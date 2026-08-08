@@ -920,7 +920,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
         return data
 
     try:
-        skip_count = 0   # 管道跳帧计数器
+        consecutive_miss = 0  # 连续漏检计数, 超阈值说明管道帧损坏, 自动回退文件模式
         while True:
             raw = _read_frame(extract.stdout, frame_size)
             if len(raw) < frame_size:
@@ -934,6 +934,13 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
             faces, cards = [], []
             if face_on:
                 faces = face_proc.process(img, frame_idx)
+                if faces:
+                    consecutive_miss = 0
+                else:
+                    consecutive_miss += 1
+            # 前20帧后, 连续30个处理帧没有检测到任何人脸 → 管道数据损坏, 回退文件模式
+            if face_on and frame_idx > 20 and consecutive_miss > 30:
+                raise RuntimeError(f"管道帧数据异常(连续{consecutive_miss}处理帧无人脸), 回退文件模式")
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
                     heavy_mosaic(img, int(x1 - FACE_EXPAND * bw),
