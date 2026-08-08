@@ -40,7 +40,7 @@ cd /home/ubuntu/video-mask
 .venv/bin/python video_mask_face_gpu.py \
   /home/ubuntu/sources/example.MOV \
   --out-dir /home/ubuntu/outputs \
-  --face-int 5 \
+  --face-int 3 \
   --decode auto \
   --encoder auto
 ```
@@ -58,7 +58,7 @@ cd /home/ubuntu/video-mask
 在 `scripts/task_manager.sh` 中直接选择 `video_mask_face_gpu.py`。该算法只处理人脸，不需要再输入 `--no-card`；如需调整检测间隔，可输入：
 
 ```text
---face-int 5
+--face-int 3
 ```
 
 任务管理器会把它转换成调度器可识别的透传参数。
@@ -66,8 +66,8 @@ cd /home/ubuntu/video-mask
 ## 性能调节
 
 - `--workers 2`：T4 + 8 核 CPU 的建议起点；整体吞吐提升，但单个视频不一定更快。
-- `--face-int 3`：检测更密集，适合快速运动，速度较慢。
-- `--face-int 5`：默认平衡值。
+- `--face-int 3`：默认的隐私优先设置，适合快速运动与入镜人脸。
+- `--face-int 5`：速度与召回的平衡设置；启用前应抽查结果。
 - `--face-int 6`：更快，但快速转头或突然入镜时可能短暂漏检。
 - `--cpu`：用于与 GPU 做同条件基准测试。
 - `--decode cpu` / `--encoder x264`：用于排查 NVIDIA 视频编解码问题。

@@ -182,7 +182,7 @@ def encoder_command(path: Path, output: Path, info: VideoInfo,
 
 
 def heavy_mosaic(image: np.ndarray, box: tuple[int, int, int, int],
-                 cells: int = 5, expand: float = 0.16):
+                 cells: int = 10, expand: float = 0.22):
     height, width = image.shape[:2]
     x1, y1, x2, y2 = box
     bw, bh = x2 - x1, y2 - y1
@@ -368,7 +368,7 @@ class FaceDetector:
 class MultiFaceTracker:
     """Detect all faces on key frames and track each box between detections."""
 
-    def __init__(self, detector: FaceDetector, interval: int = 5, grace: int = 2):
+    def __init__(self, detector: FaceDetector, interval: int = 3, grace: int = 4):
         self.detector = detector
         self.interval = max(1, interval)
         self.grace = max(0, grace)
@@ -576,10 +576,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("inputs", nargs="+", help="Video files, directories, or glob patterns")
     parser.add_argument("--out-dir", default="masked_face_gpu", help="Output directory")
     parser.add_argument("--model-dir", default=None, help=f"Directory containing {YUNET_FILE}")
-    parser.add_argument("--face-int", type=int, default=5,
-                        help="Detect every N frames; intermediate frames use optical flow (default: 5)")
-    parser.add_argument("--face-conf", type=float, default=0.45,
-                        help="YuNet confidence threshold (default: 0.45)")
+    parser.add_argument("--face-int", type=int, default=3,
+                        help="Detect every N frames; intermediate frames use optical flow (default: 3)")
+    parser.add_argument("--face-conf", type=float, default=0.30,
+                        help="YuNet confidence threshold (default: 0.30)")
     parser.add_argument("--face-size", type=int, default=960,
                         help="Maximum OpenCV CPU detector input size (default: 960)")
     parser.add_argument("--device-id", type=int, default=0, help="CUDA device index (default: 0)")
