@@ -757,7 +757,9 @@ def _hw_encoder_is_usable(encoder):
 
     probe = _run([
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+        # NVENC rejects very small frames; 256x256 is safely above its minimum
+        # supported dimension while remaining a negligible one-frame probe.
+        "-f", "lavfi", "-i", "color=c=black:s=256x256:r=30",
         "-frames:v", "1", "-an", "-c:v", encoder,
         "-f", "null", "-",
     ])
