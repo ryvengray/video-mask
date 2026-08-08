@@ -139,8 +139,25 @@ class Tracker:
 # ================= 人脸检测 =================
 
 class FaceDetector:
-    """人脸检测: YuNet(强: 侧脸/小脸/戴帽/低光照) → res10 SSD → Haar 兜底"""
+    """人脸检测: YuNet(强: 侧脸/小脸/戴帽/低光照) → res10 SSD → Haar 兜底
+
+    GPU 加速: 在 CUDA 机器上自动启用(YuNet/res10 均走 GPU)。
+      - 全局设置 cv2.dnn.setPreferableBackend(DNN_BACKEND_CUDA) + TARGET_CUDA
+      - CUDA 不可用时(本机/macOS)静默回退 CPU, 无需传参
+      - 要求: OpenCV 需编译 CUDA 支持(conda install -c conda-forge opencv 或自编译)
+    """
+    _gpu_init_done = False
+
     def __init__(self, model_dir=None, yunet_size=FACE_YUNET_SIZE):
+        # === GPU 加速: 全局设置 DNN CUDA 后端(首次调用, 静默回退) ===
+        if not FaceDetector._gpu_init_done:
+            FaceDetector._gpu_init_done = True
+            try:
+                cv2.dnn.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                cv2.dnn.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                print("[人脸] OpenCV DNN CUDA GPU 加速已启用")
+            except Exception:
+                print("[人脸] CUDA GPU 不可用, 使用 CPU(若需GPU请用conda安装CUDA版OpenCV)")
         self.yunet = None
         self.ssd = None
         self.yunet_size = yunet_size
@@ -903,16 +920,16 @@ def process_video(src, dst, face_on=True, card_on=True, card_detector="owlv2",
     if use_pipe:
         try:
             return _process_pipe(src, dst, face_on, card_on, card_detector,
-                                card_conf, card_color, model_dir,
-                                card_key_int, owl_size, face_size,
-                                face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
+                                 card_conf, card_color, model_dir,
+                                 card_key_int, owl_size, face_size,
+                                 face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, card_on, card_detector,
-                         card_conf, card_color, model_dir,
-                         card_key_int, owl_size, face_size,
-                         face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                         frame_skip, log)
+                          card_conf, card_color, model_dir,
+                          card_key_int, owl_size, face_size,
+                          face_int, face_conf, keep_tmp, force_h264, use_gpu,
+                          frame_skip, log)
 
 
 def expand_inputs(inputs):
