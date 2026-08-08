@@ -182,7 +182,7 @@ def encoder_command(path: Path, output: Path, info: VideoInfo,
 
 
 def heavy_mosaic(image: np.ndarray, box: tuple[int, int, int, int],
-                 cells: int = 10, expand: float = 0.22):
+                 cells: int = 18, expand: float = 0.28):
     height, width = image.shape[:2]
     x1, y1, x2, y2 = box
     bw, bh = x2 - x1, y2 - y1
@@ -191,6 +191,8 @@ def heavy_mosaic(image: np.ndarray, box: tuple[int, int, int, int],
     if x2 - x1 < 4 or y2 - y1 < 4:
         return
     region = image[y1:y2, x1:x2]
+    # Blur before pixelation so facial contours cannot survive inside a large block.
+    region = cv2.GaussianBlur(region, (0, 0), sigmaX=9, sigmaY=9)
     small_width = max(1, (x2 - x1) // cells)
     small_height = max(1, (y2 - y1) // cells)
     small = cv2.resize(region, (small_width, small_height), interpolation=cv2.INTER_AREA)
