@@ -302,20 +302,14 @@ class OwlCardDetector:
         self.owl_size = owl_size
         self.processor = Owlv2Processor.from_pretrained(OWL_MODEL)
         self.model = Owlv2ForObjectDetection.from_pretrained(OWL_MODEL)
-        # 按推理性能优先级自动选择设备：NVIDIA CUDA → Apple MPS → CPU。
-        # 同一份代码可直接部署在 Linux CUDA 服务器或 Apple Silicon Mac。
-        if torch.cuda.is_available():
-            self.device = "cuda"
-            name = torch.cuda.get_device_name(torch.cuda.current_device())
-            device_label = f"CUDA GPU: {name}"
-        elif torch.backends.mps.is_available():
+        # MPS(GPU) 加速(Apple Silicon); 不可用则回退 CPU
+        if torch.backends.mps.is_available():
             self.device = "mps"
-            device_label = "MPS GPU"
+            self.model.to("mps")
+            print("[信用卡] OWLv2 模型已加载 (MPS GPU 加速)")
         else:
             self.device = "cpu"
-            device_label = "CPU"
-        self.model.to(self.device).eval()
-        print(f"[信用卡] OWLv2 模型已加载 ({device_label})")
+            print("[信用卡] OWLv2 模型已加载 (CPU)")
 
     @classmethod
     def get(cls, owl_size=CARD_OWL_SIZE):
@@ -334,8 +328,8 @@ class OwlCardDetector:
         else:
             sw, sh, scale = w0, h0, 1.0
         inputs = self.processor(text=CARD_TEXTS, images=image, return_tensors="pt")
-        if self.device != "cpu":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        if self.device == "mps":
+            inputs = {k: v.to("mps") for k, v in inputs.items()}
         with self.torch.no_grad():
             outputs = self.model(**inputs)
         ts = self.torch.tensor([[sh, sw]])
