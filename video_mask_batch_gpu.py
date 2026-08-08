@@ -892,15 +892,15 @@ def process_video(src, dst, face_on=True, card_on=True, card_detector="owlv2",
     if use_pipe:
         try:
             return _process_pipe(src, dst, face_on, card_on, card_detector,
-                                card_conf, card_color, model_dir,
-                                card_key_int, owl_size, face_size,
-                                face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
+                                 card_conf, card_color, model_dir,
+                                 card_key_int, owl_size, face_size,
+                                 face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, card_on, card_detector,
-                         card_conf, card_color, model_dir,
-                         card_key_int, owl_size, face_size,
-                         face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
+                          card_conf, card_color, model_dir,
+                          card_key_int, owl_size, face_size,
+                          face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
 
 
 def expand_inputs(inputs):
