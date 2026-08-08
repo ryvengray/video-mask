@@ -1070,6 +1070,7 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
         vcmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                  "-threads", "0"]
         log("  [编码] libx264 veryfast(CPU多核)")
+    vcmd += ["-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart", dst]
     r = _run(vcmd)
     if r.returncode != 0:
         log("  [错误] ffmpeg 合成失败: " + r.stderr[-300:])
