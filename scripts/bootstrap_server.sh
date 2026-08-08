@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # 在全新 Ubuntu/Debian 服务器初始化 video-mask 运行环境。
-# 用法：bash scripts/bootstrap_server.sh [--cpu] [--skip-models] [--torch-index-url URL]
+# 用法：bash scripts/bootstrap_server.sh [--face-only] [--cpu] [--skip-models] [--torch-index-url URL]
 set -Eeuo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="auto"                 # auto | cuda | cpu
 DOWNLOAD_MODELS=1
+FACE_ONLY=0
 # 如官方 PyTorch 安装页给出不同 CUDA wheel，请通过 --torch-index-url 覆盖。
 TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
 
@@ -14,12 +15,13 @@ usage() {
 用法：bash scripts/bootstrap_server.sh [选项]
 
   --cpu                     强制安装 CPU 版 PyTorch
+  --face-only               部署仅人脸 GPU 流水线；跳过 OWLv2 模型下载
   --skip-models             不预下载 OWLv2 和 YuNet 模型
   --torch-index-url URL     指定 PyTorch wheel 索引（默认 cu128）
   -h, --help                显示帮助
 
 示例：
-  bash scripts/bootstrap_server.sh
+  bash scripts/bootstrap_server.sh --face-only
   bash scripts/bootstrap_server.sh --torch-index-url https://download.pytorch.org/whl/cu126
   bash scripts/bootstrap_server.sh --cpu --skip-models
 EOF
@@ -28,6 +30,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cpu) MODE="cpu" ;;
+    --face-only) FACE_ONLY=1 ;;
     --skip-models) DOWNLOAD_MODELS=0 ;;
     --torch-index-url)
       [[ $# -ge 2 ]] || { echo "缺少 --torch-index-url 的值" >&2; exit 2; }
@@ -70,7 +73,7 @@ fi
 echo "==> 安装系统依赖"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ffmpeg git python3 python3-venv python3-pip ca-certificates
+  ffmpeg git python3 python3-venv python3-pip ca-certificates util-linux
 
 if [[ "$MODE" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
@@ -103,8 +106,16 @@ PYTHON="$APP_DIR/.venv/bin/python"
 echo "==> 安装 PyTorch（${MODE}）"
 "$PYTHON" -m pip install --upgrade torch torchvision --index-url "$TORCH_INDEX_URL"
 
-echo "==> 安装项目与 OWLv2 依赖"
+echo "==> 安装项目依赖"
 "$PYTHON" -m pip install -e '.[cards]'
+
+if [[ "$MODE" == "cuda" ]]; then
+  echo "==> 安装 YuNet ONNX Runtime CUDA 依赖"
+  "$PYTHON" -m pip install -r requirements-cuda.txt
+fi
+
+echo "==> 创建默认任务目录"
+mkdir -p /home/ubuntu/sources /home/ubuntu/outputs
 
 echo "==> 验证 ffmpeg 与 PyTorch"
 ffmpeg -version | head -n 1
@@ -129,14 +140,38 @@ EOF
   fi
 fi
 
+if [[ "$MODE" == "cuda" ]]; then
+  echo "==> 验证 ONNX Runtime CUDA provider"
+  VIDEO_MASK_FACE_ONLY="$FACE_ONLY" "$PYTHON" - <<'PY'
+import torch
+import onnxruntime as ort
+
+if hasattr(ort, "preload_dlls"):
+    ort.preload_dlls()
+print("ONNX Runtime:", ort.__version__)
+print("Providers:", ort.get_available_providers())
+if "CUDAExecutionProvider" not in ort.get_available_providers():
+    raise SystemExit("ONNX Runtime CUDAExecutionProvider 不可用")
+PY
+  echo "==> 检查 NVIDIA 视频编解码能力"
+  ffmpeg -hide_banner -hwaccels | grep -q cuda && echo "NVDEC/CUDA: available" || echo "NVDEC/CUDA: not listed"
+  ffmpeg -hide_banner -encoders | grep -q h264_nvenc && echo "NVENC H.264: available" || echo "NVENC H.264: not listed"
+fi
+
 if [[ "$DOWNLOAD_MODELS" -eq 1 ]]; then
-  echo "==> 预下载 OWLv2 与 YuNet 模型（首次约 600MB）"
+  if [[ "$FACE_ONLY" -eq 1 ]]; then
+    echo "==> 预下载 YuNet 人脸模型"
+  else
+    echo "==> 预下载 OWLv2 与 YuNet 模型（首次约 600MB）"
+  fi
   # 确保此前 shell 中遗留的离线配置不会阻止首次下载。
   unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
-  "$PYTHON" - <<'PY'
+  VIDEO_MASK_FACE_ONLY="$FACE_ONLY" "$PYTHON" - <<'PY'
 from huggingface_hub import hf_hub_download, snapshot_download
+import os
 
-snapshot_download("google/owlv2-base-patch16-ensemble")
+if os.environ.get("VIDEO_MASK_FACE_ONLY") != "1":
+    snapshot_download("google/owlv2-base-patch16-ensemble")
 hf_hub_download(
     repo_id="opencv/face_detection_yunet",
     filename="face_detection_yunet_2023mar.onnx",
@@ -150,6 +185,10 @@ fi
 echo
 echo "部署完成。建议先执行："
 echo "  cd $APP_DIR"
-echo "  .venv/bin/python video_mask_batch_flast.py /path/to/test.mp4 --out-dir /path/to/output"
-echo "日志应显示 '[信用卡] OWLv2 模型已加载 (CUDA GPU: ...)'。"
-echo "注意：当前版本请不要使用 --pipe。"
+if [[ "$FACE_ONLY" -eq 1 ]]; then
+  echo "  .venv/bin/python video_mask_face_gpu.py /home/ubuntu/sources/test.mp4 --out-dir /home/ubuntu/outputs"
+  echo "日志应显示 '[Face model] YuNet ONNX Runtime CUDA'、'[Decode] NVDEC/CUDA' 与 '[Encode] NVENC h264'。"
+else
+  echo "  .venv/bin/python video_mask_batch_flast.py /path/to/test.mp4 --out-dir /path/to/output"
+  echo "日志应显示 '[信用卡] OWLv2 模型已加载 (CUDA GPU: ...)'。"
+fi

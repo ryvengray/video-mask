@@ -124,16 +124,17 @@ start_task() {
     fi
     choose_algorithm || return
 
-    read -r -p 'Source directory [/home/ubuntu/video_source]: ' source_dir || return
-    source_dir="${source_dir:-/home/ubuntu/video_source}"
-    read -r -p 'Target directory [/home/ubuntu/video_masked]: ' target_dir || return
-    target_dir="${target_dir:-/home/ubuntu/video_masked}"
+    read -r -p 'Source directory [/home/ubuntu/sources]: ' source_dir || return
+    source_dir="${source_dir:-/home/ubuntu/sources}"
+    read -r -p 'Target directory [/home/ubuntu/outputs]: ' target_dir || return
+    target_dir="${target_dir:-/home/ubuntu/outputs}"
     read -r -p 'Optional algorithm arguments (example: --no-card): ' extra_line || return
     if [[ -n "$extra_line" ]]; then
         # Intended for ordinary flag/value pairs. Each item is safely passed as one --extra-arg.
         read -r -a extra_args <<< "$extra_line"
     fi
     workers=1
+    [[ "$(basename "$CHOSEN_ALGORITHM")" == "video_mask_face_gpu.py" ]] && workers=2
     for arg in "${extra_args[@]}"; do
         [[ "$arg" == "--no-card" ]] && workers=2
     done
