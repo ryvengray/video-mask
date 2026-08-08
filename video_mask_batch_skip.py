@@ -45,6 +45,7 @@ video_mask_batch.py — 视频批量打码（人脸 + 信用卡/银行卡），�
 """
 import argparse
 import glob
+import math
 import os
 import shutil
 import subprocess
@@ -138,69 +139,196 @@ class Tracker:
 
 # ================= 人脸检测 =================
 
-class FaceDetector:
-    """人脸检测: YuNet(强: 侧脸/小脸/戴帽/低光照) → res10 SSD → Haar 兜底
+# -- GPU 辅助函数 (NVDEC/NVENC, face_gpu.py 移植) --
 
-    GPU 加速: 在 CUDA 机器上自动启用(YuNet/res10 均走 GPU)。
-      - 全局设置 cv2.dnn.setPreferableBackend(DNN_BACKEND_CUDA) + TARGET_CUDA
-      - CUDA 不可用时(本机/macOS)静默回退 CPU, 无需传参
-      - 要求: OpenCV 需编译 CUDA 支持(conda install -c conda-forge opencv 或自编译)
+YUNET_FILE = "face_detection_yunet_2023mar.onnx"
+YUNET_REPO = "opencv/face_detection_yunet"
+
+
+def ffmpeg_has(name: str, section: str) -> bool:
+    """检查 ffmpeg 是否支持指定的编码器/加速器"""
+    out = subprocess.run(["ffmpeg", "-hide_banner", section], capture_output=True, text=True)
+    return name in (out.stdout or "")
+
+
+def cuda_decode_available() -> bool:
+    return shutil.which("nvidia-smi") is not None and ffmpeg_has("cuda", "-hwaccels")
+
+
+def nvenc_available() -> bool:
+    return shutil.which("nvidia-smi") is not None and ffmpeg_has("h264_nvenc", "-encoders")
+
+
+# -- YuNet ONNX Runtime CUDA 推理引擎 (face_gpu.py 核心) --
+
+class YuNetOrtCuda:
+    """YuNet 人脸检测, ONNX Runtime CUDA 推理。
+
+    直接解析 YuNet 的多尺度输出(cls/obj/bbox/kps @ stride 8/16/32),
+    手动NMS, 比 OpenCV DNN CUDA 后端更快(避免 OpenCV 内部开销)。
+    要求: PyTorch CUDA + onnxruntime-gpu 均已安装。
     """
-    _gpu_init_done = False
+    OUTPUT_NAMES = [
+        "cls_8", "cls_16", "cls_32", "obj_8", "obj_16", "obj_32",
+        "bbox_8", "bbox_16", "bbox_32", "kps_8", "kps_16", "kps_32",
+    ]
+    STRIDES = (8, 16, 32)
 
-    def __init__(self, model_dir=None, yunet_size=FACE_YUNET_SIZE):
-        # === GPU 加速: 全局设置 DNN CUDA 后端(首次调用, 静默回退) ===
-        if not FaceDetector._gpu_init_done:
-            FaceDetector._gpu_init_done = True
-            try:
-                cv2.dnn.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                cv2.dnn.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                print("[人脸] OpenCV DNN CUDA GPU 加速已启用")
-            except Exception:
-                print("[人脸] CUDA GPU 不可用, 使用 CPU(若需GPU请用conda安装CUDA版OpenCV)")
-        self.yunet = None
-        self.ssd = None
+    def __init__(self, model_path, device_id=0):
+        import torch
+        import onnxruntime as ort
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("PyTorch CUDA is unavailable")
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            raise RuntimeError("CUDAExecutionProvider is unavailable")
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = ort.InferenceSession(
+            str(model_path), sess_options=options,
+            providers=[("CUDAExecutionProvider", {"device_id": device_id}),
+                       "CPUExecutionProvider"],
+        )
+        if not self.session.get_providers() or \
+                self.session.get_providers()[0] != "CUDAExecutionProvider":
+            raise RuntimeError(f"CUDA provider failed: {self.session.get_providers()}")
+        self.providers = self.session.get_providers()
+        self.input = self.session.get_inputs()[0]
+        output_names = {o.name for o in self.session.get_outputs()}
+        missing = set(self.OUTPUT_NAMES) - output_names
+        if missing:
+            raise RuntimeError(f"Incompatible YuNet outputs: {sorted(missing)}")
+        shape = self.input.shape
+        self.fixed_h = shape[2] if len(shape) == 4 and isinstance(shape[2], int) else None
+        self.fixed_w = shape[3] if len(shape) == 4 and isinstance(shape[3], int) else None
+        self.gpu_name = torch.cuda.get_device_name(device_id)
+
+    def _prepare(self, image):
+        height, width = image.shape[:2]
+        if self.fixed_w and self.fixed_h:
+            scale = min(self.fixed_w / width, self.fixed_h / height)
+            resized = cv2.resize(image, (max(1, round(width * scale)),
+                                         max(1, round(height * scale))))
+            padded = np.zeros((self.fixed_h, self.fixed_w, 3), dtype=np.uint8)
+            padded[:resized.shape[0], :resized.shape[1]] = resized
+        else:
+            scale = 1.0
+            padded_width = math.ceil(width / 32) * 32
+            padded_height = math.ceil(height / 32) * 32
+            padded = cv2.copyMakeBorder(
+                image, 0, padded_height - height, 0, padded_width - width,
+                cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        blob = np.ascontiguousarray(padded.transpose(2, 0, 1)[None], dtype=np.float32)
+        return blob, scale, padded.shape[1], padded.shape[0]
+
+    def detect(self, image, confidence):
+        blob, scale, pw, ph = self._prepare(image)
+        values = self.session.run(self.OUTPUT_NAMES, {self.input.name: blob})
+        boxes, scores = [], []
+        for pos, stride in enumerate(self.STRIDES):
+            cls_row = np.asarray(values[pos]).reshape(-1)
+            obj_row = np.asarray(values[pos + 3]).reshape(-1)
+            bbox = np.asarray(values[pos + 6]).reshape(-1, 4)
+            rows, cols = ph // stride, pw // stride
+            count = min(rows * cols, len(cls_row), len(obj_row), len(bbox))
+            probs = np.sqrt(np.clip(cls_row[:count], 0, 1) * np.clip(obj_row[:count], 0, 1))
+            for idx in np.flatnonzero(probs >= confidence):
+                r, c = divmod(int(idx), cols)
+                dx, dy, dw, dh = bbox[idx]
+                cx = (c + dx) * stride
+                cy = (r + dy) * stride
+                bw = float(np.exp(dw) * stride)
+                bh = float(np.exp(dh) * stride)
+                boxes.append([cx - bw / 2, cy - bh / 2, bw, bh])
+                scores.append(float(probs[idx]))
+        if not boxes:
+            return []
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, confidence, 0.3, top_k=5000)
+        if idxs is None or len(idxs) == 0:
+            return []
+        h0, w0 = image.shape[:2]
+        out = []
+        for i in np.asarray(idxs).reshape(-1):
+            x, y, bw, bh = boxes[int(i)]
+            x1, y1 = max(0, int(x / scale)), max(0, int(y / scale))
+            x2 = min(w0, int((x + bw) / scale))
+            y2 = min(h0, int((y + bh) / scale))
+            if x2 > x1 and y2 > y1:
+                out.append((x1, y1, x2, y2))
+        return out
+
+
+# -- 统一人脸检测器 (GPU优先 + CPU兜底) --
+
+class FaceDetector:
+    """人脸检测: YuNetOrtCuda(GPU) → YuNet OpenCV(CPU) → res10 SSD → Haar 兜底
+
+    GPU 优先: CUDA 环境可用时走 ONNX Runtime CUDA(YuNetOrtCuda),
+    比 OpenCV DNN CUDA 快(直接推理, 无OpenCV内部开销)。
+    不可用时自动回退 OpenCV CPU / Haar, 无需传参。
+    """
+
+    def __init__(self, model_dir=None, yunet_size=FACE_YUNET_SIZE, use_gpu=True):
         self.yunet_size = yunet_size
-        # 1. 优先 YuNet(从 model_dir 或 HuggingFace 缓存找)
+        self.ort = None         # YuNetOrtCuda (CUDA)
+        self.yunet = None       # cv2.FaceDetectorYN (OpenCV CPU)
+        self.ssd = None         # res10 SSD (CPU)
+        self.haar = None        # Haar 级联(最后兜底)
+
+        # 找 YuNet ONNX 文件路径
         yunet_path = None
         if model_dir:
-            cand = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
+            cand = os.path.join(model_dir, YUNET_FILE)
             if os.path.exists(cand):
                 yunet_path = cand
         if not yunet_path:
             try:
-                # 绕过本机代理(HF 直连可用, 走代理会 502) + 离线模式用缓存
                 for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
                           "https_proxy", "ALL_PROXY", "all_proxy"):
                     os.environ.pop(k, None)
                 os.environ.setdefault("HF_HUB_OFFLINE", "1")
                 from huggingface_hub import hf_hub_download
-                yunet_path = hf_hub_download(
-                    repo_id="opencv/face_detection_yunet",
-                    filename="face_detection_yunet_2023mar.onnx")
+                yunet_path = hf_hub_download(YUNET_REPO, YUNET_FILE)
             except Exception:
                 pass
-        if yunet_path and os.path.exists(yunet_path):
+
+        # 1. 优先 ONNX Runtime CUDA(YuNetOrtCuda, GPU加速)
+        if yunet_path and use_gpu:
+            try:
+                self.ort = YuNetOrtCuda(yunet_path)
+                print(f"[人脸] YuNet ONNX Runtime CUDA | GPU={self.ort.gpu_name}")
+            except Exception as exc:
+                print(f"[人脸] CUDA不可用({exc}), 回退CPU")
+
+        # 2. OpenCV DNN CPU 兜底
+        if self.ort is None and yunet_path and os.path.exists(yunet_path):
             self.yunet = cv2.FaceDetectorYN_create(
                 yunet_path, "", (320, 320),
                 score_threshold=FACE_CONF, nms_threshold=0.3, top_k=5000)
-            print(f"[人脸] YuNet 模型(强: 侧脸/小脸/戴帽/低光照, 输入{yunet_size})")
-        # 2. res10 SSD 兜底
-        if self.yunet is None and model_dir:
+            print(f"[人脸] YuNet OpenCV CPU, 输入{yunet_size}")
+
+        # 3. res10 SSD
+        if self.ort is None and self.yunet is None and model_dir:
             proto = os.path.join(model_dir, "deploy.prototxt")
             model = os.path.join(model_dir, "res10_300x300_ssd_iter_140000.caffemodel")
             if os.path.exists(proto) and os.path.exists(model):
                 self.ssd = cv2.dnn.readNetFromCaffe(proto, model)
                 print("[人脸] res10 SSD(YuNet 未找到)")
-        # 3. Haar 最后兜底
-        if self.yunet is None and self.ssd is None:
+
+        # 4. Haar 最后兜底
+        if self.ort is None and self.yunet is None and self.ssd is None:
             self.haar = cv2.CascadeClassifier(
                 cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
             print("[人脸] Haar 级联(零依赖)")
 
     def detect(self, img, conf=FACE_CONF):
+        # GPU: ONNX Runtime CUDA(YuNetOrtCuda)
+        if self.ort is not None:
+            return self.ort.detect(img, conf)
         h0, w0 = img.shape[:2]
-        # YuNet: 缩放输入提速, 坐标映射回原图
+        # CPU: OpenCV FaceDetectorYN(含输入缩放)
         if self.yunet is not None:
             if self.yunet_size and max(w0, h0) > self.yunet_size:
                 scale = self.yunet_size / max(w0, h0)
@@ -667,7 +795,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
     hw = find_hw_encoder(family="h264" if force_h264 else "hevc")
 
     # 初始化检测器
-    fd = FaceDetector(model_dir, yunet_size=face_size)
+    fd = FaceDetector(model_dir, yunet_size=face_size, use_gpu=use_gpu)
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
     owl = None
     geo_thr = GEO_SCORE
@@ -685,26 +813,37 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
     card_tr = CardTracker(owl, key_int=card_key_int, conf=card_conf) if owl else None
     geo_tr = Tracker(10) if (card_on and not owl) else None
 
-    # 启动抽帧进程(raw BGR → stdout pipe, stderr → DEVNULL 避免管道死锁)
-    # 注意: rawvideo不自动旋转, 需手动加transpose滤镜(iPhone等竖屏视频)
-    extract_cmd = ["ffmpeg", "-i", src]
+    # 启动抽帧进程(raw BGR → stdout pipe)
+    # NVDEC 硬件解码(可用时): -hwaccel cuda 让 ffmpeg 用 GPU 解码
+    # rawvideo 不自动旋转, 需手动加transpose滤镜(iPhone等竖屏视频)
+    extract_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    if cuda_decode_available():
+        extract_cmd += ["-hwaccel", "cuda"]
+        log("  [解码] NVDEC GPU 硬件解码")
+    extract_cmd += ["-i", src]
     vf = get_transpose_filter(rot)
     if vf:
         extract_cmd += ["-vf", vf]
-    extract_cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    extract_cmd += ["-map", "0:v:0", "-an", "-sn", "-dn",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
     extract = subprocess.Popen(
         extract_cmd,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     # 构建编码命令(stdin ← raw BGR)
-    # 注意: ffmpeg参数顺序必须是 [输入选项 -i 输入] [输出选项 输出文件]
-    enc_cmd = ["ffmpeg", "-y",
+    # NVENC 优先(可用时): 使用 face_gpu.py 调优参数
+    enc_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s", f"{w}x{h}", "-r", str(fps), "-i", "-"]
+               "-s:v", f"{w}x{h}", "-r", str(fps), "-i", "pipe:0"]
     if audio_tmp:
         enc_cmd += ["-i", audio_tmp]
     # 输出选项(必须在所有 -i 之后)
-    if hw:
+    if nvenc_available():
+        # NVENC 调优参数(face_gpu.py 移植): p4 速度优先, hq 画质微调, vbr+cq20 近无损
+        enc_cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+                    "-rc", "vbr", "-cq", "20", "-b:v", "0"]
+        log("  [编码] NVENC GPU 硬件编码 (h264_nvenc, preset=p4)")
+    elif hw:
         bitrate = hw_bitrate(w, h, fps, hw)
         enc_cmd += ["-c:v", hw, "-b:v", str(bitrate), "-real_time", "0"]
         if hw.startswith(("hevc", "h265")):
@@ -851,7 +990,7 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
             geo_thr = GEO_COLOR_SCORE if card_color else GEO_SCORE
             log(f"  [信用卡] 几何法" + (f" + 颜色:{card_color}" if card_color else ""))
 
-    fd = FaceDetector(model_dir, yunet_size=face_size)
+    fd = FaceDetector(model_dir, yunet_size=face_size, use_gpu=use_gpu)
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
     card_tr = CardTracker(owl, key_int=card_key_int, conf=card_conf) if owl else None
     geo_tr = Tracker(10)
