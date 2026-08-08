@@ -871,13 +871,14 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
         log("  [编码] NVENC GPU 硬件编码 (h264_nvenc, preset=p4)")
     elif hw:
         bitrate = hw_bitrate(w, h, fps, hw)
-        enc_cmd += ["-c:v", hw, "-b:v", str(bitrate)]
+        enc_cmd += ["-c:v", hw, "-b:v", str(bitrate), "-real_time", "0"]
         if hw.startswith(("hevc", "h265")):
             enc_cmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
         log(f"  [编码] 硬件加速: {hw} ({bitrate // 1000}kbps)")
     else:
-        enc_cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
-        log(f"  [编码] libx264 fast (CPU)")
+        enc_cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                     "-threads", "0"]
+        log("  [编码] libx264 veryfast (CPU多核)")
     enc_cmd += ["-pix_fmt", "yuv420p"]
     if audio_tmp:
         enc_cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "copy"]
@@ -1058,12 +1059,15 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
     if has_audio(src):
         vcmd += ["-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
     if hw:
-        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw))]
+        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw)), "-real_time", "0"]
         if hw.startswith(("hevc", "h265")):
-            vcmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
+            vcmd += ["-tag:v", "hvc1"]
+        log(f"  [编码] 硬件: {hw}")
     else:
-        vcmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "18"]
-    vcmd += ["-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart", dst]
+        # CPU x264: preset veryfast(原slow太慢) + threads 0(全核) + crf 20(原18偏慢)
+        vcmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-threads", "0"]
+        log("  [编码] libx264 veryfast(CPU多核)")
     r = _run(vcmd)
     if r.returncode != 0:
         log("  [错误] ffmpeg 合成失败: " + r.stderr[-300:])
