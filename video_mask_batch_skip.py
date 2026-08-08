@@ -1060,10 +1060,13 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
     if has_audio(src):
         vcmd += ["-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
     if hw:
-        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw))]
+        bitrate = hw_bitrate(w, h, fps, hw)
+        log(f"  [编码] 硬件加速: {hw} ({bitrate // 1000}kbps)")
+        vcmd += ["-c:v", hw, "-b:v", str(bitrate)]
         if hw.startswith(("hevc", "h265")):
             vcmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
     else:
+        log("  [编码] libx264 slow (CPU)")
         vcmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "18"]
     vcmd += ["-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart", dst]
     r = _run(vcmd)
