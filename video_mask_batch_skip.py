@@ -613,6 +613,31 @@ def get_transpose_filter(rotation):
     return None
 
 
+_HW_ENCODER_USABILITY = {}
+
+
+def _hw_encoder_is_usable(encoder):
+    """确认硬件编码器不只是被 ffmpeg 编译进去了，而且当前机器真的可用。
+
+    有些云镜像会带有 nvenc 编码器，但没有把 NVIDIA 设备/驱动暴露给
+    ffmpeg。这种情况下 ``ffmpeg -encoders`` 仍会列出 ``*_nvenc``，而真正
+    合成到最后一步才报 CUDA_ERROR_NO_DEVICE。用一个极小的空帧编码探测
+    可以在开始处理前安全地回退到 libx264。
+    """
+    if encoder in _HW_ENCODER_USABILITY:
+        return _HW_ENCODER_USABILITY[encoder]
+
+    probe = _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+        "-frames:v", "1", "-an", "-c:v", encoder,
+        "-f", "null", "-",
+    ])
+    usable = probe.returncode == 0
+    _HW_ENCODER_USABILITY[encoder] = usable
+    return usable
+
+
 def find_hw_encoder(family="hevc"):
     """检测可用的硬件编码器。
 
@@ -629,7 +654,8 @@ def find_hw_encoder(family="hevc"):
                  "hevc_qsv", "h265_qsv", "h264_videotoolbox", "h264_nvenc", "h264_qsv"]
     for enc in order:
         if enc in r.stdout:
-            return enc
+            if _hw_encoder_is_usable(enc):
+                return enc
     return None
 
 
@@ -706,7 +732,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
     # 输出选项(必须在所有 -i 之后)
     if hw:
         bitrate = hw_bitrate(w, h, fps, hw)
-        enc_cmd += ["-c:v", hw, "-b:v", str(bitrate), "-real_time", "0"]
+        enc_cmd += ["-c:v", hw, "-b:v", str(bitrate)]
         if hw.startswith(("hevc", "h265")):
             enc_cmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
         log(f"  [编码] 硬件加速: {hw} ({bitrate // 1000}kbps)")
@@ -893,7 +919,7 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
     if has_audio(src):
         vcmd += ["-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
     if hw:
-        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw)), "-real_time", "0"]
+        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw))]
         if hw.startswith(("hevc", "h265")):
             vcmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
     else:
