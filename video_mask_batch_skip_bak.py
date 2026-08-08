@@ -801,14 +801,8 @@ def hw_bitrate(w, h, fps, encoder):
 
 def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                   card_color, model_dir, card_key_int, owl_size, face_size,
-                  face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                  frame_skip, log):
-    """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
-
-    帧流转: 解码后通过 stdout pipe 传 BGR 裸数据到 Python,
-    处理完成后通过 stdin pipe 传给编码器。无需落盘 JPEG。
-    frame_skip: 跳帧间隔, 管跳模式通过跳过读取来实现。
-    """
+                  face_int, face_conf, keep_tmp, force_h264, use_gpu, log):
+    """管道模式: ffmpeg抽帧(rawvideo) → Python处理 → ffmpeg编码, 无磁盘I/O"""
     t0 = time.time()
     w, h, fps, rot = get_video_info(src)
     has_aud = has_audio(src)
@@ -868,7 +862,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
     # NVENC 优先(可用时): 使用 face_gpu.py 调优参数
     enc_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s:v", f"{w}x{h}", "-r", str(fps / frame_skip), "-i", "pipe:0"]
+               "-s:v", f"{w}x{h}", "-r", str(fps), "-i", "pipe:0"]
     if audio_tmp:
         enc_cmd += ["-i", audio_tmp]
     # 输出选项(必须在所有 -i 之后)
@@ -920,15 +914,11 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
         return data
 
     try:
-        skip_count = 0   # 管道跳帧计数器
         while True:
             raw = _read_frame(extract.stdout, frame_size)
             if len(raw) < frame_size:
                 break
             frame_idx += 1
-            # 管道跳帧: frame_skip>1 时跳过中间帧(只处理关键帧)
-            if frame_skip > 1 and (frame_idx - 1) % frame_skip != 0:
-                continue
             img = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).copy()
 
             faces, cards = [], []
@@ -1096,16 +1086,15 @@ def process_video(src, dst, face_on=True, card_on=True, card_detector="owlv2",
                   card_conf=CARD_OWL_CONF, card_color=None, model_dir=None,
                   card_key_int=CARD_KEY_INT, owl_size=CARD_OWL_SIZE,
                   face_size=FACE_YUNET_SIZE, face_int=FACE_DETECT_INT,
-                  face_conf=FACE_CONF, use_pipe=True, keep_tmp=False,
+                  face_conf=FACE_CONF, use_pipe=False, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP, log=print):
     """处理单个视频: 人脸+信用卡打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
             return _process_pipe(src, dst, face_on, card_on, card_detector,
-                                card_conf, card_color, model_dir,
-                                card_key_int, owl_size, face_size,
-                                face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                                frame_skip, log)
+                                 card_conf, card_color, model_dir,
+                                 card_key_int, owl_size, face_size,
+                                 face_int, face_conf, keep_tmp, force_h264, use_gpu, log)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, card_on, card_detector,
@@ -1146,8 +1135,8 @@ def main():
                     help=f"人脸置信度阈值(默认{FACE_CONF}; 降底如0.25可检出更多侧脸/遮挡, 可能增误检)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
                     help="【抽帧频率】跳过间隔(默认1=逐帧; 2=隔1抽1提速2x; 3=每3帧抽1提速3x; 配合--face-int效果叠加)")
-    ap.add_argument("--no-pipe", action="store_true",
-                    help="禁用管道模式, 强制文件模式(调试或特殊场景; 默认已启用流式管道)")
+    ap.add_argument("--pipe", action="store_true",
+                    help="启用管道模式(无磁盘I/O, 更快但对HDR/HEVC+旋转视频有兼容问题)")
     ap.add_argument("--force-h264", action="store_true",
                     help="强制H.264输出(兼容性无敌: 微信/Android/旧播放器都能播; 画质仍近无损高码率)")
     ap.add_argument("--card-color", default=None,
@@ -1177,7 +1166,7 @@ def main():
                          card_key_int=args.card_key_int, owl_size=args.owl_size,
                          face_size=args.face_size, face_int=args.face_int,
                          face_conf=args.face_conf,
-                         use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
+                         use_pipe=args.pipe, keep_tmp=args.keep_tmp,
                          force_h264=args.force_h264, use_gpu=not args.no_gpu,
                          frame_skip=args.frame_skip):
             ok += 1
