@@ -9,6 +9,9 @@ SCHEDULER="$ROOT_DIR/scripts/batch_scheduler.py"
 TASK_HOME="$ROOT_DIR/.task_manager"
 TASKS_DIR="$TASK_HOME/tasks"
 RUNNERS_DIR="$TASK_HOME/runners"
+DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_skip.py"
+DEFAULT_EXTRA_ARGS=(--no-card --face-size 960 --face-int 5 --frame-skip 3)
+DEFAULT_EXTRA_LINE="--no-card --face-size 960 --face-int 5 --frame-skip 3"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
 trap 'printf "\nCtrl+C only leaves the current prompt; running tasks stay detached.\n"' INT
@@ -85,7 +88,7 @@ list_tasks() {
 
 choose_algorithm() {
     local -a files=()
-    local file choice
+    local file choice default_index=0
     while IFS= read -r file; do files+=("$file"); done < <(
         find "$ROOT_DIR" -maxdepth 1 -type f -name 'video_mask_batch*.py' -print | sort
     )
@@ -96,9 +99,18 @@ choose_algorithm() {
     printf '\nChoose algorithm:\n'
     for i in "${!files[@]}"; do
         printf '  %d) %s\n' "$((i + 1))" "$(basename "${files[i]}")"
+        [[ "${files[i]}" == "$DEFAULT_ALGORITHM" ]] && default_index="$((i + 1))"
     done
+    if ((default_index == 0)); then
+        die "Default algorithm was not found: $(basename "$DEFAULT_ALGORITHM")"
+        return 1
+    fi
     while true; do
-        read -r -p "Algorithm [1-${#files[@]}]: " choice
+        read -r -p "Algorithm [1-${#files[@]}, Enter=$(basename "$DEFAULT_ALGORITHM")]: " choice
+        if [[ -z "$choice" ]]; then
+            CHOSEN_ALGORITHM="$DEFAULT_ALGORITHM"
+            return 0
+        fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#files[@]})); then
             CHOSEN_ALGORITHM="${files[choice - 1]}"
             return 0
@@ -109,7 +121,7 @@ choose_algorithm() {
 
 start_task() {
     local source_dir target_dir extra_line workers_line workers id started log_file meta_file runner_file pid
-    local -a extra_args=()
+    local -a extra_args=("${DEFAULT_EXTRA_ARGS[@]}")
     if [[ ! -x "$PYTHON_BIN" ]]; then
         die "Python was not found: $PYTHON_BIN"
         return
@@ -128,10 +140,12 @@ start_task() {
     source_dir="${source_dir:-/home/ubuntu/sources}"
     read -r -p 'Target directory [/home/ubuntu/outputs]: ' target_dir || return
     target_dir="${target_dir:-/home/ubuntu/outputs}"
-    read -r -p 'Optional algorithm arguments (example: --no-card): ' extra_line || return
+    read -r -p "Algorithm arguments [${DEFAULT_EXTRA_LINE}]: " extra_line || return
     if [[ -n "$extra_line" ]]; then
-        # Intended for ordinary flag/value pairs. Each item is safely passed as one --extra-arg.
+        # A non-empty response intentionally replaces the defaults.
         read -r -a extra_args <<< "$extra_line"
+    else
+        extra_line="$DEFAULT_EXTRA_LINE"
     fi
     workers=1
     [[ "$(basename "$CHOSEN_ALGORITHM")" == "video_mask_face_gpu.py" ]] && workers=2
