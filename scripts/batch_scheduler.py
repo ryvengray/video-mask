@@ -47,10 +47,17 @@ class JobStore:
                 status TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 duration REAL,
+                source_duration REAL,
+                output_duration REAL,
                 error TEXT,
                 updated_at REAL NOT NULL
             )
         """)
+        # 兼容已创建的状态库：SQLite 只支持逐列迁移。
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(jobs)")}
+        for name in ("source_duration", "output_duration"):
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} REAL")
         self.conn.commit()
 
     def close(self):
@@ -84,17 +91,20 @@ class JobStore:
         self.conn.commit()
         return status
 
-    def mark_running(self, job: VideoJob):
+    def mark_running(self, job: VideoJob, source_duration: float | None):
         self.conn.execute("""
             UPDATE jobs SET status='running', attempts=attempts + 1, error=NULL,
+            source_duration=?,
             updated_at=? WHERE source=?
-        """, (time.time(), str(job.relative)))
+        """, (source_duration, time.time(), str(job.relative)))
         self.conn.commit()
 
-    def mark_result(self, job: VideoJob, success: bool, duration: float, error: str | None = None):
+    def mark_result(self, job: VideoJob, success: bool, duration: float,
+                    output_duration: float | None, error: str | None = None):
         self.conn.execute("""
-            UPDATE jobs SET status=?, duration=?, error=?, updated_at=? WHERE source=?
-        """, ("success" if success else "failed", duration, error, time.time(), str(job.relative)))
+            UPDATE jobs SET status=?, duration=?, output_duration=?, error=?, updated_at=? WHERE source=?
+        """, ("success" if success else "failed", duration, output_duration,
+              error, time.time(), str(job.relative)))
         self.conn.commit()
 
 
@@ -112,6 +122,20 @@ def is_valid_output(path: Path) -> bool:
         capture_output=True, text=True, check=False,
     )
     return result.returncode == 0 and "video" in result.stdout
+
+
+def probe_duration(path: Path) -> float | None:
+    """读取容器时长；失败不阻断任务，只记录为 NULL。"""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        value = float(result.stdout.strip())
+        return value if value >= 0 else None
+    except ValueError:
+        return None
 
 
 def discover_jobs(source_dir: Path, target_dir: Path) -> list[VideoJob]:
@@ -145,6 +169,10 @@ def format_duration(seconds: float) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:d}:{seconds:02d}"
+
+
+def format_media_duration(seconds: float | None) -> str:
+    return format_duration(seconds) if seconds is not None else "unknown"
 
 
 def run_job(job: VideoJob, algorithm: Path, extra_args: Iterable[str]) -> tuple[bool, float, str | None]:
@@ -242,24 +270,30 @@ def main(argv: list[str] | None = None) -> int:
             for position, job in enumerate(planned, 1):
                 average = sum(completed_seconds) / len(completed_seconds) if completed_seconds else 0
                 eta = average * (len(planned) - position + 1)
+                source_duration = probe_duration(job.source)
                 print(f"\n[{position}/{len(planned)}] 开始 {job.relative} "
+                      f"原视频时长={format_media_duration(source_duration)} "
                       f"ETA={format_duration(eta)}", flush=True)
-                store.mark_running(job)
+                store.mark_running(job, source_duration)
                 try:
                     success, duration, error = run_job(job, algorithm, args.extra_arg)
                 except KeyboardInterrupt:
                     print("\n[停止] 收到中断；下次运行会自动恢复未完成任务。", flush=True)
                     return 130
-                store.mark_result(job, success, duration, error)
+                output_duration = probe_duration(job.destination) if success else None
+                store.mark_result(job, success, duration, output_duration, error)
                 completed_seconds.append(duration)
+                speed = (source_duration / duration) if source_duration and duration else None
+                speed_text = f" 实时倍率={speed:.2f}x" if speed is not None else ""
                 if success:
                     succeeded += 1
                     print(f"[完成 {position}/{len(planned)}] {job.relative} "
-                          f"耗时={format_duration(duration)}", flush=True)
+                          f"转换耗时={format_duration(duration)} "
+                          f"输出时长={format_media_duration(output_duration)}{speed_text}", flush=True)
                 else:
                     newly_failed += 1
                     print(f"[失败 {position}/{len(planned)}] {job.relative} "
-                          f"耗时={format_duration(duration)} 原因={error}", flush=True)
+                          f"转换耗时={format_duration(duration)} 原因={error}", flush=True)
 
             elapsed = time.monotonic() - all_started
             print(f"\n[汇总] 成功={succeeded} 新失败={newly_failed} 跳过={skipped} "
