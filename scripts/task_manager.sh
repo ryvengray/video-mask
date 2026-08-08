@@ -17,7 +17,7 @@ die() { printf 'Error: %s\n' "$*" >&2; }
 pause() { read -r -p 'Press Enter to return to the menu... ' _; }
 
 write_meta() {
-    local file="$1" id="$2" pid="$3" started="$4" algorithm="$5" source_dir="$6" target_dir="$7" log_file="$8" extra_args="$9"
+    local file="$1" id="$2" pid="$3" started="$4" algorithm="$5" source_dir="$6" target_dir="$7" log_file="$8" extra_args="$9" workers="${10}"
     {
         printf 'TASK_ID=%q\n' "$id"
         printf 'PID=%q\n' "$pid"
@@ -26,7 +26,8 @@ write_meta() {
         printf 'SOURCE_DIR=%q\n' "$source_dir"
         printf 'TARGET_DIR=%q\n' "$target_dir"
         printf 'LOG_FILE=%q\n' "$log_file"
-        printf 'EXTRA_ARGS=%q\n' "$extra_args"
+    printf 'EXTRA_ARGS=%q\n' "$extra_args"
+    printf 'WORKERS=%q\n' "$workers"
     } > "$file"
 }
 
@@ -107,7 +108,7 @@ choose_algorithm() {
 }
 
 start_task() {
-    local source_dir target_dir extra_line id started log_file meta_file runner_file pid
+    local source_dir target_dir extra_line workers_line workers id started log_file meta_file runner_file pid
     local -a extra_args=()
     if [[ ! -x "$PYTHON_BIN" ]]; then
         die "Python was not found: $PYTHON_BIN"
@@ -117,16 +118,32 @@ start_task() {
         die "Scheduler was not found: $SCHEDULER"
         return
     fi
+    if ! command -v setsid >/dev/null 2>&1; then
+        die "setsid is required for detached background tasks. Install util-linux."
+        return
+    fi
     choose_algorithm || return
 
-    read -r -p 'Source directory [/home/ubuntu/video_source]: ' source_dir
+    read -r -p 'Source directory [/home/ubuntu/video_source]: ' source_dir || return
     source_dir="${source_dir:-/home/ubuntu/video_source}"
-    read -r -p 'Target directory [/home/ubuntu/video_masked]: ' target_dir
+    read -r -p 'Target directory [/home/ubuntu/video_masked]: ' target_dir || return
     target_dir="${target_dir:-/home/ubuntu/video_masked}"
-    read -r -p 'Optional algorithm arguments (example: --no-card): ' extra_line
+    read -r -p 'Optional algorithm arguments (example: --no-card): ' extra_line || return
     if [[ -n "$extra_line" ]]; then
         # Intended for ordinary flag/value pairs. Each item is safely passed as one --extra-arg.
         read -r -a extra_args <<< "$extra_line"
+    fi
+    workers=1
+    for arg in "${extra_args[@]}"; do
+        [[ "$arg" == "--no-card" ]] && workers=2
+    done
+    read -r -p "Worker count [$workers]: " workers_line || return
+    workers_line="${workers_line:-$workers}"
+    if [[ "$workers_line" =~ ^[1-9][0-9]*$ ]]; then
+        workers="$workers_line"
+    else
+        die "Worker count must be a positive integer."
+        return
     fi
 
     if [[ ! -d "$source_dir" ]]; then
@@ -154,6 +171,7 @@ start_task() {
         printf 'printf "Source: %%s\\n" %q\n' "$source_dir"
         printf 'printf "Target: %%s\\n" %q\n' "$target_dir"
         printf 'printf "Arguments: %%s\\n" %q\n' "${extra_line:-(none)}"
+        printf 'printf "Workers: %%s\\n" %q\n' "$workers"
         printf 'echo "--- Runtime environment ---"\n'
         printf 'hostname || true\nuname -a || true\n'
         printf '%q -c %q || true\n' "$PYTHON_BIN" \
@@ -167,7 +185,7 @@ start_task() {
         printf 'command -v ffmpeg >/dev/null && ffmpeg -version 2>/dev/null | head -1 || true\n'
         printf 'command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || true\n'
         printf 'echo "--- Scheduler output ---"\n'
-        printf '%q -u %q %q %q %q %q ' "$PYTHON_BIN" "$SCHEDULER" "$source_dir" "$target_dir" '--algorithm' "$CHOSEN_ALGORITHM"
+        printf '%q -u %q %q %q %q %q %q %q ' "$PYTHON_BIN" "$SCHEDULER" "$source_dir" "$target_dir" '--algorithm' "$CHOSEN_ALGORITHM" '--workers' "$workers"
         local arg
         for arg in "${extra_args[@]}"; do
             # '=' is required when the forwarded value itself starts with '--'.
@@ -182,7 +200,7 @@ start_task() {
     setsid "$runner_file" > "$log_file" 2>&1 < /dev/null &
     pid=$!
     write_meta "$meta_file" "$id" "$pid" "$started" "$(basename "$CHOSEN_ALGORITHM")" \
-        "$source_dir" "$target_dir" "$log_file" "$extra_line"
+        "$source_dir" "$target_dir" "$log_file" "$extra_line" "$workers"
 
     printf '\nTask started in the background.\n'
     printf 'Task ID: %s\nPID: %s\nLog: %s\n' "$id" "$pid" "$log_file"
@@ -265,7 +283,10 @@ view_history() {
 while true; do
     printf '\n=== Video Mask Task Manager ===\n'
     printf '1) Start task\n2) Stop task\n3) View current progress\n4) View task history\n5) Exit\n'
-    read -r -p 'Choose an action [1-5]: ' action
+    if ! read -r -p 'Choose an action [1-5]: ' action; then
+        printf '\nInput closed. Goodbye. Running tasks remain active.\n'
+        exit 0
+    fi
     case "$action" in
         1) start_task; pause ;;
         2) stop_task; pause ;;

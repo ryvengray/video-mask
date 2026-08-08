@@ -1,3 +1,4 @@
 # NVIDIA 服务器可选依赖：为 video_mask_batch_cuda.py 的 YuNet 启用 ONNX Runtime CUDA。
-# 先安装项目基础依赖，再执行：.venv/bin/pip install -r requirements-cuda.txt
-onnxruntime-gpu
+# 项目现有 PyTorch 使用 CUDA 12；ORT 1.27 起 PyPI 默认构建改为 CUDA 13，
+# 因而固定到 CUDA 12 的 1.21-1.26 系列。
+onnxruntime-gpu>=1.21,<1.27

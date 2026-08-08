@@ -150,8 +150,15 @@ class YuNetOnnxRuntimeCuda:
     _STRIDES = (8, 16, 32)
 
     def __init__(self, model_path):
+        # 与项目现有的 PyTorch CUDA 运行时共用动态库。特别是 --no-card 时，
+        # OWLv2 不会导入 torch；这里必须主动导入，ORT 才能找到 CUDA/cuDNN。
+        import torch
         import onnxruntime as ort
 
+        if not torch.cuda.is_available():
+            raise RuntimeError("PyTorch 未检测到 CUDA GPU")
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
         providers = ort.get_available_providers()
         if "CUDAExecutionProvider" not in providers:
             raise RuntimeError("未发现 CUDAExecutionProvider")

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import os
 import sqlite3
@@ -189,7 +190,7 @@ def run_job(job: VideoJob, algorithm: Path, extra_args: Iterable[str]) -> tuple[
     for line in process.stdout:
         line = line.rstrip()
         if line:
-            print(f"    │ {line}", flush=True)
+            print(f"    │ [{job.relative}] {line}", flush=True)
             tail.append(line)
             tail = tail[-8:]
     code = process.wait()
@@ -213,6 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-failed", action="store_true", help="重新处理上次失败的任务")
     parser.add_argument("--force", action="store_true", help="即使已有有效输出也重新处理")
     parser.add_argument("--dry-run", action="store_true", help="仅打印计划，不执行")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="同时处理的视频数量；默认 1，建议 T4 无卡片识别时使用 2")
     parser.add_argument("--extra-arg", action="append", default=[],
                         help="透传给算法脚本的一个参数；重复使用，例如 --extra-arg=--card-conf")
     return parser
@@ -220,6 +223,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.workers < 1:
+        print("[错误] --workers 必须是大于等于 1 的整数。", file=sys.stderr)
+        return 2
     source_dir = args.source_dir.expanduser().resolve()
     target_dir = args.target_dir.expanduser().resolve()
     algorithm = args.algorithm.expanduser().resolve()
@@ -267,19 +273,11 @@ def main(argv: list[str] | None = None) -> int:
             succeeded = newly_failed = 0
             completed_seconds = []
             all_started = time.monotonic()
-            for position, job in enumerate(planned, 1):
-                average = sum(completed_seconds) / len(completed_seconds) if completed_seconds else 0
-                eta = average * (len(planned) - position + 1)
-                source_duration = probe_duration(job.source)
-                print(f"\n[{position}/{len(planned)}] 开始 {job.relative} "
-                      f"原视频时长={format_media_duration(source_duration)} "
-                      f"ETA={format_duration(eta)}", flush=True)
-                store.mark_running(job, source_duration)
-                try:
-                    success, duration, error = run_job(job, algorithm, args.extra_arg)
-                except KeyboardInterrupt:
-                    print("\n[停止] 收到中断；下次运行会自动恢复未完成任务。", flush=True)
-                    return 130
+            print(f"[调度] workers={args.workers}", flush=True)
+
+            def finish_job(position, job, source_duration, result):
+                nonlocal succeeded, newly_failed
+                success, duration, error = result
                 output_duration = probe_duration(job.destination) if success else None
                 store.mark_result(job, success, duration, output_duration, error)
                 completed_seconds.append(duration)
@@ -294,6 +292,36 @@ def main(argv: list[str] | None = None) -> int:
                     newly_failed += 1
                     print(f"[失败 {position}/{len(planned)}] {job.relative} "
                           f"转换耗时={format_duration(duration)} 原因={error}", flush=True)
+
+            # 每个 worker 启动一个独立算法进程；SQLite 仅由主线程写入。
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+            futures = {}
+            try:
+                for position, job in enumerate(planned, 1):
+                    average = sum(completed_seconds) / len(completed_seconds) if completed_seconds else 0
+                    eta = average * (len(planned) - position + 1) / args.workers
+                    source_duration = probe_duration(job.source)
+                    print(f"\n[{position}/{len(planned)}] 排队 {job.relative} "
+                          f"原视频时长={format_media_duration(source_duration)} "
+                          f"ETA={format_duration(eta)}", flush=True)
+                    store.mark_running(job, source_duration)
+                    futures[executor.submit(run_job, job, algorithm, args.extra_arg)] = (
+                        position, job, source_duration)
+                for future in concurrent.futures.as_completed(futures):
+                    position, job, source_duration = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = (False, 0.0, f"worker exception: {exc}")
+                    finish_job(position, job, source_duration, result)
+            except KeyboardInterrupt:
+                print("\n[停止] 收到中断；未完成任务下次运行会自动恢复。", flush=True)
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                return 130
+            finally:
+                executor.shutdown(wait=True)
 
             elapsed = time.monotonic() - all_started
             print(f"\n[汇总] 成功={succeeded} 新失败={newly_failed} 跳过={skipped} "
