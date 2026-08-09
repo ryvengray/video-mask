@@ -999,6 +999,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
     try:
         consecutive_miss = 0
         ever_had_face = False
+        warned_corruption = False  # 只打一次警告
         while True:
             raw = _read_frame(extract.stdout, frame_size)
             if len(raw) < frame_size:
@@ -1021,13 +1022,10 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                     ever_had_face = True
                 else:
                     consecutive_miss += 1
-            # 管道损坏双层检测:
-            # 1) 像素花屏(快速): 连续30帧无人脸 + 当前帧像素方差异常 → 立即回退
-            # 2) 隐性损坏(兜底): 300帧无人脸 + 从未检出过 + 非纯无人场景 → 回退
-            if consecutive_miss > 30 and _frame_looks_corrupted(img):
-                raise RuntimeError(f"管道帧像素异常(连续{consecutive_miss}帧无人脸), 回退文件模式")
-            if consecutive_miss > 300 and not ever_had_face:
-                raise RuntimeError(f"管道帧隐性损坏(300+帧零检出), 回退文件模式")
+            # 管道损坏检测: 只提示一次
+            if not warned_corruption and consecutive_miss > 300 and not ever_had_face:
+                log("  [注意] 300+帧零人脸检出, 管道帧数据可能异常(HEVC HDR等)")
+                warned_corruption = True
             if face_on:
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
@@ -1212,24 +1210,15 @@ def process_video(src, dst, face_on=True, card_on=True, card_detector="owlv2",
                   card_conf=CARD_OWL_CONF, card_color=None, model_dir=None,
                   card_key_int=CARD_KEY_INT, owl_size=CARD_OWL_SIZE,
                   face_size=FACE_YUNET_SIZE, face_int=FACE_DETECT_INT,
-                  face_conf=FACE_CONF, use_pipe=True, keep_tmp=False,
+                  face_conf=FACE_CONF, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, log=print):
     """处理单个视频: 人脸+信用卡打码, 保留音轨。返回是否成功。"""
-    if use_pipe:
-        try:
-            return _process_pipe(src, dst, face_on, card_on, card_detector,
-                                card_conf, card_color, model_dir,
-                                card_key_int, owl_size, face_size,
-                                face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                                frame_skip, fisheye, fisheye_strength, log)
-        except Exception as e:
-            log(f"  [警告] 管道模式失败({e}), 回退文件模式")
-    return _process_files(src, dst, face_on, card_on, card_detector,
-                          card_conf, card_color, model_dir,
-                          card_key_int, owl_size, face_size,
-                          face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                          frame_skip, fisheye, fisheye_strength, log)
+    return _process_pipe(src, dst, face_on, card_on, card_detector,
+                         card_conf, card_color, model_dir,
+                         card_key_int, owl_size, face_size,
+                         face_int, face_conf, keep_tmp, force_h264, use_gpu,
+                         frame_skip, fisheye, fisheye_strength, log)
 
 
 def expand_inputs(inputs):
@@ -1267,8 +1256,6 @@ def main():
                     help=f"人脸置信度阈值(默认{FACE_CONF}; 降底如0.25可检出更多侧脸/遮挡, 可能增误检)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
                     help="【抽帧频率】跳过间隔(默认1=逐帧; 2=隔1抽1提速2x; 3=每3帧抽1提速3x; 配合--face-int效果叠加)")
-    ap.add_argument("--no-pipe", action="store_true",
-                    help="禁用管道模式, 强制文件模式(调试或特殊场景; 默认已启用流式管道)")
     ap.add_argument("--force-h264", action="store_true",
                     help="强制H.264输出(兼容性无敌: 微信/Android/旧播放器都能播; 画质仍近无损高码率)")
     ap.add_argument("--card-color", default=None,
@@ -1298,9 +1285,8 @@ def main():
                          card_key_int=args.card_key_int, owl_size=args.owl_size,
                          face_size=args.face_size, face_int=args.face_int,
                          face_conf=args.face_conf,
-                         use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
                          force_h264=args.force_h264, use_gpu=not args.no_gpu,
-                         frame_skip=args.frame_skip,
+                         keep_tmp=args.keep_tmp, frame_skip=args.frame_skip,
                          fisheye=args.fisheye, fisheye_strength=args.fisheye_strength):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
