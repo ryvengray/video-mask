@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARGS = ["--no-card", "--face-size", "960", "--face-int", "5", "--frame-skip", "3"]
+DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--no-card", "--face-size", "960",
+                "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8"]
+DEFAULT_ALGORITHM = "video_mask_batch_fish.py"
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -64,7 +66,7 @@ class Worker:
 
     @staticmethod
     def capabilities() -> dict[str, Any]:
-        info: dict[str, Any] = {"algorithm": "video_mask_batch_skip.py", "pid": os.getpid()}
+        info: dict[str, Any] = {"algorithm": DEFAULT_ALGORITHM, "pid": os.getpid()}
         try:
             import torch
             info.update({"cuda_available": torch.cuda.is_available(), "torch": torch.__version__})
@@ -195,7 +197,7 @@ def main() -> None:
     parser.add_argument("--worker-id", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--work-dir", type=Path, default=Path("/home/ubuntu/work/video-mask"))
-    parser.add_argument("--algorithm", type=Path, default=Path(__file__).resolve().parents[1] / "video_mask_batch_skip.py")
+    parser.add_argument("--algorithm", type=Path, default=Path(__file__).resolve().parents[1] / DEFAULT_ALGORITHM)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--poll-seconds", type=int, default=10)
     parser.add_argument("--extra-arg", action="append", default=[])

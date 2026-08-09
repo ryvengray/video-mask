@@ -52,8 +52,11 @@ class TaskRequest(BaseModel):
     source_size_bytes: int | None = None
     source_sha256: str | None = None
     source_duration_seconds: float | None = None
-    algorithm: str = "video_mask_batch_skip.py"
-    arguments: list[str] = Field(default_factory=lambda: ["--no-card", "--face-size", "960", "--face-int", "5", "--frame-skip", "3"])
+    algorithm: str = "video_mask_batch_fish.py"
+    arguments: list[str] = Field(default_factory=lambda: [
+        "--fisheye", "--fisheye-device", "pico4", "--no-card", "--face-size", "960",
+        "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8",
+    ])
     output_object_key: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=20)
 
