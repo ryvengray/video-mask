@@ -16,3 +16,4 @@ masked_out/
 *.AVI
 *.mkv
 *.MKV
+terraform-host.pem
