@@ -57,3 +57,16 @@
     name: video-mask-controller
     enabled: true
     state: started
+
+- name: Apply controller service changes before deploying Workers
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait until the controller API is ready
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8080/healthz
+    method: GET
+    status_code: 200
+  register: video_mask_controller_health
+  retries: 12
+  delay: 2
+  until: video_mask_controller_health.status == 200
