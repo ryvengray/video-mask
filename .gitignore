@@ -17,3 +17,4 @@ masked_out/
 *.mkv
 *.MKV
 terraform-host.pem
+terraform-user_accessKeys.csv
