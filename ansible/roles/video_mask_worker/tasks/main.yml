@@ -15,6 +15,7 @@
     dest: "{{ video_mask_app_dir }}"
     version: "{{ video_mask_ref }}"
     update: true
+    accept_newhostkey: true
   become_user: ubuntu
 
 - name: Provision Worker credential on the controller
