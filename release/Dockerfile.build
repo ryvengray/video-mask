@@ -1,11 +1,17 @@
 # Build Linux x86_64 release binaries on an Ubuntu 24.04-compatible image.
 FROM --platform=linux/amd64 ubuntu:24.04
 
+ARG UBUNTU_MIRROR=http://mirrors.aliyun.com/ubuntu
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-RUN for attempt in 1 2 3 4 5; do \
+RUN sed -i \
+      -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+      -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+      /etc/apt/sources.list.d/ubuntu.sources && \
+    for attempt in 1 2 3 4 5; do \
       apt-get -o Acquire::Retries=5 update; \
       apt-get -o Acquire::Retries=5 -y --fix-broken install || true; \
       if apt-get -o Acquire::Retries=5 install -y --no-install-recommends \

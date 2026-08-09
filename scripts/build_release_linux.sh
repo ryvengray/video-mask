@@ -7,6 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_DIR="${1:?Usage: bash scripts/build_release_linux.sh /path/to/video-mask-release [version]}"
 VERSION="${2:-$(git -C "$ROOT_DIR" describe --tags --always --dirty)}"
 IMAGE="video-mask-release-builder:${VERSION//\//-}"
+UBUNTU_MIRROR="${UBUNTU_MIRROR:-http://mirrors.aliyun.com/ubuntu}"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/video-mask-release.XXXXXX")"
 
 cleanup() {
@@ -23,6 +24,7 @@ docker info >/dev/null || { echo "Error: Docker daemon is not running." >&2; exi
 
 echo "==> Building Linux x86_64 release image: $IMAGE"
 docker build --platform linux/amd64 \
+    --build-arg "UBUNTU_MIRROR=$UBUNTU_MIRROR" \
     --file "$ROOT_DIR/release/Dockerfile.build" \
     --tag "$IMAGE" \
     "$ROOT_DIR"
