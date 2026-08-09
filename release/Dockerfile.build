@@ -26,7 +26,7 @@ COPY . .
 
 RUN python3 -m venv /opt/release-venv && \
     /opt/release-venv/bin/python -m pip install --upgrade pip setuptools wheel && \
-    /opt/release-venv/bin/python -m pip install nuitka orderedset zstandard && \
+    /opt/release-venv/bin/python -m pip install nuitka zstandard && \
     /opt/release-venv/bin/python -m pip install '.[cards,cluster]' -r requirements-cuda.txt
 
 RUN mkdir -p /opt/release/bin && \
