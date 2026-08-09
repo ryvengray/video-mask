@@ -180,6 +180,9 @@ video_mask_s3_output_bucket: ''
 video_mask_s3_output_prefix: outputs/
 video_mask_s3_output_region: ''
 EOF
+  # Keep the generated secrets private, but do not leak this restrictive umask
+  # into Ansible: its virtualenv is executed later by the ubuntu service user.
+  umask 022
   echo "==> Wrote configuration: $variables (mode 0600)"
 else
   echo "==> Keeping existing configuration: $variables"
