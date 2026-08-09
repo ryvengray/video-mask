@@ -1,7 +1,9 @@
-video_mask_repo: https://gitee.com/ryven/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
-video_mask_controller_url: https://controller.example.com
+# Use the Controller private VPC address for remote Workers. No HTTPS is
+# required on the private network; restrict TCP 8080 to the Worker security group.
+video_mask_controller_url: http://10.0.0.10:8080
 # Store these secrets with ansible-vault, never commit real values.
 video_mask_admin_token: CHANGE_ME_TO_A_LONG_RANDOM_SECRET
 video_mask_worker_token: CHANGE_ME_TO_A_LONG_RANDOM_SECRET

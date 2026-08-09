@@ -35,6 +35,15 @@ echo "Cluster code is ready"
 git status --short
 ```
 
+仅启动 Controller、暂时没有 Worker 时，可运行
+`bash scripts/bootstrap_cluster_controller.sh` 自动生成本机配置并部署。
+多机 AWS 环境请指定 Controller 私网地址，例如：
+
+```bash
+bash scripts/bootstrap_cluster_controller.sh \
+  --controller-url http://10.0.1.25:8080
+```
+
 ## 1. 安装 Ansible
 
 ```bash
@@ -111,7 +120,7 @@ nano group_vars/all.yml
 保留 `video_mask_repo` 等已有配置，并至少设置以下内容；把两处 Token 替换成刚刚生成的不同随机值：
 
 ```yaml
-video_mask_repo: https://gitee.com/ryven/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
 
