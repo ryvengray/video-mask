@@ -5,11 +5,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-RUN for attempt in 1 2 3; do \
-      apt-get update && apt-get install -y --fix-missing --no-install-recommends \
-    build-essential ccache patchelf python3 python3-dev python3-pip python3-venv \
-    ca-certificates libgl1 libglib2.0-0 && break; \
-      test "$attempt" = 3 && exit 1; sleep 5; \
+RUN for attempt in 1 2 3 4 5; do \
+      apt-get -o Acquire::Retries=5 update; \
+      apt-get -o Acquire::Retries=5 -y --fix-broken install || true; \
+      if apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        bzip2 build-essential ccache patchelf python3 python3-dev python3-pip python3-venv \
+        ca-certificates libgl1 libglib2.0-0; then break; fi; \
+      test "$attempt" = 5 && exit 1; sleep 10; \
     done && \
     rm -rf /var/lib/apt/lists/*
 
