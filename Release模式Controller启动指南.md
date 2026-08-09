@@ -62,9 +62,8 @@ cp inventory.yml.example inventory.yml
 controller:
   hosts:
     controller-01:
-      ansible_host: 10.0.0.10       # Controller 私网 IP
       ansible_user: ubuntu
-      ansible_ssh_private_key_file: /secure/path/controller.pem
+      ansible_connection: local      # Ansible 与 Controller 在同一台机器
 
 gpu_workers:
   hosts: {}
