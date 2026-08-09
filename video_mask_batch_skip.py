@@ -398,12 +398,14 @@ class FaceDetector:
 
 
 class FaceProcessor:
-    """人脸检测+光流跟踪: 每N帧检测1次, 中间帧LK光流跟随, 减少检测调用"""
+    """人脸检测+光流跟踪: 每N帧检测1次, 中间帧LK光流跟随, 减少检测调用。
+    支持多人脸: 直接使用 YuNet 全部检出框, 通过光流独立跟踪每个脸。
+    """
     def __init__(self, detector, detect_int=FACE_DETECT_INT, grace=FACE_GRACE, conf=FACE_CONF):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.conf = conf
-        self.tracker = Tracker(grace)
+        self.miss_count = {}    # 每个脸的漏检计数
         self.last_faces = []
         self.prev_gray = None
         self.face_pts = {}
@@ -423,20 +425,85 @@ class FaceProcessor:
                                       minDistance=5, mask=mask, blockSize=7)
         return None if pts is None else pts.reshape(-1, 1, 2)
 
+    @staticmethod
+    def _iou(box_a, box_b):
+        """两个框的 IoU"""
+        x1 = max(box_a[0], box_b[0])
+        y1 = max(box_a[1], box_b[1])
+        x2 = min(box_a[2], box_b[2])
+        y2 = min(box_a[3], box_b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(1, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
+        area_b = max(1, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
+        return inter / (area_a + area_b - inter)
+
+    @staticmethod
+    def _match_faces(dets, last_faces):
+        """将新的检测框匹配到上一帧的脸(贪心IoU匹配), 返回 pairs 和 unmatched dets"""
+        if not last_faces:
+            return [], list(dets)
+        used = set()
+        pairs = []
+        for l_idx, old in enumerate(last_faces):
+            best_i, best_iou = -1, 0.3  # IoU < 0.3 视为新人脸
+            for d_idx, det in enumerate(dets):
+                if d_idx in used:
+                    continue
+                iou = FaceProcessor._iou(old, det)
+                if iou > best_iou:
+                    best_iou, best_i = iou, d_idx
+            if best_i >= 0:
+                used.add(best_i)
+                pairs.append((l_idx, best_i))
+        unmatched = [d for i, d in enumerate(dets) if i not in used]
+        return pairs, unmatched
+
     def process(self, img, frame_idx):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_faces
         if need_detect:
             dets = self.detector.detect(img, conf=self.conf)
-            faces = self.tracker.update(dets)
-            self.face_pts = {}
-            for i, box in enumerate(faces):
-                pts = self._init_pts(gray, box)
-                if pts is not None:
-                    self.face_pts[i] = pts
-            self.last_faces = faces
+            if not dets:
+                # 没有新检测 → 沿用旧框(FACE_GRACE帧内)
+                self.last_faces = [f for i, f in enumerate(self.last_faces)
+                                   if self.miss_count.get(i, 0) < FACE_GRACE]
+                for i in list(self.miss_count.keys()):
+                    if self.miss_count[i] >= FACE_GRACE:
+                        self.miss_count.pop(i, None)
+                    else:
+                        self.miss_count[i] = self.miss_count.get(i, 0) + 1
+            else:
+                # 匹配新检测到已有脸
+                pairs, unmatched = self._match_faces(dets, self.last_faces)
+                new_faces = {}
+                new_pts = {}
+                # 匹配上的: 更新位置
+                for l_idx, d_idx in pairs:
+                    new_faces[l_idx] = dets[d_idx]
+                    self.miss_count[l_idx] = 0
+                # 新出现的人脸
+                next_idx = len(self.last_faces)
+                for det in unmatched:
+                    new_faces[next_idx] = det
+                    self.miss_count[next_idx] = 0
+                    next_idx += 1
+                # 旧脸上次有但这次没匹配到的: 漏检计数+1, 沿用旧框
+                for i in range(len(self.last_faces)):
+                    if i not in new_faces:
+                        miss = self.miss_count.get(i, 0) + 1
+                        if miss <= FACE_GRACE:
+                            new_faces[i] = self.last_faces[i]
+                            self.miss_count[i] = miss
+                self.last_faces = list(new_faces.values())
+                self.face_pts = {}
+                for i, box in enumerate(self.last_faces):
+                    pts = self._init_pts(gray, box)
+                    if pts is not None:
+                        self.face_pts[i] = pts
         elif self.prev_gray is not None and self.last_faces and self.face_pts:
-            tracked, new_pts = [], {}
+            # 光流跟踪模式
+            tracked = []
+            new_pts_dict = {}
             for i, (x1, y1, x2, y2) in enumerate(self.last_faces):
                 if i not in self.face_pts or len(self.face_pts[i]) < 4:
                     tracked.append((x1, y1, x2, y2))
@@ -452,10 +519,10 @@ class FaceProcessor:
                     dy = float(np.median(good[:, 1] - old_flat[:, 1]))
                     tracked.append((int(x1 + dx), int(y1 + dy),
                                     int(x2 + dx), int(y2 + dy)))
-                    new_pts[i] = good.reshape(-1, 1, 2)
+                    new_pts_dict[i] = good.reshape(-1, 1, 2)
                 else:
                     tracked.append((x1, y1, x2, y2))
-            self.face_pts = new_pts
+            self.face_pts = new_pts_dict
             self.last_faces = tracked
         self.prev_gray = gray
         return self.last_faces
