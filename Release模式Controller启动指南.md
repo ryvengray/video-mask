@@ -18,6 +18,48 @@ Controller 可作为 Ansible 控制端，但它只能使用 release 仓库中随
 
 Controller 需要能访问 GitHub release 仓库；Worker 通过内网访问 Controller 的 TCP `8080`。内网部署不需要 HTTPS，但安全组应只允许 Worker 网段访问 `8080`。
 
+## 0.1 创建共享只读 release Deploy Key（一次性）
+
+这把 Key 仅用于读取 `video-mask-release`，由客户 Controller 保存，并由 Ansible 自动分发给所有动态 Worker。不要使用构建服务器用于 push release 的可写 Key，也不要给它源码仓库权限。
+
+在受信任的构建/运维机生成一次：
+
+```bash
+ssh-keygen -t ed25519 \
+  -f ~/.ssh/video-mask-release-readonly \
+  -C "video-mask-release-cluster-readonly" \
+  -N ""
+
+cat ~/.ssh/video-mask-release-readonly.pub
+```
+
+在 GitHub 打开 `ryvengray/video-mask-release`：
+
+1. 进入 `Settings` → `Deploy keys` → `Add deploy key`；
+2. 名称填写 `video-mask-release-cluster-readonly`；
+3. 粘贴上一步输出的 **公钥**；
+4. **不要勾选** `Allow write access`；
+5. 保存。
+
+随后通过受控安全渠道把私钥文件 `~/.ssh/video-mask-release-readonly` 交给客户 Controller，并在 Controller 上保存为：
+
+```bash
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+# 将收到的私钥保存为下面这个文件；不要把它提交到任何 Git 仓库。
+chmod 600 ~/.ssh/video-mask-release
+```
+
+Controller 后续会将同一份私钥加密保存到 Ansible Vault；Ansible 初始化每台 Worker 时，会以 `0600` 权限写入该 Worker 的 `~/.ssh/video-mask-release`。Worker 销毁时不需要去 GitHub 删除 Key。
+
+测试 Controller 上的 Key：
+
+```bash
+ssh -i ~/.ssh/video-mask-release -o IdentitiesOnly=yes -T git@github.com
+```
+
+GitHub 提示认证成功、但不提供 shell 是正常结果。
+
 ## 1. 构建并发布 release
 
 先在构建机完成一次发布。记下输出版本号；通常就是源码提交短 SHA。
@@ -34,7 +76,7 @@ bash scripts/publish_release.sh ~/video-mask-release
 
 以下操作在客户 Controller 上进行。它使用 release 仓库里的部署包，不需要源码仓库权限。
 
-先安装 Ansible 与 Git LFS，并 clone release 仓库。该仓库使用共享只读 Deploy Key；密钥配置方式见 [Release构建服务器部署指南.md](./Release构建服务器部署指南.md)。
+先安装 Ansible 与 Git LFS，并 clone release 仓库。该仓库使用上一节创建的共享只读 Deploy Key。
 
 ```bash
 sudo apt-get update
@@ -216,7 +258,7 @@ ansible-playbook -i inventory.yml site.yml \
 
 ### `Permission denied (publickey)`
 
-检查 Vault 中的 Deploy Key 私钥、GitHub `video-mask-release` 仓库中的 Deploy Key，以及该 Key 的只读权限。Controller 不需要源码仓库 Key。
+检查 Controller 的 `~/.ssh/video-mask-release`、Vault 中的 Deploy Key 私钥、GitHub `video-mask-release` 仓库中的 Deploy Key，以及该 Key 的只读权限。Controller 不需要源码仓库 Key。
 
 ### `ModuleNotFoundError`
 
