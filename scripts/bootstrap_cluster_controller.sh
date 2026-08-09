@@ -14,6 +14,7 @@ ADMIN_TOKEN=""
 WORKER_TOKEN=""
 DEPLOY=1
 FORCE_CONFIG=0
+DEPLOY_USER="ubuntu"
 
 usage() {
   cat <<'EOF'
@@ -30,6 +31,7 @@ Options:
   --output-dir PATH        Local-test output directory
   --admin-token TOKEN      Reuse a generated admin token; otherwise generate one
   --worker-token TOKEN     Reuse a generated Worker token; otherwise generate one
+  --deploy-user USER       Service/deployment user (default: ubuntu)
   --force-config           Back up and recreate Ansible inventory/configuration
   --no-deploy              Generate configuration but do not run Ansible
   -h, --help               Show this help
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="${2:?missing value for --output-dir}"; shift ;;
     --admin-token) ADMIN_TOKEN="${2:?missing value for --admin-token}"; shift ;;
     --worker-token) WORKER_TOKEN="${2:?missing value for --worker-token}"; shift ;;
+    --deploy-user) DEPLOY_USER="${2:?missing value for --deploy-user}"; shift ;;
     --force-config) FORCE_CONFIG=1 ;;
     --no-deploy) DEPLOY=0 ;;
     -h|--help) usage; exit 0 ;;
@@ -66,13 +69,22 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Error: this script supports Ubuntu/Debian Linux only." >&2
   exit 1
 fi
-if [[ $EUID -eq 0 ]]; then
-  echo "Error: run this script as the deployment user (usually ubuntu), not root." >&2
-  exit 1
-fi
 if ! command -v sudo >/dev/null 2>&1; then
   echo "Error: sudo is required." >&2
   exit 1
+fi
+
+if ! id "$DEPLOY_USER" >/dev/null 2>&1; then
+  echo "Error: deployment user '$DEPLOY_USER' does not exist." >&2
+  exit 1
+fi
+
+if [[ $EUID -eq 0 ]]; then
+  RUN_AS_DEPLOY_USER=(sudo -u "$DEPLOY_USER")
+  ANSIBLE_BECOME_ARGS=()
+else
+  RUN_AS_DEPLOY_USER=()
+  ANSIBLE_BECOME_ARGS=(-K)
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -100,7 +112,7 @@ if [[ "$SOURCE_REPO" != "$APP_DIR" ]]; then
   fi
   if [[ ! -d "$APP_DIR/.git" ]]; then
     echo "==> Cloning $REPO_URL into $APP_DIR"
-    git clone --branch "$REPO_REF" "$REPO_URL" "$APP_DIR"
+    "${RUN_AS_DEPLOY_USER[@]}" git clone --branch "$REPO_REF" "$REPO_URL" "$APP_DIR"
   fi
 fi
 
@@ -109,7 +121,7 @@ if [[ ! -f "$APP_DIR/ansible/site.yml" ]]; then
   exit 1
 fi
 
-git -C "$APP_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || true
+"${RUN_AS_DEPLOY_USER[@]}" git -C "$APP_DIR" remote set-url origin "$REPO_URL" 2>/dev/null || true
 mkdir -p "$SOURCE_DIR" "$OUTPUT_DIR"
 
 timestamp="$(date +%Y%m%d%H%M%S)"
@@ -181,7 +193,7 @@ fi
 
 echo "==> Deploying Controller"
 cd "$APP_DIR"
-ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit controller -K
+ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit controller "${ANSIBLE_BECOME_ARGS[@]}"
 
 echo
 echo "Controller bootstrap complete. Verify with:"
