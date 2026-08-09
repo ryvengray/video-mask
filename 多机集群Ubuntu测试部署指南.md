@@ -111,7 +111,7 @@ nano group_vars/all.yml
 保留 `video_mask_repo` 等已有配置，并至少设置以下内容；把两处 Token 替换成刚刚生成的不同随机值：
 
 ```yaml
-video_mask_repo: git@gitee.com:ryven/video-mask.git
+video_mask_repo: https://gitee.com/ryven/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
 

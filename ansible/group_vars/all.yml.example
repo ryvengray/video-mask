@@ -1,4 +1,4 @@
-video_mask_repo: git@gitee.com:ryven/video-mask.git
+video_mask_repo: https://gitee.com/ryven/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
 video_mask_controller_url: https://controller.example.com
