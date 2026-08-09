@@ -84,3 +84,22 @@ def test_local_ingestor_creates_one_file_task(tmp_path: Path):
     assert task["output_object_key"] == "masked_clip.mp4"
     assert ingestor.scan() == 0
     store.close()
+
+
+def test_duplicate_local_scan_does_not_block_worker_claim(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir()
+    (source_dir / "clip.mp4").write_bytes(b"test video")
+    ingestor = LocalIngestor(store, source_dir, tmp_path / "outputs")
+
+    assert ingestor.scan() == 1
+    # The second scan hits the task's unique ID, as it does before each claim.
+    assert ingestor.scan() == 0
+    claimed = store.claim("worker-01", TOKEN)
+
+    assert claimed is not None
+    assert claimed["status"] == "assigned"
+    store.close()

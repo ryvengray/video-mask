@@ -162,17 +162,24 @@ class ClusterStore:
         if missing:
             raise ValueError(f"missing required fields: {', '.join(missing)}")
         stamp = now()
-        self.conn.execute("""
-            INSERT INTO tasks(task_id, source_url, source_object_key, source_size_bytes, source_sha256,
-              source_duration_seconds, algorithm, arguments_json, output_upload_url, output_object_key,
-              status, max_attempts, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-        """, (task_id, payload["source_url"], payload.get("source_object_key"),
-              payload.get("source_size_bytes"), payload.get("source_sha256"),
-              payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
-              json.dumps(args), payload["output_upload_url"], payload.get("output_object_key"),
-              int(payload.get("max_attempts", 3)), stamp, stamp))
-        self.conn.commit()
+        try:
+            self.conn.execute("""
+                INSERT INTO tasks(task_id, source_url, source_object_key, source_size_bytes, source_sha256,
+                  source_duration_seconds, algorithm, arguments_json, output_upload_url, output_object_key,
+                  status, max_attempts, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """, (task_id, payload["source_url"], payload.get("source_object_key"),
+                  payload.get("source_size_bytes"), payload.get("source_sha256"),
+                  payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
+                  json.dumps(args), payload["output_upload_url"], payload.get("output_object_key"),
+                  int(payload.get("max_attempts", 3)), stamp, stamp))
+            self.conn.commit()
+        except Exception:
+            # A duplicate local-ingest task is expected and is handled by the
+            # caller.  SQLite keeps the failed INSERT transaction open unless
+            # it is rolled back, which would otherwise block the next claim.
+            self.conn.rollback()
+            raise
         return self.task(task_id) or {}
 
     @synchronized
