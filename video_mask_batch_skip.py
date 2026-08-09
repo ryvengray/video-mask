@@ -102,6 +102,37 @@ def heavy_mosaic(img, x1, y1, x2, y2, cells=6, sigma=35.0):
     img[y1:y2, x1:x2] = big
 
 
+# -- 鱼眼去畸变 (无需标定, 自动估算) --
+
+_fisheye_maps_cache = {}  # 按 (w, h, strength) 缓存 remap 映射表
+
+def fisheye_undistort(img, strength=1.0):
+    """对单帧做鱼眼去畸变, 返回矫正后的图像。
+
+    原理: OpenCV fisheye 模型, K 矩阵自动估算(假设宽FOV),
+    畸变系数 D = [k1 * strength, k2 * strength, 0, 0]。
+    映射表按分辨率缓存, 同一视频只算一次。
+    """
+    h, w = img.shape[:2]
+    cache_key = (w, h, strength)
+    if cache_key in _fisheye_maps_cache:
+        map1, map2 = _fisheye_maps_cache[cache_key]
+        return cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+
+    # 估算内参矩阵 K: 假设焦距 ≈ max(w,h) * 0.45(宽FOV)
+    fx = max(w, h) * 0.45
+    K = np.array([[fx, 0, w / 2], [0, fx, h / 2], [0, 0, 1]], dtype=np.float64)
+    # 畸变系数: k1 主导桶形畸变, strength 控制强度
+    D = np.array([0.35 * strength, 0.08 * strength, 0, 0], dtype=np.float64)
+
+    new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+        K, D, (w, h), np.eye(3), balance=0.6)
+    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+        K, D, np.eye(3), new_K, (w, h), cv2.CV_16SC2)
+    _fisheye_maps_cache[cache_key] = (map1, map2)
+    return cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+
+
 class Tracker:
     """短时漏检沿用上一帧框(几何法/人脸用)"""
     def __init__(self, grace):
@@ -679,34 +710,53 @@ def has_audio(path):
 
 
 def get_fps(path):
+    """获取视频真实帧率(优先 avg_frame_rate, 无效时回退 duration/帧数推算)"""
     r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-              "-show_entries", "stream=r_frame_rate",
+              "-show_entries", "stream=r_frame_rate,avg_frame_rate,nb_frames",
               "-of", "default=noprint_wrappers=1:nokey=1", path])
-    s = r.stdout.strip()
-    if "/" in s:
-        num, den = s.split("/")
+    lines = [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
+    # 优先 avg_frame_rate(最可靠); r_frame_rate 可能是错误元数据(如 600fps)
+    for line in lines:
+        if "/" in line:
+            num, den = line.split("/")
+            try:
+                fps = float(num) / float(den)
+                if 1 <= fps <= 240:  # 合理范围
+                    return fps
+            except (ValueError, ZeroDivisionError):
+                pass
+    # 都不合理时用 duration/nb_frames 推算
+    dur = get_duration(path)
+    for line in lines:
         try:
-            return float(num) / float(den)
-        except ZeroDivisionError:
+            nb = int(line)
+            if nb > 0 and dur and dur > 0:
+                return nb / dur
+        except ValueError:
             pass
     return 25.0
+
+
+def get_duration(path):
+    """获取视频时长(秒)"""
+    r = _run(["ffprobe", "-v", "error", "-show_entries",
+              "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path])
+    try:
+        return float(r.stdout.strip())
+    except (ValueError, TypeError):
+        return None
 
 
 def get_video_info(path):
     """获取视频宽、高、帧率(已考虑旋转)"""
     r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-              "-show_entries", "stream=width,height,r_frame_rate",
+              "-show_entries", "stream=width,height",
               "-of", "csv=p=0", path])
     parts = r.stdout.strip().split(",")
-    if len(parts) < 3:
+    if len(parts) < 2:
         return 1920, 1080, 25.0, 0
     w, h = int(parts[0]), int(parts[1])
-    fps_str = parts[2]
-    if "/" in fps_str:
-        num, den = fps_str.split("/")
-        fps = float(num) / float(den) if float(den) != 0 else 25.0
-    else:
-        fps = float(fps_str) if fps_str else 25.0
+    fps = get_fps(path)  # 使用修复后的帧率获取
     # 检测旋转(iPhone等设备拍摄的竖屏视频有旋转元数据)
     rot = get_rotation(path)
     if abs(rot) == 90:
@@ -789,20 +839,34 @@ def find_hw_encoder(family="hevc"):
     return None
 
 
-def hw_bitrate(w, h, fps, encoder):
+def get_bitrate(path):
+    """获取视频总码率(bps), 用于编码时不超过原片码率"""
+    r = _run(["ffprobe", "-v", "error", "-show_entries",
+              "format=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", path])
+    try:
+        return int(r.stdout.strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
     """根据编码器和分辨率算目标码率(接近原片画质)。
 
     HEVC 效率高, 0.10 系数即可接近原片; H.264 效率低需更高码率补偿。
-    下限 4Mbps, 保证小视频也有基本画质。
+    下限 1Mbps(保证极低分辨率视频也有基本画质)。
+    如果原片码率更低则不超过原片码率(避免小视频无故膨胀)。
     """
     factor = 0.10 if (encoder or "").startswith(("hevc", "h265")) else 0.15
-    return max(int(w * h * fps * factor), 4000000)
+    target = max(int(w * h * fps * factor), 1000000)
+    if src_bitrate and src_bitrate > 0:
+        target = min(target, int(src_bitrate))
+    return target
 
 
 def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                   card_color, model_dir, card_key_int, owl_size, face_size,
                   face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                  frame_skip, log):
+                  frame_skip, fisheye, fisheye_strength, log):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     帧流转: 解码后通过 stdout pipe 传 BGR 裸数据到 Python,
@@ -878,8 +942,8 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                     "-rc", "vbr", "-cq", "20", "-b:v", "0"]
         log("  [编码] NVENC GPU 硬件编码 (h264_nvenc, preset=p4)")
     elif hw:
-        bitrate = hw_bitrate(w, h, fps, hw)
-        enc_cmd += ["-c:v", hw, "-b:v", str(bitrate), "-real_time", "0"]
+        bitrate = hw_bitrate(w, h, fps, hw, get_bitrate(src))
+        enc_cmd += ["-c:v", hw, "-b:v", str(bitrate)]
         if hw.startswith(("hevc", "h265")):
             enc_cmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
         log(f"  [编码] 硬件加速: {hw} ({bitrate // 1000}kbps)")
@@ -931,6 +995,10 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                 continue
             img = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).copy()
 
+            # 鱼眼去畸变: 矫正后再检测人脸, 大幅提升识别率
+            if fisheye:
+                img = fisheye_undistort(img, fisheye_strength)
+
             faces, cards = [], []
             if face_on:
                 faces = face_proc.process(img, frame_idx)
@@ -941,6 +1009,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
             # 前20帧后, 连续30个处理帧没有检测到任何人脸 → 管道数据损坏, 回退文件模式
             if face_on and frame_idx > 20 and consecutive_miss > 30:
                 raise RuntimeError(f"管道帧数据异常(连续{consecutive_miss}处理帧无人脸), 回退文件模式")
+            if face_on:
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
                     heavy_mosaic(img, int(x1 - FACE_EXPAND * bw),
@@ -988,6 +1057,24 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
     if not keep_tmp and encode.returncode == 0:
         shutil.rmtree(tmp, ignore_errors=True)
     elapsed = time.time() - t0
+    # 完整性检查: 超高帧率视频管道可能跟不上下游, 若实际处理帧远低于预期则自动回退文件模式
+    duration = get_duration(src)
+    if duration and duration > 5:
+        total_expected = int(fps * duration)  # 视频总帧数(含跳帧前)
+        actual_ratio = frame_idx / max(1, total_expected)
+        if actual_ratio < 0.3:
+            # 流式管道提前结束(<30%帧处理完成), 自动回退文件模式
+            extract.stdout.close()
+            extract.wait()
+            try:
+                encode.stdin.close()
+            except BrokenPipeError:
+                pass
+            encode.wait()
+            if not keep_tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(
+                f"管道提前结束(仅处理{frame_idx}/{total_expected}帧, {actual_ratio:.0%}), 回退文件模式")
     log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face} 卡帧次={total_card}")
     return encode.returncode == 0
 
@@ -995,7 +1082,7 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
 def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
                    card_color, model_dir, card_key_int, owl_size, face_size,
                    face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                   frame_skip, log):
+                   frame_skip, fisheye, fisheye_strength, log):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1046,6 +1133,9 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
         img = cv2.imread(os.path.join(fin, fn))
         if img is None:
             continue
+        # 鱼眼去畸变
+        if fisheye:
+            img = fisheye_undistort(img, fisheye_strength)
         faces, cards = [], []
         if face_on:
             faces = face_proc.process(img, i)
@@ -1078,7 +1168,7 @@ def _process_files(src, dst, face_on, card_on, card_detector, card_conf,
     if has_audio(src):
         vcmd += ["-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
     if hw:
-        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw)), "-real_time", "0"]
+        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw, get_bitrate(src)))]
         if hw.startswith(("hevc", "h265")):
             vcmd += ["-tag:v", "hvc1"]
         log(f"  [编码] 硬件: {hw}")
@@ -1104,7 +1194,8 @@ def process_video(src, dst, face_on=True, card_on=True, card_detector="owlv2",
                   card_key_int=CARD_KEY_INT, owl_size=CARD_OWL_SIZE,
                   face_size=FACE_YUNET_SIZE, face_int=FACE_DETECT_INT,
                   face_conf=FACE_CONF, use_pipe=True, keep_tmp=False,
-                  force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP, log=print):
+                  force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
+                  fisheye=False, fisheye_strength=1.0, log=print):
     """处理单个视频: 人脸+信用卡打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1112,14 +1203,14 @@ def process_video(src, dst, face_on=True, card_on=True, card_detector="owlv2",
                                 card_conf, card_color, model_dir,
                                 card_key_int, owl_size, face_size,
                                 face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                                frame_skip, log)
+                                frame_skip, fisheye, fisheye_strength, log)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, card_on, card_detector,
                           card_conf, card_color, model_dir,
                           card_key_int, owl_size, face_size,
                           face_int, face_conf, keep_tmp, force_h264, use_gpu,
-                          frame_skip, log)
+                          frame_skip, fisheye, fisheye_strength, log)
 
 
 def expand_inputs(inputs):
@@ -1149,6 +1240,10 @@ def main():
                     help="YuNet人脸检测输入最长边(默认1280快且准; 0=原图最准最慢; 远景多人脸可调低)")
     ap.add_argument("--face-int", type=int, default=FACE_DETECT_INT,
                     help="人脸检测间隔帧数(默认3: 每3帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
+    ap.add_argument("--fisheye", action="store_true",
+                    help="鱼眼视频去畸变(提升鱼眼镜头下人脸识别率, 输出也为去畸变后视频)")
+    ap.add_argument("--fisheye-strength", type=float, default=1.0,
+                    help="鱼眼畸变强度(默认1.0; 桶形畸变越严重调越大, 1.5~2.0)")
     ap.add_argument("--face-conf", type=float, default=FACE_CONF,
                     help=f"人脸置信度阈值(默认{FACE_CONF}; 降底如0.25可检出更多侧脸/遮挡, 可能增误检)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
@@ -1186,7 +1281,8 @@ def main():
                          face_conf=args.face_conf,
                          use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
                          force_h264=args.force_h264, use_gpu=not args.no_gpu,
-                         frame_skip=args.frame_skip):
+                         frame_skip=args.frame_skip,
+                         fisheye=args.fisheye, fisheye_strength=args.fisheye_strength):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
