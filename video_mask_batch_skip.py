@@ -863,6 +863,19 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
     return target
 
 
+def _frame_looks_corrupted(img):
+    """检查帧数据是否花屏(管道HEVC HDR转换异常)。
+
+    正常帧: 各通道像素标准差 > 15(BGR 0-255范围), 有自然纹理
+    管道花屏: 标准差 < 10, 呈现纯色块/条纹(无自然纹理)
+    """
+    if img is None or img.size == 0:
+        return True
+    stds = [float(np.std(img[:, :, c])) for c in range(3)]
+    # 三个通道都极低方差 → 花屏; 任一通道正常 → 正常
+    return all(s < 10 for s in stds)
+
+
 def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                   card_color, model_dir, card_key_int, owl_size, face_size,
                   face_int, face_conf, keep_tmp, force_h264, use_gpu,
@@ -984,7 +997,8 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
         return data
 
     try:
-        consecutive_miss = 0  # 连续漏检计数, 超阈值说明管道帧损坏, 自动回退文件模式
+        consecutive_miss = 0
+        ever_had_face = False
         while True:
             raw = _read_frame(extract.stdout, frame_size)
             if len(raw) < frame_size:
@@ -1004,11 +1018,16 @@ def _process_pipe(src, dst, face_on, card_on, card_detector, card_conf,
                 faces = face_proc.process(img, frame_idx)
                 if faces:
                     consecutive_miss = 0
+                    ever_had_face = True
                 else:
                     consecutive_miss += 1
-            # 前20帧后, 连续30个处理帧没有检测到任何人脸 → 管道数据损坏, 回退文件模式
-            if face_on and frame_idx > 20 and consecutive_miss > 30:
-                raise RuntimeError(f"管道帧数据异常(连续{consecutive_miss}处理帧无人脸), 回退文件模式")
+            # 管道损坏双层检测:
+            # 1) 像素花屏(快速): 连续30帧无人脸 + 当前帧像素方差异常 → 立即回退
+            # 2) 隐性损坏(兜底): 300帧无人脸 + 从未检出过 + 非纯无人场景 → 回退
+            if consecutive_miss > 30 and _frame_looks_corrupted(img):
+                raise RuntimeError(f"管道帧像素异常(连续{consecutive_miss}帧无人脸), 回退文件模式")
+            if consecutive_miss > 300 and not ever_had_face:
+                raise RuntimeError(f"管道帧隐性损坏(300+帧零检出), 回退文件模式")
             if face_on:
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
