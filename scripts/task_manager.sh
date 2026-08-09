@@ -14,7 +14,23 @@ DEFAULT_EXTRA_ARGS=(--no-card --face-size 960 --face-int 1 --frame-skip 3 --fish
 DEFAULT_EXTRA_LINE="--no-card --face-size 960 --face-int 1 --frame-skip 3 --fisheye"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
-trap 'printf "\nCtrl+C only leaves the current prompt; running tasks stay detached.\n"' INT
+LAST_INTERRUPT_AT=0
+INTERRUPTED_PROMPT=0
+
+handle_interrupt() {
+    local now
+    now="$(date +%s)"
+    if (( LAST_INTERRUPT_AT > 0 && now - LAST_INTERRUPT_AT <= 3 )); then
+        printf '\nSecond Ctrl+C received. Exiting task manager; detached tasks stay active.\n'
+        trap - INT
+        exit 130
+    fi
+    LAST_INTERRUPT_AT="$now"
+    INTERRUPTED_PROMPT=1
+    printf '\nCtrl+C received. Press Ctrl+C again within 3 seconds to exit; detached tasks stay active.\n'
+}
+
+trap handle_interrupt INT
 
 die() { printf 'Error: %s\n' "$*" >&2; }
 pause() { read -r -p 'Press Enter to return to the menu... ' _; }
@@ -308,7 +324,11 @@ view_history() {
 while true; do
     printf '\n=== Video Mask Task Manager ===\n'
     printf '1) Start task\n2) Stop task\n3) View current progress\n4) View task history\n5) Exit\n'
+    INTERRUPTED_PROMPT=0
     if ! read -r -p 'Choose an action [1-5]: ' action; then
+        if (( INTERRUPTED_PROMPT )); then
+            continue
+        fi
         printf '\nInput closed. Goodbye. Running tasks remain active.\n'
         exit 0
     fi
