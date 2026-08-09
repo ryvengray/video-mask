@@ -88,6 +88,18 @@ git clone git@github-video-mask-source:ryvengray/video-mask.git
 git clone git@github-video-mask-release:ryvengray/video-mask-release.git
 ```
 
+release 压缩包通常远大于 GitHub 的普通单文件限制，release 仓库必须使用 Git LFS。首次初始化 release 仓库时执行一次：
+
+```bash
+sudo apt-get install -y git-lfs
+cd ~/video-mask-release
+git lfs install
+git lfs track 'artifacts/*.tar.gz'
+git add .gitattributes
+git commit -m "chore: store release archives with Git LFS"
+git push origin main
+```
+
 ## 5. 一键发布 release
 
 ```bash
@@ -114,7 +126,6 @@ bash scripts/publish_release.sh ~/video-mask-release --version 20260809.1
 ```text
 ~/video-mask-release/artifacts/video-mask-linux-x86_64-<版本>.tar.gz
 ~/video-mask-release/artifacts/video-mask-linux-x86_64-<版本>.SHA256
-~/video-mask-release/artifacts/<版本>/bin/
 ~/video-mask-release/manifests/<版本>.json
 ```
 
@@ -209,6 +220,8 @@ vault_video_mask_release_deploy_key: |
 video_mask_release_repo: git@github.com:ryvengray/video-mask-release.git
 video_mask_release_ref: main
 video_mask_release_dir: /home/ubuntu/video-mask-release
+video_mask_release_version: CHANGE_ME_TO_A_PUBLISHED_RELEASE_VERSION
+video_mask_release_install_root: /opt/video-mask/releases
 video_mask_release_deploy_key: "{{ vault_video_mask_release_deploy_key }}"
 ```
 
@@ -219,4 +232,4 @@ ansible-playbook -i ansible/inventory.yml ansible/site.yml \
   --limit gpu_workers -K --ask-vault-pass
 ```
 
-角色会将私钥以 `0600` 权限写入 `/home/ubuntu/.ssh/video-mask-release`，并使用它 clone/pull release 仓库。密钥内容不会出现在 Playbook 输出中。当前步骤只是预下载 release 仓库；待编译版运行部署验证完成后，Worker 服务将从该目录启动，以彻底移除源码仓库访问。
+角色会将私钥以 `0600` 权限写入 `/home/ubuntu/.ssh/video-mask-release`，并使用它 clone/pull release 仓库。密钥内容不会出现在 Playbook 输出中。随后它会解压指定版本到 `/opt/video-mask/releases/<版本>`，Controller 和 Worker 的 systemd 服务都直接运行该目录中的 Nuitka 二进制，不再 clone、安装或执行源码仓库内容。

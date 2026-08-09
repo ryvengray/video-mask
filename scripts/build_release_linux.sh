@@ -35,10 +35,8 @@ docker cp "$container:/opt/release/." "$STAGE_DIR/"
 docker rm "$container" >/dev/null
 container=""
 
-artifact_dir="$RELEASE_DIR/artifacts/$VERSION"
-mkdir -p "$artifact_dir"
-cp -R "$STAGE_DIR/bin" "$artifact_dir/"
-tar -C "$artifact_dir" -czf "$RELEASE_DIR/artifacts/video-mask-linux-x86_64-$VERSION.tar.gz" bin
+mkdir -p "$RELEASE_DIR/artifacts"
+tar -C "$STAGE_DIR" -czf "$RELEASE_DIR/artifacts/video-mask-linux-x86_64-$VERSION.tar.gz" bin
 (
     cd "$RELEASE_DIR/artifacts"
     shasum -a 256 "video-mask-linux-x86_64-$VERSION.tar.gz" > "video-mask-linux-x86_64-$VERSION.SHA256"

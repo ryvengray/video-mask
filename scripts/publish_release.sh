@@ -55,6 +55,10 @@ done
     echo "Error: release directory is not a Git repository: $RELEASE_DIR" >&2
     exit 1
 }
+command -v git-lfs >/dev/null || {
+    echo "Error: git-lfs is required for large release archives. Install git-lfs and run git lfs install." >&2
+    exit 1
+}
 
 require_clean_tree() {
     local repo="$1"
@@ -78,6 +82,13 @@ VERSION="${VERSION:-$(git -C "$ROOT_DIR" rev-parse --short HEAD)}"
 [[ "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]] || {
     echo "Error: version may contain only letters, numbers, dot, underscore and dash." >&2
     exit 2
+}
+
+LFS_ATTRIBUTE="$(git -C "$RELEASE_DIR" check-attr filter -- "artifacts/video-mask-linux-x86_64-$VERSION.tar.gz")"
+[[ "$LFS_ATTRIBUTE" == *": filter: lfs" ]] || {
+    echo "Error: release archives are not configured for Git LFS." >&2
+    echo "Run: git lfs track 'artifacts/*.tar.gz' && git add .gitattributes && git commit -m 'chore: enable Git LFS'" >&2
+    exit 1
 }
 
 ARCHIVE="$RELEASE_DIR/artifacts/video-mask-linux-x86_64-$VERSION.tar.gz"
