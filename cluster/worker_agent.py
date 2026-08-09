@@ -122,6 +122,23 @@ class Worker:
         if result.returncode != 0:
             raise RuntimeError("output upload failed: " + result.stderr[-1000:])
 
+    def algorithm_command(self, source: Path, output_dir: Path, arguments: list[str]) -> list[str]:
+        """Build an invocation for either a development script or a release binary.
+
+        The normal source deployment supplies a ``.py`` algorithm and therefore
+        needs Python.  A compiled release supplies the executable emitted by
+        Nuitka and must be invoked directly; attempting to run it as a Python
+        script makes an otherwise valid release Worker fail at task claim time.
+        """
+        shared = [str(source), "--out-dir", str(output_dir), *arguments]
+        if self.algorithm.suffix.lower() == ".py":
+            return [self.python, "-u", str(self.algorithm), *shared]
+        if not self.algorithm.is_file():
+            raise RuntimeError(f"algorithm executable does not exist: {self.algorithm}")
+        if not os.access(self.algorithm, os.X_OK):
+            raise RuntimeError(f"algorithm executable is not executable: {self.algorithm}")
+        return [str(self.algorithm), *shared]
+
     def run_task(self, task: dict[str, Any]) -> None:
         task_id = task["task_id"]
         directory = self.work_dir / task_id
@@ -140,8 +157,9 @@ class Worker:
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
             self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size)
-            command = [self.python, "-u", str(self.algorithm), str(source), "--out-dir", str(output_dir),
-                       *(task.get("arguments") or self.extra_args)]
+            command = self.algorithm_command(
+                source, output_dir, task.get("arguments") or self.extra_args
+            )
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
