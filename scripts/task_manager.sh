@@ -10,8 +10,8 @@ TASK_HOME="$ROOT_DIR/.task_manager"
 TASKS_DIR="$TASK_HOME/tasks"
 RUNNERS_DIR="$TASK_HOME/runners"
 DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_skip.py"
-DEFAULT_EXTRA_ARGS=(--no-card --face-size 1280 --face-int 5 --frame-skip 3 --fisheye)
-DEFAULT_EXTRA_LINE="--no-card --face-size 1280 --face-int 5 --frame-skip 3 --fisheye"
+DEFAULT_EXTRA_ARGS=(--no-card --face-size 960 --face-int 1 --frame-skip 3 --fisheye)
+DEFAULT_EXTRA_LINE="--no-card --face-size 960 --face-int 1 --frame-skip 3 --fisheye"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
 trap 'printf "\nCtrl+C only leaves the current prompt; running tasks stay detached.\n"' INT
@@ -20,7 +20,7 @@ die() { printf 'Error: %s\n' "$*" >&2; }
 pause() { read -r -p 'Press Enter to return to the menu... ' _; }
 
 write_meta() {
-    local file="$1" id="$2" pid="$3" started="$4" algorithm="$5" source_dir="$6" target_dir="$7" log_file="$8" extra_args="$9" workers="${10}"
+    local file="$1" id="$2" pid="$3" started="$4" algorithm="$5" source_dir="$6" target_dir="$7" log_file="$8" extra_args="$9" workers="${10}" force_reprocess="${11}"
     {
         printf 'TASK_ID=%q\n' "$id"
         printf 'PID=%q\n' "$pid"
@@ -31,6 +31,7 @@ write_meta() {
         printf 'LOG_FILE=%q\n' "$log_file"
     printf 'EXTRA_ARGS=%q\n' "$extra_args"
     printf 'WORKERS=%q\n' "$workers"
+    printf 'FORCE_REPROCESS=%q\n' "$force_reprocess"
     } > "$file"
 }
 
@@ -120,7 +121,8 @@ choose_algorithm() {
 }
 
 start_task() {
-    local source_dir target_dir extra_line workers_line workers id started log_file meta_file runner_file pid
+    local source_dir target_dir extra_line workers_line force_line force_reprocess id started log_file meta_file runner_file pid
+    local workers
     local -a extra_args=("${DEFAULT_EXTRA_ARGS[@]}")
     if [[ ! -x "$PYTHON_BIN" ]]; then
         die "Python was not found: $PYTHON_BIN"
@@ -146,6 +148,12 @@ start_task() {
         read -r -a extra_args <<< "$extra_line"
     else
         extra_line="$DEFAULT_EXTRA_LINE"
+    fi
+    read -r -p 'Force reprocess completed videos? [y/N]: ' force_line || return
+    if [[ "$force_line" =~ ^[Yy]$ ]]; then
+        force_reprocess=yes
+    else
+        force_reprocess=no
     fi
     workers=1
     [[ "$(basename "$CHOSEN_ALGORITHM")" == "video_mask_face_gpu.py" ]] && workers=2
@@ -186,6 +194,7 @@ start_task() {
         printf 'printf "Source: %%s\\n" %q\n' "$source_dir"
         printf 'printf "Target: %%s\\n" %q\n' "$target_dir"
         printf 'printf "Arguments: %%s\\n" %q\n' "${extra_line:-(none)}"
+        printf 'printf "Force reprocess: %%s\\n" %q\n' "$force_reprocess"
         printf 'printf "Workers: %%s\\n" %q\n' "$workers"
         printf 'echo "--- Runtime environment ---"\n'
         printf 'hostname || true\nuname -a || true\n'
@@ -201,6 +210,7 @@ start_task() {
         printf 'command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || true\n'
         printf 'echo "--- Scheduler output ---"\n'
         printf '%q -u %q %q %q %q %q %q %q ' "$PYTHON_BIN" "$SCHEDULER" "$source_dir" "$target_dir" '--algorithm' "$CHOSEN_ALGORITHM" '--workers' "$workers"
+        [[ "$force_reprocess" == yes ]] && printf '%q ' '--force'
         local arg
         for arg in "${extra_args[@]}"; do
             # '=' is required when the forwarded value itself starts with '--'.
@@ -215,7 +225,7 @@ start_task() {
     setsid "$runner_file" > "$log_file" 2>&1 < /dev/null &
     pid=$!
     write_meta "$meta_file" "$id" "$pid" "$started" "$(basename "$CHOSEN_ALGORITHM")" \
-        "$source_dir" "$target_dir" "$log_file" "$extra_line" "$workers"
+        "$source_dir" "$target_dir" "$log_file" "$extra_line" "$workers" "$force_reprocess"
 
     printf '\nTask started in the background.\n'
     printf 'Task ID: %s\nPID: %s\nLog: %s\n' "$id" "$pid" "$log_file"
