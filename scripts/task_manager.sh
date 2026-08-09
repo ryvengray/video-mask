@@ -10,8 +10,8 @@ TASK_HOME="$ROOT_DIR/.task_manager"
 TASKS_DIR="$TASK_HOME/tasks"
 RUNNERS_DIR="$TASK_HOME/runners"
 DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_skip.py"
-DEFAULT_EXTRA_ARGS=(--no-card --face-size 960 --face-int 5 --frame-skip 3)
-DEFAULT_EXTRA_LINE="--no-card --face-size 960 --face-int 5 --frame-skip 3"
+DEFAULT_EXTRA_ARGS=(--no-card --face-size 1280 --face-int 5 --frame-skip 3 --fisheye)
+DEFAULT_EXTRA_LINE="--no-card --face-size 1280 --face-int 5 --frame-skip 3 --fisheye"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
 trap 'printf "\nCtrl+C only leaves the current prompt; running tasks stay detached.\n"' INT
