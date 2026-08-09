@@ -103,3 +103,21 @@ def test_duplicate_local_scan_does_not_block_worker_claim(tmp_path: Path):
     assert claimed is not None
     assert claimed["status"] == "assigned"
     store.close()
+
+
+def test_list_workers_includes_status_capabilities_and_current_task(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-ready", TOKEN)
+    store.register_worker("worker-ready", TOKEN, {"gpu": "Tesla T4", "cuda_available": True})
+    store.provision_worker("worker-busy", TOKEN)
+    store.register_worker("worker-busy", TOKEN, {})
+    task = store.create_task(task_payload())
+    store.claim("worker-busy", TOKEN)
+
+    workers = store.list_workers()
+
+    assert [worker["worker_id"] for worker in workers] == ["worker-busy", "worker-ready"]
+    assert workers[0]["status"] == "busy"
+    assert workers[0]["current_task_id"] == task["task_id"]
+    assert workers[1]["capabilities"]["gpu"] == "Tesla T4"
+    store.close()

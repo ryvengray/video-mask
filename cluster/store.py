@@ -137,6 +137,16 @@ class ClusterStore:
         return self._row(self.conn.execute("SELECT * FROM workers WHERE worker_id=?", (worker_id,)).fetchone())
 
     @synchronized
+    def list_workers(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute("""
+            SELECT * FROM workers
+            ORDER BY CASE status WHEN 'busy' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
+                     last_seen_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._row(row) or {} for row in rows]
+
+    @synchronized
     def heartbeat(self, worker_id: str, token: str, status: str,
                   capabilities: dict[str, Any] | None = None) -> dict[str, Any]:
         self.authenticate_worker(worker_id, token)

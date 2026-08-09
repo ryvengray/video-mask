@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import html
 import hmac
 import os
 import sqlite3
@@ -147,17 +149,40 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         require_admin(authorization)
         return {"tasks": store.list_tasks(max(1, min(limit, 1000)))}
 
+    @app.get("/api/workers")
+    def list_workers(limit: int = 100, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"workers": store.list_workers(max(1, min(limit, 1000)))}
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard():
         rows = store.list_tasks(100)
-        items = "".join(
-            f"<tr><td>{task['task_id']}</td><td>{task['status']}</td><td>{task['assigned_worker_id'] or '-'}</td>"
-            f"<td>{task['source_object_key'] or task['source_url']}</td><td>{task['attempt_count']}</td></tr>"
+        task_items = "".join(
+            f"<tr><td>{html.escape(str(task['task_id']))}</td><td>{html.escape(str(task['status']))}</td>"
+            f"<td>{html.escape(str(task['assigned_worker_id'] or '-'))}</td>"
+            f"<td>{html.escape(str(task['source_object_key'] or task['source_url']))}</td>"
+            f"<td>{task['attempt_count']}</td></tr>"
             for task in rows
         ) or "<tr><td colspan='5'>No tasks</td></tr>"
+        workers = store.list_workers(100)
+
+        def last_seen(timestamp: float | None) -> str:
+            if not timestamp:
+                return "-"
+            return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        worker_items = "".join(
+            f"<tr><td>{html.escape(str(worker['worker_id']))}</td><td>{html.escape(str(worker['status']))}</td>"
+            f"<td>{html.escape(str((worker.get('capabilities') or {}).get('gpu', '-')))}</td>"
+            f"<td>{html.escape(str((worker.get('capabilities') or {}).get('cuda_available', '-')))}</td>"
+            f"<td>{html.escape(str(worker.get('current_task_id') or '-'))}</td>"
+            f"<td>{last_seen(worker.get('last_seen_at'))}</td></tr>"
+            for worker in workers
+        ) or "<tr><td colspan='6'>No workers registered</td></tr>"
         return """<!doctype html><title>Video Mask Cluster</title>
-        <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.5rem;text-align:left}</style>
-        <h1>Video Mask Cluster</h1><table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Source</th><th>Attempts</th></tr>""" + items + "</table>"
+        <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%;margin:0 0 2rem}td,th{border:1px solid #ddd;padding:.5rem;text-align:left}h2{margin-top:2rem}</style>
+        <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>GPU</th><th>CUDA</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
+            "<h2>Tasks</h2><table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Source</th><th>Attempts</th></tr>" + task_items + "</table>"
 
     return app
 
