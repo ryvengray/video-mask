@@ -88,17 +88,28 @@ git clone git@github-video-mask-source:ryvengray/video-mask.git
 git clone git@github-video-mask-release:ryvengray/video-mask-release.git
 ```
 
-## 5. 构建 release
+## 5. 一键发布 release
 
 ```bash
-git -C ~/video-mask pull --ff-only
-git -C ~/video-mask-release pull --ff-only
 cd ~/video-mask
-VERSION="$(git rev-parse --short HEAD)"
-bash scripts/build_release_linux.sh ~/video-mask-release "$VERSION"
+bash scripts/publish_release.sh ~/video-mask-release
 ```
 
-脚本会启动 Docker，在固定的 Linux x86_64 Ubuntu 24.04 容器中安装编译依赖、运行 Nuitka，并生成：
+脚本会先确认两个仓库没有未提交修改并执行 `git pull --ff-only`，再启动 Docker，在固定的 Linux x86_64 Ubuntu 24.04 容器中安装编译依赖、运行 Nuitka。构建完成后自动执行 SHA256 校验、提交并推送 release 仓库。版本号默认使用当前源码提交短 SHA；同一版本不会被覆盖。
+
+只想构建并在本地检查、不推送时：
+
+```bash
+bash scripts/publish_release.sh ~/video-mask-release --no-push
+```
+
+如需为同一份源码重新打包，显式指定新版本号：
+
+```bash
+bash scripts/publish_release.sh ~/video-mask-release --version 20260809.1
+```
+
+构建产物为：
 
 ```text
 ~/video-mask-release/artifacts/video-mask-linux-x86_64-<版本>.tar.gz
@@ -118,33 +129,22 @@ top
 df -h /
 ```
 
-## 6. 校验并推送
+## 6. 手动校验（可选）
 
 构建完成后：
 
 ```bash
 cd ~/video-mask-release
-VERSION="$(git -C ~/video-mask rev-parse --short HEAD)"
+VERSION="$(git -C ~/video-mask rev-parse --short HEAD)"  # 或指定实际发布版本
 shasum -a 256 -c "artifacts/video-mask-linux-x86_64-$VERSION.SHA256"
 tar -tzf "artifacts/video-mask-linux-x86_64-$VERSION.tar.gz" | head -30
-git add artifacts manifests
-git commit -m "release: build $VERSION"
-git push origin main
 ```
 
 ## 7. 日常发布
 
 ```bash
-git -C ~/video-mask pull --ff-only
-git -C ~/video-mask-release pull --ff-only
 cd ~/video-mask
-VERSION="$(git rev-parse --short HEAD)"
-bash scripts/build_release_linux.sh ~/video-mask-release "$VERSION"
-cd ~/video-mask-release
-shasum -a 256 -c "artifacts/video-mask-linux-x86_64-$VERSION.SHA256"
-git add artifacts manifests
-git commit -m "release: build $VERSION"
-git push origin main
+bash scripts/publish_release.sh ~/video-mask-release
 ```
 
 ## 8. 常见问题
@@ -160,10 +160,10 @@ docker info
 
 ### 下载慢或失败
 
-确认构建机可访问 Docker Hub、PyPI 和 GitHub。构建脚本默认使用阿里云 Ubuntu 镜像；如需改回官方源：
+确认构建机可访问 Docker Hub、PyPI 和 GitHub。构建脚本默认使用 Ubuntu 官方源；若在中国大陆构建且官方源较慢，可临时指定镜像：
 
 ```bash
-UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu bash scripts/build_release_linux.sh ~/video-mask-release "$VERSION"
+UBUNTU_MIRROR=http://mirrors.aliyun.com/ubuntu bash scripts/publish_release.sh ~/video-mask-release
 ```
 
 ### 磁盘不足

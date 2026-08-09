@@ -1,7 +1,7 @@
 # Build Linux x86_64 release binaries on an Ubuntu 24.04-compatible image.
 FROM --platform=linux/amd64 ubuntu:24.04
 
-ARG UBUNTU_MIRROR=http://mirrors.aliyun.com/ubuntu
+ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \

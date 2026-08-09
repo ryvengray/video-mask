@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_DIR="${1:?Usage: bash scripts/build_release_linux.sh /path/to/video-mask-release [version]}"
 VERSION="${2:-$(git -C "$ROOT_DIR" describe --tags --always --dirty)}"
 IMAGE="video-mask-release-builder:${VERSION//\//-}"
-UBUNTU_MIRROR="${UBUNTU_MIRROR:-http://mirrors.aliyun.com/ubuntu}"
+UBUNTU_MIRROR="${UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/video-mask-release.XXXXXX")"
 
 cleanup() {
