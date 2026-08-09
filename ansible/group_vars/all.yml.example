@@ -1,0 +1,20 @@
+video_mask_repo: https://gitee.com/ryven/video-mask.git
+video_mask_ref: main
+video_mask_app_dir: /home/ubuntu/video-mask
+video_mask_controller_url: https://controller.example.com
+# Store these secrets with ansible-vault, never commit real values.
+video_mask_admin_token: CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+video_mask_worker_token: CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+# Testing mode: controller and Worker use their local /home/ubuntu directories.
+# Change to s3 after the external source Bucket grants cross-account read access.
+video_mask_storage_mode: local
+video_mask_local_source_dir: /home/ubuntu/cluster_test_sources
+video_mask_local_output_dir: /home/ubuntu/cluster_test_outputs
+# Reserved S3 settings. Leave blank until the external Bucket owner supplies them.
+video_mask_s3_source_bucket: ''
+video_mask_s3_source_prefix: source/inbox/
+video_mask_s3_source_region: ''
+video_mask_s3_assume_role_arn: ''
+video_mask_s3_output_bucket: ''
+video_mask_s3_output_prefix: outputs/
+video_mask_s3_output_region: ''

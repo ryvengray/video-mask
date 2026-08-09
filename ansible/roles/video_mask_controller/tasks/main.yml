@@ -1,0 +1,72 @@
+---
+- name: Install controller prerequisites
+  ansible.builtin.apt:
+    name:
+      - git
+      - python3
+      - python3-venv
+      - python3-pip
+    state: present
+    update_cache: true
+
+- name: Checkout video-mask repository
+  ansible.builtin.git:
+    repo: "{{ video_mask_repo }}"
+    dest: "{{ video_mask_app_dir }}"
+    version: "{{ video_mask_ref }}"
+    update: true
+    accept_newhostkey: true
+  become_user: ubuntu
+
+- name: Install controller Python dependencies
+  ansible.builtin.pip:
+    requirements: "{{ video_mask_app_dir }}/requirements-cluster.txt"
+    virtualenv: "{{ video_mask_app_dir }}/.venv"
+    virtualenv_command: python3 -m venv
+
+- name: Create controller state directory
+  ansible.builtin.file:
+    path: /var/lib/video-mask-controller
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+
+- name: Install controller environment file
+  ansible.builtin.template:
+    src: video-mask-controller.env.j2
+    dest: /etc/video-mask-controller.env
+    owner: root
+    group: root
+    mode: '0600'
+  notify: Restart video-mask controller
+
+- name: Install controller systemd service
+  ansible.builtin.template:
+    src: video-mask-controller.service.j2
+    dest: /etc/systemd/system/video-mask-controller.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - Reload systemd controller
+    - Restart video-mask controller
+
+- name: Enable controller service
+  ansible.builtin.systemd:
+    name: video-mask-controller
+    enabled: true
+    state: started
+
+- name: Apply controller service changes before deploying Workers
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait until the controller API is ready
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8080/healthz
+    method: GET
+    status_code: 200
+  register: video_mask_controller_health
+  retries: 12
+  delay: 2
+  until: video_mask_controller_health.status == 200

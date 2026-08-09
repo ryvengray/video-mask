@@ -1,0 +1,13 @@
+---
+- name: Deploy the video-mask controller
+  hosts: controller
+  become: true
+  roles:
+    - video_mask_controller
+
+- name: Deploy GPU video-mask workers
+  hosts: gpu_workers
+  become: true
+  serial: 2
+  roles:
+    - video_mask_worker
