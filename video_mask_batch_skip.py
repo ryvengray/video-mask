@@ -60,7 +60,7 @@ import numpy as np
 # ================= 打码/检测参数 =================
 FACE_CELLS, FACE_SIGMA = 4, 45.0
 FACE_INPUT = 400              # 人脸检测输入尺寸(300->400: 小脸/侧脸召回更高)
-FACE_CONF = 0.35              # 人脸置信度阈值(0.45->0.35: 侧脸/低头/遮挡帧不漏检, 跟踪器滤误检)
+FACE_CONF = 0.25             # 人脸置信度阈值(0.45->0.35: 侧脸/低头/遮挡帧不漏检, 跟踪器滤误检)
 FACE_EXPAND = 0.12            # 人脸打码框外扩比例(确保盖住完整脸)
 FACE_YUNET_SIZE = 1280        # YuNet 输入最长边像素(0=原图最准最慢; 1280快且准)
 FACE_DETECT_INT = 3           # 人脸检测间隔: 每3帧检测1次, 中间帧光流跟踪(1=每帧检测)
@@ -109,9 +109,9 @@ _fisheye_maps_cache = {}  # 按 (w, h, strength) 缓存 remap 映射表
 def fisheye_undistort(img, strength=1.0):
     """对单帧做鱼眼去畸变, 返回矫正后的图像。
 
-    原理: OpenCV fisheye 模型, K 矩阵自动估算(假设宽FOV),
-    畸变系数 D = [k1 * strength, k2 * strength, 0, 0]。
-    映射表按分辨率缓存, 同一视频只算一次。
+    原理: OpenCV fisheye 模型, K 矩阵自动估算,
+    畸变系数 D = [k1*s, k2*s, 0, 0]。
+    默认参数针对 Pico 4(~150°FOV) 调优; 映射表按分辨率缓存。
     """
     h, w = img.shape[:2]
     cache_key = (w, h, strength)
@@ -119,14 +119,14 @@ def fisheye_undistort(img, strength=1.0):
         map1, map2 = _fisheye_maps_cache[cache_key]
         return cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
 
-    # 估算内参矩阵 K: 假设焦距 ≈ max(w,h) * 0.45(宽FOV)
-    fx = max(w, h) * 0.45
+    # Pico 4: 超宽FOV(~150°) → 焦距像素比例更低, 畸变更强
+    fx = max(w, h) * 0.38
     K = np.array([[fx, 0, w / 2], [0, fx, h / 2], [0, 0, 1]], dtype=np.float64)
-    # 畸变系数: k1 主导桶形畸变, strength 控制强度
-    D = np.array([0.35 * strength, 0.08 * strength, 0, 0], dtype=np.float64)
+    # k1=0.65 匹配Pico 4 桶形畸变, k2=0.15 二次修正
+    D = np.array([0.65 * strength, 0.15 * strength, 0, 0], dtype=np.float64)
 
     new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-        K, D, (w, h), np.eye(3), balance=0.6)
+        K, D, (w, h), np.eye(3), balance=0.75)  # 保留更大有效区域
     map1, map2 = cv2.fisheye.initUndistortRectifyMap(
         K, D, np.eye(3), new_K, (w, h), cv2.CV_16SC2)
     _fisheye_maps_cache[cache_key] = (map1, map2)
