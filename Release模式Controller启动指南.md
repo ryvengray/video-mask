@@ -176,7 +176,7 @@ openssl rand -hex 32
 先确认 Ansible 可以连通：
 
 ```bash
-ansible -i inventory.yml controller -m ping
+ansible -i inventory.yml controller -m ping --ask-vault-pass
 ```
 
 执行 Controller 初始化：
