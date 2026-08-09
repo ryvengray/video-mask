@@ -1,0 +1,17 @@
+[Unit]
+Description=Video Mask Cluster Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+EnvironmentFile=/etc/video-mask-worker.env
+WorkingDirectory={{ video_mask_app_dir }}
+ExecStart={{ video_mask_app_dir }}/.venv/bin/python -m cluster.worker_agent --controller ${VIDEO_MASK_CONTROLLER} --worker-id ${VIDEO_MASK_WORKER_ID} --token ${VIDEO_MASK_WORKER_TOKEN} --work-dir /home/ubuntu/work/video-mask --algorithm {{ video_mask_app_dir }}/video_mask_batch_skip.py{% if video_mask_storage_mode | default('local') == 'local' %} --allow-local-files{% endif %}
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

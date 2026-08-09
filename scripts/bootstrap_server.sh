@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在全新 Ubuntu/Debian 服务器初始化 video-mask 运行环境。
-# 用法：bash scripts/bootstrap_server.sh [--face-only] [--cpu] [--skip-models] [--torch-index-url URL]
+# 用法：bash scripts/bootstrap_server.sh [--cuda|--cpu] [--face-only] [--skip-models] [--torch-index-url URL]
 set -Eeuo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,14 +14,15 @@ usage() {
   cat <<'EOF'
 用法：bash scripts/bootstrap_server.sh [选项]
 
+  --cuda                    强制使用 CUDA；未检测到可用 NVIDIA GPU 时失败
   --cpu                     强制安装 CPU 版 PyTorch
-  --face-only               部署仅人脸 GPU 流水线；跳过 OWLv2 模型下载
+  --face-only               部署仅人脸流水线；默认要求 CUDA，配合 --cpu 才使用 CPU
   --skip-models             不预下载 OWLv2 和 YuNet 模型
   --torch-index-url URL     指定 PyTorch wheel 索引（默认 cu128）
   -h, --help                显示帮助
 
 示例：
-  bash scripts/bootstrap_server.sh --face-only
+  bash scripts/bootstrap_server.sh --cuda --face-only
   bash scripts/bootstrap_server.sh --torch-index-url https://download.pytorch.org/whl/cu126
   bash scripts/bootstrap_server.sh --cpu --skip-models
 EOF
@@ -29,6 +30,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --cuda) MODE="cuda" ;;
     --cpu) MODE="cpu" ;;
     --face-only) FACE_ONLY=1 ;;
     --skip-models) DOWNLOAD_MODELS=0 ;;
@@ -42,6 +44,13 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# This project is deployed to GPU workers.  A face-only installation must not
+# silently become a CPU deployment merely because GPU auto-detection failed.
+# Users who intentionally need CPU inference can opt in with --face-only --cpu.
+if [[ "$FACE_ONLY" -eq 1 && "$MODE" == "auto" ]]; then
+  MODE="cuda"
+fi
 
 if [[ ! -f "$APP_DIR/pyproject.toml" || ! -f "$APP_DIR/video_mask_batch_flast.py" ]]; then
   echo "错误：请在 video-mask 项目目录中运行此脚本。" >&2
@@ -73,7 +82,7 @@ fi
 echo "==> 安装系统依赖"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ffmpeg git python3 python3-venv python3-pip ca-certificates util-linux
+  ffmpeg git curl python3 python3-venv python3-pip ca-certificates util-linux
 
 if [[ "$MODE" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
@@ -111,7 +120,11 @@ echo "==> 安装项目依赖"
 
 if [[ "$MODE" == "cuda" ]]; then
   echo "==> 安装 YuNet ONNX Runtime CUDA 依赖"
-  "$PYTHON" -m pip install -r requirements-cuda.txt
+  "$PYTHON" -m pip install --upgrade --no-cache-dir -r "$APP_DIR/requirements-cuda.txt"
+  "$PYTHON" -m pip show onnxruntime-gpu >/dev/null || {
+    echo "错误：onnxruntime-gpu 安装后未找到。" >&2
+    exit 1
+  }
 fi
 
 echo "==> 创建默认任务目录"
@@ -180,6 +193,32 @@ print("模型缓存完成")
 PY
 else
   echo "==> 已跳过模型下载；首次任务前请自行准备 OWLv2 与 YuNet 缓存。"
+fi
+
+if [[ "$MODE" == "cuda" && "$DOWNLOAD_MODELS" -eq 1 ]]; then
+  echo "==> 验证 YuNet ONNX Runtime CUDA Session"
+  "$PYTHON" - <<'PY'
+from huggingface_hub import hf_hub_download
+import torch
+import onnxruntime as ort
+
+if hasattr(ort, "preload_dlls"):
+    ort.preload_dlls()
+model = hf_hub_download(
+    repo_id="opencv/face_detection_yunet",
+    filename="face_detection_yunet_2023mar.onnx",
+    local_files_only=True,
+)
+session = ort.InferenceSession(
+    model,
+    providers=[("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"],
+)
+providers = session.get_providers()
+print("YuNet session providers:", providers)
+if not torch.cuda.is_available() or not providers or providers[0] != "CUDAExecutionProvider":
+    raise SystemExit("YuNet ONNX Runtime CUDA Session 不可用")
+print("YuNet CUDA Session: OK; GPU:", torch.cuda.get_device_name(0))
+PY
 fi
 
 echo

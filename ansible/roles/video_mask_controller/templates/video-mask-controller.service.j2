@@ -1,0 +1,16 @@
+[Unit]
+Description=Video Mask Cluster Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+EnvironmentFile=/etc/video-mask-controller.env
+WorkingDirectory={{ video_mask_app_dir }}
+ExecStart={{ video_mask_app_dir }}/.venv/bin/python -m cluster.controller --database /var/lib/video-mask-controller/controller.sqlite3 --host 0.0.0.0 --port 8080{% if video_mask_storage_mode | default('local') == 'local' %} --local-source-dir {{ video_mask_local_source_dir }} --local-output-dir {{ video_mask_local_output_dir }}{% endif %}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

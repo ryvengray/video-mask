@@ -1,0 +1,12 @@
+controller:
+  hosts:
+    controller-01:
+      ansible_host: 10.0.0.10
+
+gpu_workers:
+  vars:
+    ansible_user: ubuntu
+  hosts:
+    worker-01:
+      ansible_host: 43.166.162.143
+      video_mask_worker_id: worker-01

@@ -22,12 +22,20 @@ cards = [
   "transformers>=4.40",
 ]
 dev = ["pytest>=7.0"]
+cluster = [
+  "fastapi>=0.110,<1",
+  "uvicorn[standard]>=0.27,<1",
+  "boto3>=1.34,<2",
+]
 
 [project.scripts]
 vmask = "video_mask_batch:main"
 
 [tool.setuptools]
 py-modules = ["video_mask_batch"]
+
+[tool.setuptools.packages.find]
+include = ["cluster*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,9 @@
+---
+- name: Reload systemd controller
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart video-mask controller
+  ansible.builtin.systemd:
+    name: video-mask-controller
+    state: restarted
