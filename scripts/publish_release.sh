@@ -110,7 +110,7 @@ echo "==> Verifying archive"
 tar -tzf "$ARCHIVE" >/dev/null
 
 echo "==> Staging release files"
-git -C "$RELEASE_DIR" add -- artifacts manifests
+git -C "$RELEASE_DIR" add -- artifacts manifests deployment
 if git -C "$RELEASE_DIR" diff --cached --quiet; then
     echo "Error: build generated no files to commit." >&2
     exit 1

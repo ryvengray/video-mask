@@ -4,13 +4,16 @@
 
 ## 0. 部署边界
 
-Ansible 应从受信任的构建机或运维机执行，而不是从客户的 Controller 运行机执行：
+Controller 可作为 Ansible 控制端，但它只能使用 release 仓库中随发布包同步的无源码部署包，**不得** clone 当前 `video-mask` 源码仓库：
 
 ```text
-构建/运维机（持有源码 + Ansible Vault）
+构建机（持有源码，仅负责发布）
+          │ push release
+          ▼
+客户 Controller（release + 无源码 Ansible + Vault）
           │ SSH / Ansible
           ▼
-Controller 运行机（只拉取 video-mask-release，运行编译扩展）
+客户 Worker（release + 公开运行依赖）
 ```
 
 Controller 需要能访问 GitHub release 仓库；Worker 通过内网访问 Controller 的 TCP `8080`。内网部署不需要 HTTPS，但安全组应只允许 Worker 网段访问 `8080`。
@@ -29,15 +32,28 @@ bash scripts/publish_release.sh ~/video-mask-release
 
 ## 2. 准备 Ansible 配置
 
-以下操作在受信任的 Ansible 控制端进行。
+以下操作在客户 Controller 上进行。它使用 release 仓库里的部署包，不需要源码仓库权限。
+
+先安装 Ansible 与 Git LFS，并 clone release 仓库。该仓库使用共享只读 Deploy Key；密钥配置方式见 [Release构建服务器部署指南.md](./Release构建服务器部署指南.md)。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ansible git git-lfs
+git lfs install
+
+cd ~
+git clone git@github.com:ryvengray/video-mask-release.git
+cd ~/video-mask-release/deployment/ansible
+```
+
+下文所有 Ansible 命令均在 `~/video-mask-release/deployment/ansible` 中执行。
 
 ### 2.1 创建 inventory
 
 从示例创建实际 inventory（实际文件不应包含任何私钥）：
 
 ```bash
-cd ~/video-mask
-cp ansible/inventory.yml.example ansible/inventory.yml
+cp inventory.yml.example inventory.yml
 ```
 
 至少保留 Controller：
@@ -57,10 +73,10 @@ gpu_workers:
 ### 2.2 创建公开配置
 
 ```bash
-cp ansible/group_vars/all.yml.example ansible/group_vars/all.yml
+cp group_vars/all.yml.example group_vars/all.yml
 ```
 
-编辑 `ansible/group_vars/all.yml` 的关键字段：
+编辑 `group_vars/all.yml` 的关键字段：
 
 ```yaml
 video_mask_release_repo: git@github.com:ryvengray/video-mask-release.git
@@ -92,8 +108,8 @@ artifacts/video-mask-linux-x86_64-<版本>.tar.gz
 ### 2.3 创建 Vault 密钥文件
 
 ```bash
-mkdir -p ansible/group_vars/all
-ansible-vault create ansible/group_vars/all/vault.yml
+mkdir -p group_vars/all
+ansible-vault create group_vars/all/vault.yml
 ```
 
 写入以下内容。其中 release Key 是 `video-mask-release` 仓库的共享只读 Deploy Key 私钥，不是 `.pub` 文件：
@@ -119,13 +135,13 @@ openssl rand -hex 32
 先确认 Ansible 可以连通：
 
 ```bash
-ansible -i ansible/inventory.yml controller -m ping
+ansible -i inventory.yml controller -m ping
 ```
 
 执行 Controller 初始化：
 
 ```bash
-ansible-playbook -i ansible/inventory.yml ansible/site.yml \
+ansible-playbook -i inventory.yml site.yml \
   --limit controller \
   -K --ask-vault-pass
 ```
@@ -177,7 +193,7 @@ Controller 监听 `0.0.0.0:8080`。建议安全组规则：
 
 ## 6. 升级到新 release
 
-每次发布新版本后，仅修改 `ansible/group_vars/all.yml`：
+每次发布新版本后，仅修改 `group_vars/all.yml`：
 
 ```yaml
 video_mask_release_version: 新版本号
@@ -186,7 +202,7 @@ video_mask_release_version: 新版本号
 然后重新执行：
 
 ```bash
-ansible-playbook -i ansible/inventory.yml ansible/site.yml \
+ansible-playbook -i inventory.yml site.yml \
   --limit controller \
   -K --ask-vault-pass
 ```

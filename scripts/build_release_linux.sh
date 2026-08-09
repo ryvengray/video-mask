@@ -54,4 +54,14 @@ cat > "$RELEASE_DIR/manifests/$VERSION.json" <<EOF
 }
 EOF
 
+# The Controller is allowed to receive deployment automation, but never the
+# proprietary algorithms. Keep a source-free Ansible bundle in the release
+# repository so it can manage itself and elastic Workers without cloning this
+# source repository.
+DEPLOYMENT_DIR="$RELEASE_DIR/deployment"
+mkdir -p "$DEPLOYMENT_DIR/ansible"
+cp -R "$ROOT_DIR/ansible/." "$DEPLOYMENT_DIR/ansible/"
+cp "$ROOT_DIR/Release模式Controller启动指南.md" "$DEPLOYMENT_DIR/Controller启动指南.md"
+cp "$ROOT_DIR/Release构建服务器部署指南.md" "$DEPLOYMENT_DIR/Release构建服务器部署指南.md"
+
 echo "==> Release created: $RELEASE_DIR/artifacts/video-mask-linux-x86_64-$VERSION.tar.gz"
