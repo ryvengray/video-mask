@@ -107,7 +107,7 @@ cd ~/video-mask
 bash scripts/publish_release.sh ~/video-mask-release
 ```
 
-脚本会先确认两个仓库没有未提交修改并执行 `git pull --ff-only`，再启动 Docker，在固定的 Linux x86_64 Ubuntu 24.04 容器中安装编译依赖、运行 Nuitka。构建完成后自动执行 SHA256 校验、提交并推送 release 仓库。版本号默认使用当前源码提交短 SHA；同一版本不会被覆盖。
+脚本会先确认两个仓库没有未提交修改并执行 `git pull --ff-only`，再启动 Docker，在固定的 Linux x86_64 Ubuntu 24.04 容器中用 Cython 编译项目自有模块。PyTorch、ONNX Runtime、OpenCV、Ultralytics 等公开依赖不参与发布编译，由 Ansible 在目标服务器的独立虚拟环境安装。构建完成后自动执行 SHA256 校验、提交并推送 release 仓库。版本号默认使用当前源码提交短 SHA；同一版本不会被覆盖。
 
 只想构建并在本地检查、不推送时：
 
@@ -232,4 +232,4 @@ ansible-playbook -i ansible/inventory.yml ansible/site.yml \
   --limit gpu_workers -K --ask-vault-pass
 ```
 
-角色会将私钥以 `0600` 权限写入 `/home/ubuntu/.ssh/video-mask-release`，并使用它 clone/pull release 仓库。密钥内容不会出现在 Playbook 输出中。随后它会解压指定版本到 `/opt/video-mask/releases/<版本>`，Controller 和 Worker 的 systemd 服务都直接运行该目录中的 Nuitka 二进制，不再 clone、安装或执行源码仓库内容。
+角色会将私钥以 `0600` 权限写入 `/home/ubuntu/.ssh/video-mask-release`，并使用它 clone/pull release 仓库。密钥内容不会出现在 Playbook 输出中。随后它会解压指定版本到 `/opt/video-mask/releases/<版本>`，Controller 和 Worker 通过该目录的启动器加载 Cython 原生扩展，不再 clone、安装或执行源码仓库内容。

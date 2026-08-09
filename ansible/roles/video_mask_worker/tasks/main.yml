@@ -1,18 +1,4 @@
 ---
-- name: Install Worker runtime system dependencies
-  ansible.builtin.apt:
-    name:
-      - ffmpeg
-      - curl
-      - libgl1
-      - libglib2.0-0
-    state: present
-    update_cache: true
-
-- name: Verify NVIDIA driver is available on GPU Worker
-  ansible.builtin.command: nvidia-smi -L
-  changed_when: false
-
 - name: Provision Worker credential on the controller
   ansible.builtin.uri:
     url: "{{ video_mask_controller_url }}/api/admin/workers"

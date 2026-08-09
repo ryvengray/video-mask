@@ -1,4 +1,5 @@
-# Build Linux x86_64 release binaries on an Ubuntu 24.04-compatible image.
+# syntax=docker/dockerfile:1.7
+# Build Cython-native proprietary modules on Ubuntu 24.04 x86_64.
 FROM --platform=linux/amd64 ubuntu:24.04
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
@@ -15,8 +16,7 @@ RUN sed -i \
       apt-get -o Acquire::Retries=5 update; \
       apt-get -o Acquire::Retries=5 -y --fix-broken install || true; \
       if apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-        bzip2 build-essential ccache patchelf python3 python3-dev python3-pip python3-venv \
-        ca-certificates libgl1 libglib2.0-0; then break; fi; \
+        build-essential python3 python3-dev python3-pip python3-venv ca-certificates; then break; fi; \
       test "$attempt" = 5 && exit 1; sleep 10; \
     done && \
     rm -rf /var/lib/apt/lists/*
@@ -24,23 +24,13 @@ RUN sed -i \
 WORKDIR /build/video-mask
 COPY . .
 
-RUN python3 -m venv /opt/release-venv && \
-    /opt/release-venv/bin/python -m pip install --upgrade pip setuptools wheel && \
-    /opt/release-venv/bin/python -m pip install nuitka zstandard && \
-    /opt/release-venv/bin/python -m pip install '.[cards,cluster]' -r requirements-cuda.txt
+RUN python3 -m venv /opt/build-venv && \
+    /opt/build-venv/bin/python -m pip install --upgrade pip setuptools wheel Cython
 
-RUN mkdir -p /opt/release/bin && \
-    /opt/release-venv/bin/python -m nuitka --standalone --follow-imports \
-      --output-dir=/opt/release/bin --output-filename=video-mask-controller \
-      release/entrypoints/controller_entry.py && \
-    /opt/release-venv/bin/python -m nuitka --standalone --follow-imports \
-      --output-dir=/opt/release/bin --output-filename=video-mask-worker \
-      release/entrypoints/worker_entry.py && \
-    /opt/release-venv/bin/python -m nuitka --standalone --follow-imports \
-      --output-dir=/opt/release/bin --output-filename=video-mask-batch-fish \
-      video_mask_batch_fish.py
-
-# Nuitka compiles the project entry points and followed project modules. Do not
-# delete every third-party .py file here: several ML libraries use dynamic
-# imports at runtime. The release policy protects first-party source; Python
-# dependency sources are not treated as proprietary application code.
+RUN mkdir -p /opt/release/python/cluster /opt/release/bin && \
+    /opt/build-venv/bin/python release/build_cython.py build_ext \
+      --build-lib /opt/release/python --build-temp /tmp/video-mask-cython-build && \
+    : > /opt/release/python/cluster/__init__.py && \
+    cp release/wrappers/video-mask-* /opt/release/bin/ && \
+    cp release/requirements-controller.txt release/requirements-worker.txt /opt/release/ && \
+    chmod 0755 /opt/release/bin/video-mask-*

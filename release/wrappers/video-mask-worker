@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${VIDEO_MASK_RUNTIME_PYTHON:-python3}" -c 'from cluster.worker_agent import main; main()' "$@"

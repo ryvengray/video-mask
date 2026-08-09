@@ -3,7 +3,9 @@
   hosts: controller
   become: true
   roles:
-    - video_mask_release
+    - role: video_mask_release
+      vars:
+        video_mask_runtime_profile: controller
     - video_mask_controller
 
 - name: Deploy GPU video-mask workers
@@ -11,5 +13,7 @@
   become: true
   serial: 2
   roles:
-    - video_mask_release
+    - role: video_mask_release
+      vars:
+        video_mask_runtime_profile: worker
     - video_mask_worker

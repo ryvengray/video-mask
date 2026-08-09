@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${VIDEO_MASK_RUNTIME_PYTHON:-python3}" -c 'from video_mask_batch_fish import main; main()' "$@"

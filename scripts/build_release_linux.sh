@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a source-free Linux x86_64 release archive with Docker/Nuitka.
+# Build a source-free Linux x86_64 release archive with Docker/Cython.
 # Usage: bash scripts/build_release_linux.sh ../video-mask-release [version]
 set -Eeuo pipefail
 
@@ -36,7 +36,8 @@ docker rm "$container" >/dev/null
 container=""
 
 mkdir -p "$RELEASE_DIR/artifacts"
-tar -C "$STAGE_DIR" -czf "$RELEASE_DIR/artifacts/video-mask-linux-x86_64-$VERSION.tar.gz" bin
+tar -C "$STAGE_DIR" -czf "$RELEASE_DIR/artifacts/video-mask-linux-x86_64-$VERSION.tar.gz" \
+    bin python requirements-controller.txt requirements-worker.txt
 (
     cd "$RELEASE_DIR/artifacts"
     shasum -a 256 "video-mask-linux-x86_64-$VERSION.tar.gz" > "video-mask-linux-x86_64-$VERSION.SHA256"
@@ -48,7 +49,8 @@ cat > "$RELEASE_DIR/manifests/$VERSION.json" <<EOF
   "platform": "linux-x86_64",
   "archive": "artifacts/video-mask-linux-x86_64-$VERSION.tar.gz",
   "sha256": "artifacts/video-mask-linux-x86_64-$VERSION.SHA256",
-  "binaries": ["video-mask-controller", "video-mask-worker", "video-mask-batch-fish"]
+  "binaries": ["video-mask-controller", "video-mask-worker", "video-mask-batch-fish"],
+  "runtime": "Cython extensions + server-installed public dependencies"
 }
 EOF
 

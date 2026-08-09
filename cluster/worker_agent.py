@@ -126,9 +126,9 @@ class Worker:
         """Build an invocation for either a development script or a release binary.
 
         The normal source deployment supplies a ``.py`` algorithm and therefore
-        needs Python.  A compiled release supplies the executable emitted by
-        Nuitka and must be invoked directly; attempting to run it as a Python
-        script makes an otherwise valid release Worker fail at task claim time.
+        needs Python. A release supplies an executable wrapper around compiled
+        proprietary modules and must be invoked directly; attempting to run it
+        as a Python script makes an otherwise valid Worker fail at task claim time.
         """
         shared = [str(source), "--out-dir", str(output_dir), *arguments]
         if self.algorithm.suffix.lower() == ".py":

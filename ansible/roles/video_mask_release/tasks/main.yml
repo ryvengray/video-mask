@@ -8,6 +8,7 @@
       - video_mask_release_deploy_key | length > 0
       - video_mask_release_version is defined
       - video_mask_release_version | length > 0
+      - video_mask_runtime_profile in ['controller', 'worker']
     fail_msg: >-
       Configure video_mask_release_repo, video_mask_release_version and the
       vault-protected video_mask_release_deploy_key before deployment.
@@ -19,6 +20,9 @@
       - git-lfs
       - tar
       - ca-certificates
+      - python3
+      - python3-venv
+      - python3-pip
     state: present
     update_cache: true
 
@@ -81,15 +85,15 @@
     src: "{{ video_mask_release_archive.stat.path }}"
     dest: "{{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}"
     remote_src: true
-    creates: "{{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}/bin/video-mask-controller.dist/video-mask-controller"
+    creates: "{{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}/bin/video-mask-controller"
 
 - name: Verify compiled release executables
   ansible.builtin.stat:
     path: "{{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}/bin/{{ item }}"
   loop:
-    - video-mask-controller.dist/video-mask-controller
-    - video-mask-worker.dist/video-mask-worker
-    - video-mask-batch-fish.dist/video-mask-batch-fish
+    - video-mask-controller
+    - video-mask-worker
+    - video-mask-batch-fish
   register: video_mask_release_binaries
 
 - name: Fail when compiled release is incomplete
@@ -97,3 +101,47 @@
     that: item.stat.exists and item.stat.executable
     fail_msg: "Compiled release binary is missing or not executable: {{ item.stat.path }}"
   loop: "{{ video_mask_release_binaries.results }}"
+
+- name: Install Worker OS libraries
+  ansible.builtin.apt:
+    name:
+      - ffmpeg
+      - curl
+      - libgl1
+      - libglib2.0-0
+    state: present
+  when: video_mask_runtime_profile == 'worker'
+
+- name: Verify NVIDIA driver is available on GPU Worker
+  ansible.builtin.command: nvidia-smi -L
+  changed_when: false
+  when: video_mask_runtime_profile == 'worker'
+
+- name: Create public dependency virtual environment
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ video_mask_runtime_venv | default('/opt/video-mask/runtime-venv') }}"
+    creates: "{{ video_mask_runtime_venv | default('/opt/video-mask/runtime-venv') }}/bin/python"
+
+- name: Upgrade public dependency installer
+  ansible.builtin.pip:
+    name:
+      - pip
+      - setuptools
+      - wheel
+    state: latest
+    virtualenv: "{{ video_mask_runtime_venv | default('/opt/video-mask/runtime-venv') }}"
+
+- name: Install CUDA PyTorch for GPU Worker
+  ansible.builtin.pip:
+    name:
+      - torch
+      - torchvision
+    state: latest
+    virtualenv: "{{ video_mask_runtime_venv | default('/opt/video-mask/runtime-venv') }}"
+    extra_args: "--index-url {{ video_mask_torch_index_url | default('https://download.pytorch.org/whl/cu128') }}"
+  when: video_mask_runtime_profile == 'worker'
+
+- name: Install public runtime dependencies
+  ansible.builtin.pip:
+    requirements: "{{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}/requirements-{{ video_mask_runtime_profile }}.txt"
+    virtualenv: "{{ video_mask_runtime_venv | default('/opt/video-mask/runtime-venv') }}"
