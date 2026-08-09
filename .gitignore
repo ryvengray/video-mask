@@ -18,3 +18,4 @@ masked_out/
 *.MKV
 terraform-host.pem
 terraform-user_accessKeys.csv
+ansible/group_vars/all/vault.yml

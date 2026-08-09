@@ -181,3 +181,42 @@ df -h /
 - 客户运行服务器只读取 `video-mask-release`，不授予源码仓库权限。
 - 不要将 Deploy Key、GitHub Token、S3 AK/SK 写入 Git、Ansible inventory 或日志。
 - 密钥泄露后，在仓库 `Deploy keys` 页面撤销并替换该密钥。
+
+## 10. 为弹性 Worker 配置共享 release 只读 Key
+
+动态创建、销毁的 Worker 可共用一把只读 Deploy Key，只添加到 `video-mask-release` 仓库一次即可。该 Key 不得用于源码仓库。
+
+在 Ansible 控制端创建加密变量文件：
+
+```bash
+cd ~/video-mask
+mkdir -p ansible/group_vars/all
+ansible-vault create ansible/group_vars/all/vault.yml
+```
+
+在打开的文件中填写私钥（不是 `.pub` 公钥）：
+
+```yaml
+vault_video_mask_release_deploy_key: |
+  -----BEGIN OPENSSH PRIVATE KEY-----
+  此处粘贴共享 release Deploy Key 私钥
+  -----END OPENSSH PRIVATE KEY-----
+```
+
+在 `ansible/group_vars/all.yml`（由示例文件复制而来）中设置：
+
+```yaml
+video_mask_release_repo: git@github.com:ryvengray/video-mask-release.git
+video_mask_release_ref: main
+video_mask_release_dir: /home/ubuntu/video-mask-release
+video_mask_release_deploy_key: "{{ vault_video_mask_release_deploy_key }}"
+```
+
+执行 Worker 初始化时带上 Vault 密码：
+
+```bash
+ansible-playbook -i ansible/inventory.yml ansible/site.yml \
+  --limit gpu_workers -K --ask-vault-pass
+```
+
+角色会将私钥以 `0600` 权限写入 `/home/ubuntu/.ssh/video-mask-release`，并使用它 clone/pull release 仓库。密钥内容不会出现在 Playbook 输出中。当前步骤只是预下载 release 仓库；待编译版运行部署验证完成后，Worker 服务将从该目录启动，以彻底移除源码仓库访问。
