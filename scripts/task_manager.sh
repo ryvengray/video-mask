@@ -12,6 +12,8 @@ RUNNERS_DIR="$TASK_HOME/runners"
 DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_fish.py"
 DEFAULT_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8)
 DEFAULT_EXTRA_LINE="--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8"
+FISH_V1_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8)
+FISH_V1_EXTRA_LINE="--fisheye --fisheye-device pico4 --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
 LAST_INTERRUPT_AT=0
@@ -137,7 +139,7 @@ choose_algorithm() {
 }
 
 start_task() {
-    local source_dir target_dir extra_line workers_line force_line force_reprocess id started log_file meta_file runner_file pid
+    local source_dir target_dir extra_line default_extra_line workers_line force_line force_reprocess id started log_file meta_file runner_file pid
     local workers
     local -a extra_args=("${DEFAULT_EXTRA_ARGS[@]}")
     if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -154,16 +156,25 @@ start_task() {
     fi
     choose_algorithm || return
 
+    # fish_v1 is face-only and deliberately does not expose --no-card.
+    # Keep the menu defaults compatible with the selected algorithm.
+    if [[ "$(basename "$CHOSEN_ALGORITHM")" == "video_mask_batch_fish_v1.py" ]]; then
+        extra_args=("${FISH_V1_EXTRA_ARGS[@]}")
+        default_extra_line="$FISH_V1_EXTRA_LINE"
+    else
+        default_extra_line="$DEFAULT_EXTRA_LINE"
+    fi
+
     read -r -p 'Source directory [/home/ubuntu/sources]: ' source_dir || return
     source_dir="${source_dir:-/home/ubuntu/sources}"
     read -r -p 'Target directory [/home/ubuntu/outputs]: ' target_dir || return
     target_dir="${target_dir:-/home/ubuntu/outputs}"
-    read -r -p "Algorithm arguments [${DEFAULT_EXTRA_LINE}]: " extra_line || return
+    read -r -p "Algorithm arguments [${default_extra_line}]: " extra_line || return
     if [[ -n "$extra_line" ]]; then
         # A non-empty response intentionally replaces the defaults.
         read -r -a extra_args <<< "$extra_line"
     else
-        extra_line="$DEFAULT_EXTRA_LINE"
+        extra_line="$default_extra_line"
     fi
     read -r -p 'Force reprocess completed videos? [y/N]: ' force_line || return
     if [[ "$force_line" =~ ^[Yy]$ ]]; then
