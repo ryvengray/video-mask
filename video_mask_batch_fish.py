@@ -546,14 +546,23 @@ class MogFaceDetector:
         import numpy as np
         h_orig, w_orig = img.shape[:2]
 
-        # 预缩放: 长边缩至 det_size, 减少 ResNet101 计算量
-        if self.det_size > 0 and max(w_orig, h_orig) > self.det_size:
-            scale = self.det_size / max(w_orig, h_orig)
-            new_w, new_h = int(w_orig * scale), int(h_orig * scale)
-            img_det = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # 预缩放: 长边缩至 det_size, 但保证短边不低于 320px
+        if self.det_size > 0:
+            max_dim = max(w_orig, h_orig)
+            min_dim = min(w_orig, h_orig)
+            if max_dim > self.det_size:
+                scale = self.det_size / max_dim
+                # 超宽/超窄画幅: 短边太小会导致人脸无法识别, 放宽长边限制
+                if min_dim * scale < 320:
+                    scale = 320.0 / min_dim
+                new_w, new_h = int(w_orig * scale), int(h_orig * scale)
+                img_det = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         else:
             scale = 1.0
             img_det = img
+
+        # ModelScope MogFace pipeline 要求 RGB 输入 (视频管线为 BGR)
+        img_det = cv2.cvtColor(img_det, cv2.COLOR_BGR2RGB)
 
         # 推理 (inference_mode 比 no_grad 更快)
         import torch
