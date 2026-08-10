@@ -9,6 +9,8 @@ gpu_workers:
     # Password SSH option: keep actual values only in group_vars/all/vault.yml.
     # ansible_password: "{{ vault_video_mask_worker_ssh_password }}"
     # ansible_become_password: "{{ vault_video_mask_worker_sudo_password }}"
+    # Dynamic Worker option: safely accept a host key only on its first connection.
+    # ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
   hosts:
     worker-01:
       ansible_host: 43.166.162.143

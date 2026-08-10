@@ -168,6 +168,8 @@ sudo apt-get update
 sudo apt-get install -y sshpass
 ```
 
+Worker 会动态新增时，在 inventory 中使用 `StrictHostKeyChecking=accept-new`。它会自动记录**首次出现**的 Worker 主机指纹；若同一个 IP 的指纹之后发生变化，仍会拒绝连接，避免无条件信任未知主机。
+
 将 Worker 的 SSH 登录密码和 sudo 密码加密保存到 Vault。若二者相同，可以填写相同内容：
 
 ```bash
@@ -222,11 +224,19 @@ gpu_workers:
     ansible_user: ubuntu
     ansible_password: "{{ vault_video_mask_worker_ssh_password }}"
     ansible_become_password: "{{ vault_video_mask_worker_sudo_password }}"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
   hosts:
     worker-01:
       ansible_host: 10.0.2.20
       video_mask_worker_id: worker-01
       video_mask_worker_slots: 2
+```
+
+没有配置 `accept-new` 时，需要在 Controller 上先手动连接每台新 Worker 并确认一次主机指纹：
+
+```bash
+ssh ubuntu@Worker私网IP
+# 首次提示时输入 yes，再输入 Worker 密码，登录后 exit
 ```
 
 **SSH Key 示例：**
