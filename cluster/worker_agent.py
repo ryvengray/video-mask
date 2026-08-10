@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -66,9 +67,22 @@ class Worker:
     def payload(self, **extra: Any) -> dict[str, Any]:
         return {"worker_id": self.worker_id, "token": self.token, **extra}
 
-    @staticmethod
-    def capabilities() -> dict[str, Any]:
-        info: dict[str, Any] = {"algorithm": DEFAULT_ALGORITHM, "pid": os.getpid()}
+    def capabilities(self) -> dict[str, Any]:
+        """Describe this process so the Controller dashboard can identify it."""
+        hostname = socket.gethostname()
+        info: dict[str, Any] = {
+            "algorithm": DEFAULT_ALGORITHM,
+            "pid": os.getpid(),
+            "hostname": hostname,
+        }
+        prefix, marker, slot = self.worker_id.rpartition("-slot-")
+        if marker and prefix and slot.isdigit():
+            info["slot"] = int(slot)
+        try:
+            addresses = socket.gethostbyname_ex(hostname)[2]
+            info["ip_addresses"] = sorted({address for address in addresses if not address.startswith("127.")})
+        except OSError:
+            pass
         try:
             import torch
             info.update({"cuda_available": torch.cuda.is_available(), "torch": torch.__version__})

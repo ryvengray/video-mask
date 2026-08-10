@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
@@ -89,6 +89,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if not authorization or not hmac.compare_digest(authorization, expected):
             raise HTTPException(status_code=401, detail="invalid admin token")
 
+    def worker_capabilities(capabilities: dict[str, Any], http_request: Request) -> dict[str, Any]:
+        """Record the private address seen by the Controller, not a user-supplied address."""
+        result = dict(capabilities)
+        if http_request.client and http_request.client.host:
+            result["controller_seen_ip"] = http_request.client.host
+        return result
+
     @app.exception_handler(PermissionError)
     async def permission_error(_, exc: PermissionError):
         return JSONResponse(status_code=401, content={"detail": str(exc)})
@@ -104,14 +111,16 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested)}
 
     @app.post("/api/workers/register")
-    def register_worker(request: WorkerRequest):
-        return store.register_worker(request.worker_id, request.token, request.capabilities)
+    def register_worker(request: WorkerRequest, http_request: Request):
+        return store.register_worker(request.worker_id, request.token,
+                                     worker_capabilities(request.capabilities, http_request))
 
     @app.post("/api/workers/{worker_id}/heartbeat")
-    def heartbeat(worker_id: str, request: HeartbeatRequest):
+    def heartbeat(worker_id: str, request: HeartbeatRequest, http_request: Request):
         if request.worker_id != worker_id:
             raise ValueError("worker id does not match path")
-        return store.heartbeat(worker_id, request.token, request.status, request.capabilities)
+        return store.heartbeat(worker_id, request.token, request.status,
+                               worker_capabilities(request.capabilities, http_request))
 
     @app.post("/api/workers/{worker_id}/claim")
     def claim(worker_id: str, request: WorkerRequest):
@@ -174,17 +183,35 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 return "-"
             return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+        def slot_for(worker: dict[str, Any]) -> str:
+            capabilities = worker.get("capabilities") or {}
+            if capabilities.get("slot") is not None:
+                return str(capabilities["slot"])
+            _, marker, slot = str(worker["worker_id"]).rpartition("-slot-")
+            return slot if marker and slot.isdigit() else "-"
+
+        def host_for(worker: dict[str, Any]) -> str:
+            capabilities = worker.get("capabilities") or {}
+            hostname = str(capabilities.get("hostname") or "-")
+            address = capabilities.get("controller_seen_ip")
+            if not address:
+                addresses = capabilities.get("ip_addresses") or []
+                address = ", ".join(str(value) for value in addresses) or "-"
+            return f"{html.escape(hostname)}<br><small>{html.escape(str(address))}</small>"
+
         worker_items = "".join(
             f"<tr><td>{html.escape(str(worker['worker_id']))}</td><td>{html.escape(str(worker['status']))}</td>"
+            f"<td>{host_for(worker)}</td><td>{html.escape(slot_for(worker))}</td>"
             f"<td>{html.escape(str((worker.get('capabilities') or {}).get('gpu', '-')))}</td>"
             f"<td>{html.escape(str((worker.get('capabilities') or {}).get('cuda_available', '-')))}</td>"
+            f"<td>{html.escape(str((worker.get('capabilities') or {}).get('pid', '-')))}</td>"
             f"<td>{html.escape(str(worker.get('current_task_id') or '-'))}</td>"
             f"<td>{last_seen(worker.get('last_seen_at'))}</td></tr>"
             for worker in workers
-        ) or "<tr><td colspan='6'>No workers registered</td></tr>"
+        ) or "<tr><td colspan='9'>No workers registered</td></tr>"
         return """<!doctype html><title>Video Mask Cluster</title>
         <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%;margin:0 0 2rem}td,th{border:1px solid #ddd;padding:.5rem;text-align:left}h2{margin-top:2rem}</style>
-        <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>GPU</th><th>CUDA</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
+        <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>Slot</th><th>GPU</th><th>CUDA</th><th>PID</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
             "<h2>Tasks</h2><table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Source</th><th>Attempts</th></tr>" + task_items + "</table>"
 
     return app

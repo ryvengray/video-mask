@@ -259,7 +259,7 @@ curl -fsS "http://127.0.0.1:8080/api/workers" \
   -H "Authorization: Bearer 你的管理员Token"
 ```
 
-浏览器访问 `http://Controller私网IP:8080/` 也可以查看最近任务与 Worker 状态。
+浏览器访问 `http://Controller私网IP:8080/` 也可以查看最近任务与 Worker 状态。Worker 表会显示 Worker ID、主机名、Controller 实际看到的私网 IP、槽位编号、GPU、CUDA 状态、Worker PID、当前任务和最后心跳时间。
 
 > 后续可在 Controller 增加 S3 任务导入服务：扫描指定 Prefix、生成预签名 URL、调用本 API。这样业务人员只需上传视频到 S3，无需手动执行 `curl`。
 
