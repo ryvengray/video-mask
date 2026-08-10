@@ -155,20 +155,48 @@ sudo journalctl -u video-mask-controller -n 100 --no-pager
 
 ## 7. 添加 Worker
 
+### 7.1 一次性配置 Controller 到 Worker 的 SSH Key
+
+Ansible 需要 Controller 无交互登录每台 Worker。若当前只能输入 `ubuntu` 密码 SSH，使用该密码一次性安装 Controller 的 SSH 公钥；之后不再需要把 Worker 登录密码写入 inventory。
+
+在 Controller 生成管理 Key（若文件已存在，不要覆盖）：
+
+```bash
+test -f ~/.ssh/video-mask-ansible || \
+  ssh-keygen -t ed25519 -f ~/.ssh/video-mask-ansible -C "video-mask-ansible-controller" -N ""
+chmod 600 ~/.ssh/video-mask-ansible
+```
+
+把公钥安装到新 Worker。该命令会询问 **一次** Worker 的 `ubuntu` 密码：
+
+```bash
+ssh-copy-id -i ~/.ssh/video-mask-ansible.pub ubuntu@10.200.0.7
+```
+
+测试无密码 SSH：
+
+```bash
+ssh -i ~/.ssh/video-mask-ansible -o IdentitiesOnly=yes ubuntu@10.200.0.7 'hostname && nvidia-smi -L'
+```
+
+若 Worker 的 sudo 需要密码，部署时使用 Playbook 的 `-K` 输入 sudo 密码；更推荐使用云镜像默认的受控免密 sudo。不要把 SSH 登录密码写进 `inventory.yml`。
+
+### 7.2 添加 inventory
+
 在 `inventory.yml` 增加 Worker 私网 IP：
 
 ```yaml
 gpu_workers:
   vars:
     ansible_user: ubuntu
-    ansible_ssh_private_key_file: /secure/path/worker.pem
+    ansible_ssh_private_key_file: /home/ubuntu/.ssh/video-mask-ansible
   hosts:
     worker-01:
       ansible_host: 10.0.2.20
       video_mask_worker_id: worker-01
 ```
 
-确认安全组允许 Controller SSH 到 Worker，并允许 Worker 访问 Controller TCP `8080`。然后在 Controller 上执行：
+确认安全组允许 Controller SSH 到 Worker 的 TCP `22`，并允许 Worker 访问 Controller TCP `8080`。然后在 Controller 上执行：
 
 ```bash
 ansible-playbook -i inventory.yml site.yml \
