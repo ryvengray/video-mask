@@ -273,7 +273,17 @@ Worker 下载、处理后会将视频保存至该 Worker 的 `/home/ubuntu/outpu
 
 ## 9. 更新源码版本
 
-Controller 或 Worker 升级时，先在 `group_vars/all/settings.yml` 修改：
+所有更新命令都在 **Controller** 的 `~/video-mask/ansible` 目录执行。先更新 Controller，再更新 Worker；这样新任务 API（例如省略 `output_upload_url` 时保存到 Worker 本地）会先在 Controller 生效。
+
+先更新 Controller 本机的源码与 Ansible 文件：
+
+```bash
+cd ~/video-mask
+git pull --ff-only
+cd ansible
+```
+
+Controller 或 Worker 升级时，先在 `group_vars/all/settings.yml` 确认：
 
 ```yaml
 video_mask_ref: main
@@ -287,6 +297,12 @@ ansible-playbook -i inventory.yml site.yml --limit controller -K --ask-vault-pas
 
 # 更新所有 Worker
 ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pass
+```
+
+更新 Worker 后，可确认新服务参数已生效：
+
+```bash
+ssh ubuntu@Worker私网IP 'sudo systemctl status video-mask-worker --no-pager && ls -ld ~/outputs'
 ```
 
 ## 10. 常见问题
