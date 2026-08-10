@@ -1,4 +1,19 @@
 ---
+- name: Install controller Python prerequisites
+  ansible.builtin.apt:
+    name:
+      - python3
+      - python3-venv
+      - python3-pip
+    state: present
+    update_cache: true
+
+- name: Install controller Python dependencies
+  ansible.builtin.pip:
+    requirements: "{{ video_mask_app_dir }}/requirements-cluster.txt"
+    virtualenv: "{{ video_mask_app_dir }}/.venv"
+    virtualenv_command: python3 -m venv
+
 - name: Create controller state directory
   ansible.builtin.file:
     path: /var/lib/video-mask-controller

@@ -126,7 +126,8 @@ mkdir -p "$SOURCE_DIR" "$OUTPUT_DIR"
 
 timestamp="$(date +%Y%m%d%H%M%S)"
 inventory="$APP_DIR/ansible/inventory.yml"
-variables="$APP_DIR/ansible/group_vars/all.yml"
+variables="$APP_DIR/ansible/group_vars/all/settings.yml"
+mkdir -p "$APP_DIR/ansible/group_vars/all"
 
 backup_if_needed() {
   local path="$1"

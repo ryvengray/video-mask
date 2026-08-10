@@ -1,15 +1,10 @@
-# Every deployed machine downloads this source-free release repository. Put
-# the private key value only in ansible-vault as
-# vault_video_mask_release_deploy_key; never commit it in this file.
-video_mask_release_repo: git@github.com:ryvengray/video-mask-release.git
-video_mask_release_ref: main
-video_mask_release_dir: /home/ubuntu/video-mask-release
-video_mask_release_deploy_key_path: /home/ubuntu/.ssh/video-mask-release
-video_mask_release_version: CHANGE_ME_TO_A_PUBLISHED_RELEASE_VERSION
-video_mask_release_install_root: /opt/video-mask/releases
-video_mask_runtime_venv: /opt/video-mask/runtime-venv
-video_mask_torch_index_url: https://download.pytorch.org/whl/cu128
-video_mask_release_deploy_key: "{{ vault_video_mask_release_deploy_key }}"
+# Every deployed machine checks out and runs source mode. Store the source
+# repository Deploy Key only in ansible-vault; never commit it in this file.
+video_mask_repo: git@github.com:ryvengray/video-mask.git
+video_mask_ref: main
+video_mask_app_dir: /home/ubuntu/video-mask
+video_mask_source_deploy_key_path: /home/ubuntu/.ssh/video-mask-source
+video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
 # Use the Controller private VPC address for remote Workers. No HTTPS is
 # required on the private network; restrict TCP 8080 to the Worker security group.
 video_mask_controller_url: http://10.0.0.10:8080

@@ -1,4 +1,13 @@
 ---
+- name: Install Worker Python prerequisites
+  ansible.builtin.apt:
+    name:
+      - python3
+      - python3-venv
+      - python3-pip
+    state: present
+    update_cache: true
+
 - name: Provision Worker credential on the controller
   ansible.builtin.uri:
     url: "{{ video_mask_controller_url }}/api/admin/workers"
@@ -11,6 +20,12 @@
       token: "{{ video_mask_worker_token }}"
     status_code: 200
   no_log: true
+
+- name: Bootstrap CUDA face worker and source dependencies
+  ansible.builtin.command:
+    cmd: bash scripts/bootstrap_server.sh --cuda --face-only
+    chdir: "{{ video_mask_app_dir }}"
+  changed_when: false
 
 - name: Create Worker runtime directory
   ansible.builtin.file:

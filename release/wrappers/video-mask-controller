@@ -1,2 +1,0 @@
-#!/bin/sh
-exec "${VIDEO_MASK_RUNTIME_PYTHON:-python3}" -c 'from cluster.controller import main; main()' "$@"

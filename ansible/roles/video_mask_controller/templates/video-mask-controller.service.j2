@@ -7,10 +7,8 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 EnvironmentFile=/etc/video-mask-controller.env
-Environment=VIDEO_MASK_RUNTIME_PYTHON={{ video_mask_runtime_venv | default('/opt/video-mask/runtime-venv') }}/bin/python
-Environment=PYTHONPATH={{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}/python
-WorkingDirectory={{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}
-ExecStart={{ video_mask_release_install_root | default('/opt/video-mask/releases') }}/{{ video_mask_release_version }}/bin/video-mask-controller --database /var/lib/video-mask-controller/controller.sqlite3 --host 0.0.0.0 --port 8080{{ ' --local-source-dir ' ~ video_mask_local_source_dir ~ ' --local-output-dir ' ~ video_mask_local_output_dir if video_mask_storage_mode | default('local') == 'local' else '' }}
+WorkingDirectory={{ video_mask_app_dir }}
+ExecStart={{ video_mask_app_dir }}/.venv/bin/python -m cluster.controller --database /var/lib/video-mask-controller/controller.sqlite3 --host 0.0.0.0 --port 8080{{ ' --local-source-dir ' ~ video_mask_local_source_dir ~ ' --local-output-dir ' ~ video_mask_local_output_dir if video_mask_storage_mode | default('local') == 'local' else '' }}
 Restart=always
 RestartSec=5
 

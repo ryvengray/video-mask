@@ -1,6 +1,0 @@
-numpy>=1.23
-opencv-python>=4.8,<5
-pillow>=9.0
-transformers>=4.40
-ultralytics>=8.0
-onnxruntime-gpu>=1.21,<1.27
