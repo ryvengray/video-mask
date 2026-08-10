@@ -41,6 +41,17 @@ def test_worker_claims_task_once_and_finishes(tmp_path: Path):
     store.close()
 
 
+def test_task_without_upload_url_is_valid_for_worker_local_output(tmp_path: Path):
+    store = new_store(tmp_path)
+    payload = task_payload()
+    payload.pop("output_upload_url")
+    created = store.create_task(payload)
+
+    assert created["output_upload_url"] == ""
+    assert created["status"] == "pending"
+    store.close()
+
+
 def test_stale_worker_requeues_task(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)
@@ -83,4 +94,41 @@ def test_local_ingestor_creates_one_file_task(tmp_path: Path):
     assert task["source_url"] == source.resolve().as_uri()
     assert task["output_object_key"] == "masked_clip.mp4"
     assert ingestor.scan() == 0
+    store.close()
+
+
+def test_duplicate_local_scan_does_not_block_worker_claim(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir()
+    (source_dir / "clip.mp4").write_bytes(b"test video")
+    ingestor = LocalIngestor(store, source_dir, tmp_path / "outputs")
+
+    assert ingestor.scan() == 1
+    # The second scan hits the task's unique ID, as it does before each claim.
+    assert ingestor.scan() == 0
+    claimed = store.claim("worker-01", TOKEN)
+
+    assert claimed is not None
+    assert claimed["status"] == "assigned"
+    store.close()
+
+
+def test_list_workers_includes_status_capabilities_and_current_task(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-ready", TOKEN)
+    store.register_worker("worker-ready", TOKEN, {"gpu": "Tesla T4", "cuda_available": True})
+    store.provision_worker("worker-busy", TOKEN)
+    store.register_worker("worker-busy", TOKEN, {})
+    task = store.create_task(task_payload())
+    store.claim("worker-busy", TOKEN)
+
+    workers = store.list_workers()
+
+    assert [worker["worker_id"] for worker in workers] == ["worker-busy", "worker-ready"]
+    assert workers[0]["status"] == "busy"
+    assert workers[0]["current_task_id"] == task["task_id"]
+    assert workers[1]["capabilities"]["gpu"] == "Tesla T4"
     store.close()

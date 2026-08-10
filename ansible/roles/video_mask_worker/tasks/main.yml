@@ -1,22 +1,12 @@
 ---
-- name: Install prerequisites used before bootstrap
+- name: Install Worker Python prerequisites
   ansible.builtin.apt:
     name:
-      - git
       - python3
       - python3-venv
       - python3-pip
     state: present
     update_cache: true
-
-- name: Checkout video-mask repository
-  ansible.builtin.git:
-    repo: "{{ video_mask_repo }}"
-    dest: "{{ video_mask_app_dir }}"
-    version: "{{ video_mask_ref }}"
-    update: true
-    accept_newhostkey: true
-  become_user: ubuntu
 
 - name: Provision Worker credential on the controller
   ansible.builtin.uri:
@@ -31,7 +21,7 @@
     status_code: 200
   no_log: true
 
-- name: Bootstrap CUDA face worker and dependencies
+- name: Bootstrap CUDA face worker and source dependencies
   ansible.builtin.command:
     cmd: bash scripts/bootstrap_server.sh --cuda --face-only
     chdir: "{{ video_mask_app_dir }}"
@@ -40,6 +30,14 @@
 - name: Create Worker runtime directory
   ansible.builtin.file:
     path: /home/ubuntu/work/video-mask
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+
+- name: Create Worker persistent output directory
+  ansible.builtin.file:
+    path: /home/ubuntu/outputs
     state: directory
     owner: ubuntu
     group: ubuntu

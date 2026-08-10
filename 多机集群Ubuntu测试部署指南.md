@@ -35,6 +35,15 @@ echo "Cluster code is ready"
 git status --short
 ```
 
+仅启动 Controller、暂时没有 Worker 时，可运行
+`bash scripts/bootstrap_cluster_controller.sh` 自动生成本机配置并部署。
+多机 AWS 环境请指定 Controller 私网地址，例如：
+
+```bash
+bash scripts/bootstrap_cluster_controller.sh \
+  --controller-url http://10.0.1.25:8080
+```
+
 ## 1. 安装 Ansible
 
 ```bash
@@ -66,8 +75,8 @@ ls -lh /home/ubuntu/cluster_test_sources
 ```bash
 cd /home/ubuntu/video-mask/ansible
 cp -n inventory.yml.example inventory.yml
-mkdir -p group_vars
-cp -n group_vars/all.yml.example group_vars/all.yml
+mkdir -p group_vars/all
+cp -n group_vars/all/settings.yml.example group_vars/all/settings.yml
 ```
 
 编辑 inventory：
@@ -105,13 +114,13 @@ openssl rand -hex 32
 编辑变量文件：
 
 ```bash
-nano group_vars/all.yml
+nano group_vars/all/settings.yml
 ```
 
 保留 `video_mask_repo` 等已有配置，并至少设置以下内容；把两处 Token 替换成刚刚生成的不同随机值：
 
 ```yaml
-video_mask_repo: https://gitee.com/ryven/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
 
@@ -237,7 +246,7 @@ sudo systemctl start video-mask-worker
 
 ### Worker 显示未注册或 Token 无效
 
-确认 `group_vars/all.yml` 中的 `video_mask_worker_token` 未修改，并重新执行：
+确认 `group_vars/all/settings.yml` 中的 `video_mask_worker_token` 未修改，并重新执行：
 
 ```bash
 ansible-playbook -i ansible/inventory.yml ansible/site.yml -K

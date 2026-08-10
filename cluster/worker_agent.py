@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARGS = ["--no-card", "--face-size", "960", "--face-int", "5", "--frame-skip", "3"]
+DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--no-card", "--face-size", "960",
+                "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8"]
+DEFAULT_ALGORITHM = "video_mask_batch_fish.py"
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -52,19 +54,21 @@ class Worker:
         self.worker_id = args.worker_id
         self.token = args.token
         self.work_dir = args.work_dir.resolve()
+        self.completed_output_dir = args.completed_output_dir.resolve()
         self.algorithm = args.algorithm.resolve()
         self.python = args.python
         self.poll_seconds = args.poll_seconds
         self.extra_args = args.extra_arg or DEFAULT_ARGS
         self.allow_local_files = args.allow_local_files
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.completed_output_dir.mkdir(parents=True, exist_ok=True)
 
     def payload(self, **extra: Any) -> dict[str, Any]:
         return {"worker_id": self.worker_id, "token": self.token, **extra}
 
     @staticmethod
     def capabilities() -> dict[str, Any]:
-        info: dict[str, Any] = {"algorithm": "video_mask_batch_skip.py", "pid": os.getpid()}
+        info: dict[str, Any] = {"algorithm": DEFAULT_ALGORITHM, "pid": os.getpid()}
         try:
             import torch
             info.update({"cuda_available": torch.cuda.is_available(), "torch": torch.__version__})
@@ -120,6 +124,31 @@ class Worker:
         if result.returncode != 0:
             raise RuntimeError("output upload failed: " + result.stderr[-1000:])
 
+    def algorithm_command(self, source: Path, output_dir: Path, arguments: list[str]) -> list[str]:
+        """Build an invocation for either a development script or a release binary.
+
+        The normal source deployment supplies a ``.py`` algorithm and therefore
+        needs Python. A release supplies an executable wrapper around compiled
+        proprietary modules and must be invoked directly; attempting to run it
+        as a Python script makes an otherwise valid Worker fail at task claim time.
+        """
+        shared = [str(source), "--out-dir", str(output_dir), *arguments]
+        if self.algorithm.suffix.lower() == ".py":
+            return [self.python, "-u", str(self.algorithm), *shared]
+        if not self.algorithm.is_file():
+            raise RuntimeError(f"algorithm executable does not exist: {self.algorithm}")
+        if not os.access(self.algorithm, os.X_OK):
+            raise RuntimeError(f"algorithm executable is not executable: {self.algorithm}")
+        return [str(self.algorithm), *shared]
+
+    def persist_output(self, output: Path, task_id: str) -> Path:
+        """Keep a completed result after the task work directory is cleaned."""
+        destination = self.completed_output_dir / output.name
+        if destination.exists():
+            destination = self.completed_output_dir / f"{output.stem}_{task_id[:8]}{output.suffix}"
+        shutil.copy2(output, destination)
+        return destination
+
     def run_task(self, task: dict[str, Any]) -> None:
         task_id = task["task_id"]
         directory = self.work_dir / task_id
@@ -138,8 +167,9 @@ class Worker:
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
             self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size)
-            command = [self.python, "-u", str(self.algorithm), str(source), "--out-dir", str(output_dir),
-                       *(task.get("arguments") or self.extra_args)]
+            command = self.algorithm_command(
+                source, output_dir, task.get("arguments") or self.extra_args
+            )
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
@@ -156,11 +186,21 @@ class Worker:
             if not candidates:
                 raise RuntimeError("algorithm completed without an output mp4")
             output = candidates[0]
-            self.report(task_id, "uploading", phase="uploading", elapsed_seconds=round(time.monotonic() - started, 1))
-            self.upload(task["output_upload_url"], output)
+            elapsed = round(time.monotonic() - started, 1)
+            output_url = task.get("output_upload_url")
+            if output_url:
+                self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
+                self.upload(output_url, output)
+                completed_output = output
+                output_location = output_url
+            else:
+                self.report(task_id, "uploading", phase="saving_local_output", elapsed_seconds=elapsed)
+                completed_output = self.persist_output(output, task_id)
+                output_location = str(completed_output)
             self.api(f"/api/tasks/{task_id}/complete", self.payload(
-                output_sha256=sha256(output), output_duration_seconds=duration(output),
-                progress={"output_bytes": output.stat().st_size, "elapsed_seconds": round(time.monotonic() - started, 1)},
+                output_sha256=sha256(completed_output), output_duration_seconds=duration(completed_output),
+                progress={"output_bytes": completed_output.stat().st_size, "elapsed_seconds": elapsed,
+                          "output_location": output_location},
             ))
         except Exception as exc:
             print(f"[{task_id}] ERROR: {exc}", file=sys.stderr, flush=True)
@@ -195,7 +235,9 @@ def main() -> None:
     parser.add_argument("--worker-id", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--work-dir", type=Path, default=Path("/home/ubuntu/work/video-mask"))
-    parser.add_argument("--algorithm", type=Path, default=Path(__file__).resolve().parents[1] / "video_mask_batch_skip.py")
+    parser.add_argument("--completed-output-dir", type=Path, default=Path("/home/ubuntu/outputs"),
+                        help="Persistent output directory used when a task has no output_upload_url")
+    parser.add_argument("--algorithm", type=Path, default=Path(__file__).resolve().parents[1] / DEFAULT_ALGORITHM)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--poll-seconds", type=int, default=10)
     parser.add_argument("--extra-arg", action="append", default=[])

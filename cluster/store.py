@@ -137,6 +137,16 @@ class ClusterStore:
         return self._row(self.conn.execute("SELECT * FROM workers WHERE worker_id=?", (worker_id,)).fetchone())
 
     @synchronized
+    def list_workers(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute("""
+            SELECT * FROM workers
+            ORDER BY CASE status WHEN 'busy' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
+                     last_seen_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._row(row) or {} for row in rows]
+
+    @synchronized
     def heartbeat(self, worker_id: str, token: str, status: str,
                   capabilities: dict[str, Any] | None = None) -> dict[str, Any]:
         self.authenticate_worker(worker_id, token)
@@ -157,22 +167,29 @@ class ClusterStore:
         args = payload.get("arguments") or []
         if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
             raise ValueError("arguments must be a list of strings")
-        required = ("source_url", "output_upload_url")
+        required = ("source_url",)
         missing = [name for name in required if not payload.get(name)]
         if missing:
             raise ValueError(f"missing required fields: {', '.join(missing)}")
         stamp = now()
-        self.conn.execute("""
-            INSERT INTO tasks(task_id, source_url, source_object_key, source_size_bytes, source_sha256,
-              source_duration_seconds, algorithm, arguments_json, output_upload_url, output_object_key,
-              status, max_attempts, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-        """, (task_id, payload["source_url"], payload.get("source_object_key"),
-              payload.get("source_size_bytes"), payload.get("source_sha256"),
-              payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
-              json.dumps(args), payload["output_upload_url"], payload.get("output_object_key"),
-              int(payload.get("max_attempts", 3)), stamp, stamp))
-        self.conn.commit()
+        try:
+            self.conn.execute("""
+                INSERT INTO tasks(task_id, source_url, source_object_key, source_size_bytes, source_sha256,
+                  source_duration_seconds, algorithm, arguments_json, output_upload_url, output_object_key,
+                  status, max_attempts, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """, (task_id, payload["source_url"], payload.get("source_object_key"),
+                  payload.get("source_size_bytes"), payload.get("source_sha256"),
+                  payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
+                  json.dumps(args), payload.get("output_upload_url") or "", payload.get("output_object_key"),
+                  int(payload.get("max_attempts", 3)), stamp, stamp))
+            self.conn.commit()
+        except Exception:
+            # A duplicate local-ingest task is expected and is handled by the
+            # caller.  SQLite keeps the failed INSERT transaction open unless
+            # it is rolled back, which would otherwise block the next claim.
+            self.conn.rollback()
+            raise
         return self.task(task_id) or {}
 
     @synchronized

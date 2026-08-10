@@ -3,6 +3,7 @@
   hosts: controller
   become: true
   roles:
+    - video_mask_source
     - video_mask_controller
 
 - name: Deploy GPU video-mask workers
@@ -10,4 +11,5 @@
   become: true
   serial: 2
   roles:
+    - video_mask_source
     - video_mask_worker

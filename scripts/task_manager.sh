@@ -9,12 +9,30 @@ SCHEDULER="$ROOT_DIR/scripts/batch_scheduler.py"
 TASK_HOME="$ROOT_DIR/.task_manager"
 TASKS_DIR="$TASK_HOME/tasks"
 RUNNERS_DIR="$TASK_HOME/runners"
-DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_skip.py"
-DEFAULT_EXTRA_ARGS=(--no-card --face-size 960 --face-int 1 --frame-skip 3 --fisheye)
-DEFAULT_EXTRA_LINE="--no-card --face-size 960 --face-int 1 --frame-skip 3 --fisheye"
+DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_fish.py"
+DEFAULT_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8)
+DEFAULT_EXTRA_LINE="--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8"
+FISH_V1_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8)
+FISH_V1_EXTRA_LINE="--fisheye --fisheye-device pico4 --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
-trap 'printf "\nCtrl+C only leaves the current prompt; running tasks stay detached.\n"' INT
+LAST_INTERRUPT_AT=0
+INTERRUPTED_PROMPT=0
+
+handle_interrupt() {
+    local now
+    now="$(date +%s)"
+    if (( LAST_INTERRUPT_AT > 0 && now - LAST_INTERRUPT_AT <= 3 )); then
+        printf '\nSecond Ctrl+C received. Exiting task manager; detached tasks stay active.\n'
+        trap - INT
+        exit 130
+    fi
+    LAST_INTERRUPT_AT="$now"
+    INTERRUPTED_PROMPT=1
+    printf '\nCtrl+C received. Press Ctrl+C again within 3 seconds to exit; detached tasks stay active.\n'
+}
+
+trap handle_interrupt INT
 
 die() { printf 'Error: %s\n' "$*" >&2; }
 pause() { read -r -p 'Press Enter to return to the menu... ' _; }
@@ -107,7 +125,7 @@ choose_algorithm() {
         return 1
     fi
     while true; do
-        read -r -p "Algorithm [1-${#files[@]}, Enter=$(basename "$DEFAULT_ALGORITHM")]: " choice
+        read -r -p "Algorithm [1-${#files[@]} or filename, Enter=$(basename "$DEFAULT_ALGORITHM")]: " choice
         if [[ -z "$choice" ]]; then
             CHOSEN_ALGORITHM="$DEFAULT_ALGORITHM"
             return 0
@@ -116,12 +134,18 @@ choose_algorithm() {
             CHOSEN_ALGORITHM="${files[choice - 1]}"
             return 0
         fi
-        printf 'Please enter a number in the displayed range.\n'
+        for file in "${files[@]}"; do
+            if [[ "$choice" == "$(basename "$file")" ]]; then
+                CHOSEN_ALGORITHM="$file"
+                return 0
+            fi
+        done
+        printf 'Please enter a number in the displayed range or an algorithm filename from the list.\n'
     done
 }
 
 start_task() {
-    local source_dir target_dir extra_line workers_line force_line force_reprocess id started log_file meta_file runner_file pid
+    local source_dir target_dir extra_line default_extra_line workers_line force_line force_reprocess id started log_file meta_file runner_file pid
     local workers
     local -a extra_args=("${DEFAULT_EXTRA_ARGS[@]}")
     if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -138,16 +162,25 @@ start_task() {
     fi
     choose_algorithm || return
 
+    # fish_v1 is face-only and deliberately does not expose --no-card.
+    # Keep the menu defaults compatible with the selected algorithm.
+    if [[ "$(basename "$CHOSEN_ALGORITHM")" == "video_mask_batch_fish_v1.py" ]]; then
+        extra_args=("${FISH_V1_EXTRA_ARGS[@]}")
+        default_extra_line="$FISH_V1_EXTRA_LINE"
+    else
+        default_extra_line="$DEFAULT_EXTRA_LINE"
+    fi
+
     read -r -p 'Source directory [/home/ubuntu/sources]: ' source_dir || return
     source_dir="${source_dir:-/home/ubuntu/sources}"
     read -r -p 'Target directory [/home/ubuntu/outputs]: ' target_dir || return
     target_dir="${target_dir:-/home/ubuntu/outputs}"
-    read -r -p "Algorithm arguments [${DEFAULT_EXTRA_LINE}]: " extra_line || return
+    read -r -p "Algorithm arguments [${default_extra_line}]: " extra_line || return
     if [[ -n "$extra_line" ]]; then
         # A non-empty response intentionally replaces the defaults.
         read -r -a extra_args <<< "$extra_line"
     else
-        extra_line="$DEFAULT_EXTRA_LINE"
+        extra_line="$default_extra_line"
     fi
     read -r -p 'Force reprocess completed videos? [y/N]: ' force_line || return
     if [[ "$force_line" =~ ^[Yy]$ ]]; then
@@ -308,7 +341,11 @@ view_history() {
 while true; do
     printf '\n=== Video Mask Task Manager ===\n'
     printf '1) Start task\n2) Stop task\n3) View current progress\n4) View task history\n5) Exit\n'
+    INTERRUPTED_PROMPT=0
     if ! read -r -p 'Choose an action [1-5]: ' action; then
+        if (( INTERRUPTED_PROMPT )); then
+            continue
+        fi
         printf '\nInput closed. Goodbye. Running tasks remain active.\n'
         exit 0
     fi
