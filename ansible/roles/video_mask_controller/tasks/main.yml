@@ -5,7 +5,8 @@
       - python3
       - python3-venv
       - python3-pip
-      - awscli
+      - curl
+      - unzip
     state: present
     update_cache: true
 
@@ -16,6 +17,32 @@
       - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_output_bucket | default('') | length > 0)
       - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_source_region | default('') | length > 0)
     fail_msg: S3 mode requires source bucket, output bucket, and source region settings.
+
+- name: Check whether AWS CLI v2 is installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/aws
+  register: video_mask_aws_cli
+
+- name: Download AWS CLI v2 installer
+  ansible.builtin.get_url:
+    url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+    dest: /tmp/video-mask-awscliv2.zip
+    mode: '0644'
+  when: not video_mask_aws_cli.stat.exists
+
+- name: Unpack AWS CLI v2 installer
+  ansible.builtin.unarchive:
+    src: /tmp/video-mask-awscliv2.zip
+    dest: /tmp
+    remote_src: true
+    creates: /tmp/aws/install
+  when: not video_mask_aws_cli.stat.exists
+
+- name: Install AWS CLI v2
+  ansible.builtin.command:
+    cmd: /tmp/aws/install
+    creates: /usr/local/bin/aws
+  when: not video_mask_aws_cli.stat.exists
 
 - name: Install controller Python dependencies
   ansible.builtin.pip:
