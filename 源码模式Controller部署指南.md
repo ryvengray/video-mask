@@ -155,9 +155,38 @@ sudo journalctl -u video-mask-controller -n 100 --no-pager
 
 ## 7. 添加 Worker
 
-### 7.1 一次性配置 Controller 到 Worker 的 SSH Key
+### 7.1 选择 Controller 到 Worker 的 SSH 认证方式
 
-Ansible 需要 Controller 无交互登录每台 Worker。若当前只能输入 `ubuntu` 密码 SSH，使用该密码一次性安装 Controller 的 SSH 公钥；之后不再需要把 Worker 登录密码写入 inventory。
+Ansible 需要 Controller 无交互登录每台 Worker。支持两种方式：统一密码 SSH（部署方便）或 Controller 专用 SSH Key（更推荐）。两种方式只能选一种，不要在 inventory 同时配置 `ansible_password` 与 `ansible_ssh_private_key_file`。
+
+#### 方式 A：所有 Worker 使用同一账号密码
+
+Controller 先安装密码 SSH 所需组件：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y sshpass
+```
+
+将 Worker 的 SSH 登录密码和 sudo 密码加密保存到 Vault。若二者相同，可以填写相同内容：
+
+```bash
+cd ~/video-mask/ansible
+ansible-vault edit group_vars/all/vault.yml
+```
+
+添加：
+
+```yaml
+vault_video_mask_worker_ssh_password: "所有Worker共用的SSH登录密码"
+vault_video_mask_worker_sudo_password: "所有Worker共用的sudo密码"
+```
+
+密码只能存在 `vault.yml` 中，不能写进 `inventory.yml`、Shell 历史或 Git 仓库。
+
+#### 方式 B：Controller 专用 SSH Key（推荐）
+
+若当前只能输入 `ubuntu` 密码 SSH，使用该密码一次性安装 Controller 的 SSH 公钥；之后不再需要保存 Worker 登录密码。
 
 在 Controller 生成管理 Key（若文件已存在，不要覆盖）：
 
@@ -179,11 +208,28 @@ ssh-copy-id -i ~/.ssh/video-mask-ansible.pub ubuntu@10.200.0.7
 ssh -i ~/.ssh/video-mask-ansible -o IdentitiesOnly=yes ubuntu@10.200.0.7 'hostname && nvidia-smi -L'
 ```
 
-若 Worker 的 sudo 需要密码，部署时使用 Playbook 的 `-K` 输入 sudo 密码；更推荐使用云镜像默认的受控免密 sudo。不要把 SSH 登录密码写进 `inventory.yml`。
+若 Worker 的 sudo 需要密码，部署时使用 Playbook 的 `-K` 输入 sudo 密码；更推荐使用云镜像默认的受控免密 sudo。
 
 ### 7.2 添加 inventory
 
-在 `inventory.yml` 增加 Worker 私网 IP：
+在 `inventory.yml` 增加 Worker 私网 IP，并按上一节选择一种认证配置。
+
+**统一密码 SSH 示例：**
+
+```yaml
+gpu_workers:
+  vars:
+    ansible_user: ubuntu
+    ansible_password: "{{ vault_video_mask_worker_ssh_password }}"
+    ansible_become_password: "{{ vault_video_mask_worker_sudo_password }}"
+  hosts:
+    worker-01:
+      ansible_host: 10.0.2.20
+      video_mask_worker_id: worker-01
+      video_mask_worker_slots: 2
+```
+
+**SSH Key 示例：**
 
 ```yaml
 gpu_workers:
@@ -200,6 +246,12 @@ gpu_workers:
 确认安全组允许 Controller SSH 到 Worker 的 TCP `22`，并允许 Worker 访问 Controller TCP `8080`。然后在 Controller 上执行：
 
 ```bash
+# 密码 SSH：密码已在 Vault 中，不需要 -K
+ansible -i inventory.yml gpu_workers -m ping --ask-vault-pass
+ansible-playbook -i inventory.yml site.yml \
+  --limit gpu_workers --ask-vault-pass
+
+# SSH Key：若 Worker sudo 需要密码，使用 -K
 ansible-playbook -i inventory.yml site.yml \
   --limit gpu_workers \
   -K --ask-vault-pass

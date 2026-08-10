@@ -6,6 +6,9 @@ controller:
 gpu_workers:
   vars:
     ansible_user: ubuntu
+    # Password SSH option: keep actual values only in group_vars/all/vault.yml.
+    # ansible_password: "{{ vault_video_mask_worker_ssh_password }}"
+    # ansible_become_password: "{{ vault_video_mask_worker_sudo_password }}"
   hosts:
     worker-01:
       ansible_host: 43.166.162.143
