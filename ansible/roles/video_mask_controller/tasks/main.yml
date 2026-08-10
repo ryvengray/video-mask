@@ -5,8 +5,17 @@
       - python3
       - python3-venv
       - python3-pip
+      - awscli
     state: present
     update_cache: true
+
+- name: Validate S3 configuration when S3 storage mode is selected
+  ansible.builtin.assert:
+    that:
+      - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_source_bucket | default('') | length > 0)
+      - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_output_bucket | default('') | length > 0)
+      - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_source_region | default('') | length > 0)
+    fail_msg: S3 mode requires source bucket, output bucket, and source region settings.
 
 - name: Install controller Python dependencies
   ansible.builtin.pip:

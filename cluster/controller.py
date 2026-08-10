@@ -21,6 +21,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 
 from cluster.store import ClusterStore
 from cluster.local_ingest import LocalIngestor
+from cluster.s3_ingest import S3Ingestor
 
 
 class WorkerRequest(BaseModel):
@@ -67,8 +68,14 @@ class WorkerProvisionRequest(BaseModel):
 
 
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
-               local_source_dir: Path | None = None, local_output_dir: Path | None = None) -> FastAPI:
+               local_source_dir: Path | None = None, local_output_dir: Path | None = None,
+               s3_ingestor: S3Ingestor | None = None,
+               s3_config: dict[str, Any] | None = None) -> FastAPI:
     store = ClusterStore(database)
+    if s3_ingestor and s3_config:
+        raise ValueError("s3_ingestor and s3_config are mutually exclusive")
+    if s3_config:
+        s3_ingestor = S3Ingestor(store, **s3_config)
     local_ingestor = (LocalIngestor(store, local_source_dir, local_output_dir)
                       if local_source_dir and local_output_dir else None)
 
@@ -108,7 +115,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def healthz() -> dict[str, str]:
         requeued = store.requeue_stale(stale_after_seconds)
         ingested = local_ingestor.scan() if local_ingestor else 0
-        return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested)}
+        s3_ingested = s3_ingestor.scan_if_due() if s3_ingestor else 0
+        return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested),
+                "s3_ingested": str(s3_ingested)}
 
     @app.post("/api/workers/register")
     def register_worker(request: WorkerRequest, http_request: Request):
@@ -129,7 +138,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         store.requeue_stale(stale_after_seconds)
         if local_ingestor:
             local_ingestor.scan()
-        return {"task": store.claim(worker_id, request.token)}
+        if s3_ingestor:
+            s3_ingestor.scan_if_due()
+        task = store.claim(worker_id, request.token)
+        return {"task": s3_ingestor.materialize(task) if task and s3_ingestor else task}
 
     @app.post("/api/tasks/{task_id}/progress")
     def progress(task_id: str, request: ProgressRequest):
@@ -230,14 +242,40 @@ def main() -> None:
                         help="Testing only: scan local videos and issue file:// tasks")
     parser.add_argument("--local-output-dir", type=Path,
                         help="Testing only: write completed files to this directory")
+    parser.add_argument("--s3-source-bucket")
+    parser.add_argument("--s3-source-prefix", default="")
+    parser.add_argument("--s3-output-bucket")
+    parser.add_argument("--s3-output-prefix", default="outputs/")
+    parser.add_argument("--s3-region")
+    parser.add_argument("--s3-profile")
+    parser.add_argument("--s3-poll-seconds", type=int, default=60)
+    parser.add_argument("--s3-presign-seconds", type=int, default=86400)
     args = parser.parse_args()
     if not args.admin_token or len(args.admin_token) < 16:
         raise SystemExit("Set --admin-token or VIDEO_MASK_ADMIN_TOKEN (at least 16 characters)")
     if bool(args.local_source_dir) != bool(args.local_output_dir):
         raise SystemExit("--local-source-dir and --local-output-dir must be supplied together")
+    s3_options = (args.s3_source_bucket, args.s3_output_bucket, args.s3_region)
+    if any(s3_options) and not all(s3_options):
+        raise SystemExit("--s3-source-bucket, --s3-output-bucket and --s3-region must be supplied together")
+    if args.s3_poll_seconds < 1 or not 1 <= args.s3_presign_seconds <= 604800:
+        raise SystemExit("--s3-poll-seconds must be positive; --s3-presign-seconds must be 1..604800")
+    s3_config = None
+    if args.s3_source_bucket:
+        s3_config = {
+            "source_bucket": args.s3_source_bucket,
+            "source_prefix": args.s3_source_prefix,
+            "output_bucket": args.s3_output_bucket,
+            "output_prefix": args.s3_output_prefix,
+            "region": args.s3_region,
+            "profile": args.s3_profile,
+            "poll_seconds": args.s3_poll_seconds,
+            "presign_seconds": args.s3_presign_seconds,
+        }
     import uvicorn
     uvicorn.run(create_app(args.database, args.admin_token, args.stale_after,
-                           args.local_source_dir, args.local_output_dir), host=args.host, port=args.port)
+                           args.local_source_dir, args.local_output_dir,
+                           s3_config=s3_config), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

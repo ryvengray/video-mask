@@ -206,7 +206,8 @@ class Worker:
                 self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
                 self.upload(output_url, output)
                 completed_output = output
-                output_location = output_url
+                # Do not save a sensitive presigned URL in the Controller database.
+                output_location = task.get("output_object_key") or "uploaded"
             else:
                 self.report(task_id, "uploading", phase="saving_local_output", elapsed_seconds=elapsed)
                 completed_output = self.persist_output(output, task_id)

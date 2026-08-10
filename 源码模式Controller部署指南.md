@@ -325,6 +325,51 @@ curl -fsS "http://127.0.0.1:8080/api/workers" \
 
 > 后续可在 Controller 增加 S3 任务导入服务：扫描指定 Prefix、生成预签名 URL、调用本 API。这样业务人员只需上传视频到 S3，无需手动执行 `curl`。
 
+### S3 自动分发与结果上传
+
+S3 模式下，Controller 使用自身的 AWS Profile 扫描源桶，将视频自动加入任务队列。Worker 领取任务的瞬间，Controller 才生成新的预签名下载 URL 和上传 URL：Worker 不需要 AWS AK/SK，也不会因为任务排队导致 URL 在处理前过期。
+
+在 **Controller** 上以运行服务的 `ubuntu` 用户配置 AWS Profile（不要用 `root` 配置，否则 systemd 服务无法读取）：
+
+```bash
+sudo -u ubuntu -H aws configure --profile s3-test
+sudo -u ubuntu -H aws sts get-caller-identity --profile s3-test
+```
+
+所用 IAM 身份至少需要：源桶 `s3:ListBucket`、`s3:GetObject`；结果桶 `s3:ListBucket`、`s3:GetObject`（用于跳过已有结果）、`s3:PutObject`。AK/SK 只保存在 Controller 的 `/home/ubuntu/.aws/`，不要写入 Git、Ansible inventory 或 Vault 以外的明文文件。
+
+编辑 `ansible/group_vars/all/settings.yml`：
+
+```yaml
+video_mask_storage_mode: s3
+video_mask_s3_source_bucket: dataai-mp4-685538570851-us-east-2-an
+video_mask_s3_source_prefix: ''
+video_mask_s3_source_region: us-east-2
+video_mask_s3_output_bucket: processed-video-685538570851-us-east-2-an
+video_mask_s3_output_prefix: outputs/
+video_mask_s3_profile: s3-test
+video_mask_s3_poll_seconds: 60
+video_mask_s3_presign_seconds: 86400
+```
+
+部署 Controller：
+
+```bash
+cd ~/video-mask/ansible
+ansible-playbook -i inventory.yml site.yml \
+  --limit controller -K --ask-vault-pass
+```
+
+首次健康检查会扫描源桶；之后 Controller 每 60 秒扫描一次，或有 Worker 领取任务时按周期扫描一次：
+
+```bash
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+返回中的 `s3_ingested` 是本次新创建任务数。结果对象会上传至 `s3://processed-video-685538570851-us-east-2-an/outputs/`，保留源视频的子目录，并加上 `masked_` 前缀。数据库已记录的同一对象版本、或结果桶已存在的输出，会自动跳过。
+
+预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。当前上传方式是单次 S3 `PutObject`，单个结果文件应小于 5 GiB；更大的文件需要后续增加 multipart upload。
+
 ### 无 S3 时的远程 Worker 测试
 
 可以只提供一个 Worker 能访问的 HTTP/HTTPS 下载 URL，并省略 `output_upload_url`：
