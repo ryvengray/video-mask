@@ -206,7 +206,59 @@ ansible-playbook -i inventory.yml site.yml \
 
 Worker 会自动获得源码只读 Key、clone 源码、安装 CUDA/Python 依赖，并启动 `video-mask-worker.service`。启动后 Worker 会自行轮询 Controller 领取任务；不需要让 Ansible 常驻运行。
 
-## 8. 更新源码版本
+## 8. 添加视频打码任务
+
+Worker 安装完成后会自动注册到 Controller 并持续轮询任务。Ansible 只负责部署，不负责添加视频任务。
+
+### 本机目录模式仅限单机测试
+
+`video_mask_storage_mode: local` 会扫描 Controller 的 `video_mask_local_source_dir`，生成 `file://` 任务。该方式仅适用于 Controller 与 Worker 在同一台机器，或两者挂载了同一个共享文件系统且路径完全一致。
+
+**当前远程 Worker 不能直接处理 Controller 本机 `/home/ubuntu/cluster_test_sources` 中的文件。**
+
+### 远程 Worker 使用任务 API
+
+给远程 Worker 添加任务时，调用 Controller 的 `POST /api/tasks`。任务必须提供：
+
+- `source_url`：Worker 能下载源视频的 URL；生产环境使用 S3 预签名 GET URL。
+- `output_upload_url`：Worker 能上传打码结果的 URL；生产环境使用 S3 预签名 PUT URL。
+
+在 Controller 上执行（将 Token 和两个 URL 替换为真实值）：
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:8080/api/tasks" \
+  -H "Authorization: Bearer 你的管理员Token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_url": "https://S3预签名下载URL",
+    "output_upload_url": "https://S3预签名上传URL",
+    "source_object_key": "incoming/video_001.mp4",
+    "output_object_key": "masked/video_001.mp4"
+  }'
+```
+
+Controller 会立即将任务标记为 `pending`；空闲 Worker 会领取、下载、处理并上传结果。当前默认算法与参数为：
+
+```text
+video_mask_batch_fish.py
+--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8
+```
+
+查看任务与 Worker 状态：
+
+```bash
+curl -fsS "http://127.0.0.1:8080/api/tasks" \
+  -H "Authorization: Bearer 你的管理员Token"
+
+curl -fsS "http://127.0.0.1:8080/api/workers" \
+  -H "Authorization: Bearer 你的管理员Token"
+```
+
+浏览器访问 `http://Controller私网IP:8080/` 也可以查看最近任务与 Worker 状态。
+
+> 后续可在 Controller 增加 S3 任务导入服务：扫描指定 Prefix、生成预签名 URL、调用本 API。这样业务人员只需上传视频到 S3，无需手动执行 `curl`。
+
+## 9. 更新源码版本
 
 Controller 或 Worker 升级时，先在 `group_vars/all/settings.yml` 修改：
 
@@ -224,7 +276,7 @@ ansible-playbook -i inventory.yml site.yml --limit controller -K --ask-vault-pas
 ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pass
 ```
 
-## 9. 常见问题
+## 10. 常见问题
 
 ### `Attempting to decrypt but no vault secrets found`
 
