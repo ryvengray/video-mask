@@ -14,8 +14,8 @@ video_mask_release_deploy_key: "{{ vault_video_mask_release_deploy_key }}"
 # required on the private network; restrict TCP 8080 to the Worker security group.
 video_mask_controller_url: http://10.0.0.10:8080
 # Store these secrets with ansible-vault, never commit real values.
-video_mask_admin_token: CHANGE_ME_TO_A_LONG_RANDOM_SECRET
-video_mask_worker_token: CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
+video_mask_worker_token: "{{ vault_video_mask_worker_token }}"
 # Testing mode: controller and Worker use their local /home/ubuntu directories.
 # Change to s3 after the external source Bucket grants cross-account read access.
 video_mask_storage_mode: local

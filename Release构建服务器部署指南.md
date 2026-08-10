@@ -214,7 +214,7 @@ vault_video_mask_release_deploy_key: |
   -----END OPENSSH PRIVATE KEY-----
 ```
 
-在 `ansible/group_vars/all.yml`（由示例文件复制而来）中设置：
+在 `ansible/group_vars/all/settings.yml`（由示例文件复制而来）中设置：
 
 ```yaml
 video_mask_release_repo: git@github.com:ryvengray/video-mask-release.git

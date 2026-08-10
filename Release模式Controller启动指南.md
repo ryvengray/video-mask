@@ -114,10 +114,11 @@ gpu_workers:
 ### 2.2 创建公开配置
 
 ```bash
-cp group_vars/all.yml.example group_vars/all.yml
+mkdir -p group_vars/all
+cp group_vars/all/settings.yml.example group_vars/all/settings.yml
 ```
 
-编辑 `group_vars/all.yml` 的关键字段：
+编辑 `group_vars/all/settings.yml` 的关键字段：
 
 ```yaml
 video_mask_release_repo: git@github.com:ryvengray/video-mask-release.git
@@ -234,7 +235,7 @@ Controller 监听 `0.0.0.0:8080`。建议安全组规则：
 
 ## 6. 升级到新 release
 
-每次发布新版本后，仅修改 `group_vars/all.yml`：
+每次发布新版本后，仅修改 `group_vars/all/settings.yml`：
 
 ```yaml
 video_mask_release_version: 新版本号

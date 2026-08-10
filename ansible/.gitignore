@@ -1,4 +1,4 @@
 # Customer-specific deployment state. Never commit it to the release repo.
 inventory.yml
-group_vars/all.yml
 group_vars/all/vault.yml
+group_vars/all/settings.yml
