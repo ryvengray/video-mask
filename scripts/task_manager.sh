@@ -125,7 +125,7 @@ choose_algorithm() {
         return 1
     fi
     while true; do
-        read -r -p "Algorithm [1-${#files[@]}, Enter=$(basename "$DEFAULT_ALGORITHM")]: " choice
+        read -r -p "Algorithm [1-${#files[@]} or filename, Enter=$(basename "$DEFAULT_ALGORITHM")]: " choice
         if [[ -z "$choice" ]]; then
             CHOSEN_ALGORITHM="$DEFAULT_ALGORITHM"
             return 0
@@ -134,7 +134,13 @@ choose_algorithm() {
             CHOSEN_ALGORITHM="${files[choice - 1]}"
             return 0
         fi
-        printf 'Please enter a number in the displayed range.\n'
+        for file in "${files[@]}"; do
+            if [[ "$choice" == "$(basename "$file")" ]]; then
+                CHOSEN_ALGORITHM="$file"
+                return 0
+            fi
+        done
+        printf 'Please enter a number in the displayed range or an algorithm filename from the list.\n'
     done
 }
 
