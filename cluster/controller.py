@@ -47,7 +47,7 @@ class FinishRequest(WorkerRequest):
 
 class TaskRequest(BaseModel):
     source_url: str
-    output_upload_url: str
+    output_upload_url: str | None = None
     source_object_key: str | None = None
     source_size_bytes: int | None = None
     source_sha256: str | None = None

@@ -35,6 +35,14 @@
     group: ubuntu
     mode: '0750'
 
+- name: Create Worker persistent output directory
+  ansible.builtin.file:
+    path: /home/ubuntu/outputs
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+
 - name: Install Worker environment file
   ansible.builtin.template:
     src: video-mask-worker.env.j2

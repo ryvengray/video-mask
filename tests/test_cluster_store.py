@@ -41,6 +41,17 @@ def test_worker_claims_task_once_and_finishes(tmp_path: Path):
     store.close()
 
 
+def test_task_without_upload_url_is_valid_for_worker_local_output(tmp_path: Path):
+    store = new_store(tmp_path)
+    payload = task_payload()
+    payload.pop("output_upload_url")
+    created = store.create_task(payload)
+
+    assert created["output_upload_url"] == ""
+    assert created["status"] == "pending"
+    store.close()
+
+
 def test_stale_worker_requeues_task(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)

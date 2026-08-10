@@ -167,7 +167,7 @@ class ClusterStore:
         args = payload.get("arguments") or []
         if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
             raise ValueError("arguments must be a list of strings")
-        required = ("source_url", "output_upload_url")
+        required = ("source_url",)
         missing = [name for name in required if not payload.get(name)]
         if missing:
             raise ValueError(f"missing required fields: {', '.join(missing)}")
@@ -181,7 +181,7 @@ class ClusterStore:
             """, (task_id, payload["source_url"], payload.get("source_object_key"),
                   payload.get("source_size_bytes"), payload.get("source_sha256"),
                   payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
-                  json.dumps(args), payload["output_upload_url"], payload.get("output_object_key"),
+                  json.dumps(args), payload.get("output_upload_url") or "", payload.get("output_object_key"),
                   int(payload.get("max_attempts", 3)), stamp, stamp))
             self.conn.commit()
         except Exception:

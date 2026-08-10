@@ -221,7 +221,7 @@ Worker 安装完成后会自动注册到 Controller 并持续轮询任务。Ansi
 给远程 Worker 添加任务时，调用 Controller 的 `POST /api/tasks`。任务必须提供：
 
 - `source_url`：Worker 能下载源视频的 URL；生产环境使用 S3 预签名 GET URL。
-- `output_upload_url`：Worker 能上传打码结果的 URL；生产环境使用 S3 预签名 PUT URL。
+- `output_upload_url`：可选。生产环境使用 S3 预签名 PUT URL；省略时，Worker 将结果保存到自身的 `/home/ubuntu/outputs`。
 
 在 Controller 上执行（将 Token 和两个 URL 替换为真实值）：
 
@@ -257,6 +257,19 @@ curl -fsS "http://127.0.0.1:8080/api/workers" \
 浏览器访问 `http://Controller私网IP:8080/` 也可以查看最近任务与 Worker 状态。
 
 > 后续可在 Controller 增加 S3 任务导入服务：扫描指定 Prefix、生成预签名 URL、调用本 API。这样业务人员只需上传视频到 S3，无需手动执行 `curl`。
+
+### 无 S3 时的远程 Worker 测试
+
+可以只提供一个 Worker 能访问的 HTTP/HTTPS 下载 URL，并省略 `output_upload_url`：
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:8080/api/tasks" \
+  -H "Authorization: Bearer 你的管理员Token" \
+  -H "Content-Type: application/json" \
+  -d '{"source_url":"https://可下载的视频URL"}'
+```
+
+Worker 下载、处理后会将视频保存至该 Worker 的 `/home/ubuntu/outputs/`，并向 Controller 标记 `completed`。任务详情的 `progress.output_location` 会记录实际本地路径。
 
 ## 9. 更新源码版本
 

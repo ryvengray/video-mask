@@ -8,7 +8,7 @@ Type=simple
 User=ubuntu
 EnvironmentFile=/etc/video-mask-worker.env
 WorkingDirectory={{ video_mask_app_dir }}
-ExecStart={{ video_mask_app_dir }}/.venv/bin/python -m cluster.worker_agent --controller ${VIDEO_MASK_CONTROLLER} --worker-id ${VIDEO_MASK_WORKER_ID} --token ${VIDEO_MASK_WORKER_TOKEN} --work-dir /home/ubuntu/work/video-mask --algorithm {{ video_mask_app_dir }}/video_mask_batch_fish.py{{ ' --allow-local-files' if video_mask_storage_mode | default('local') == 'local' else '' }}
+ExecStart={{ video_mask_app_dir }}/.venv/bin/python -m cluster.worker_agent --controller ${VIDEO_MASK_CONTROLLER} --worker-id ${VIDEO_MASK_WORKER_ID} --token ${VIDEO_MASK_WORKER_TOKEN} --work-dir /home/ubuntu/work/video-mask --completed-output-dir /home/ubuntu/outputs --algorithm {{ video_mask_app_dir }}/video_mask_batch_fish.py{{ ' --allow-local-files' if video_mask_storage_mode | default('local') == 'local' else '' }}
 Restart=always
 RestartSec=10
 KillSignal=SIGINT
