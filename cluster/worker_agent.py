@@ -175,11 +175,14 @@ class Worker:
         heartbeat = threading.Thread(target=self.busy_heartbeat,
                                      args=(heartbeat_stop, self.capabilities()), daemon=True)
         heartbeat.start()
+        phase = "initializing"
         try:
+            phase = "downloading"
             self.report(task_id, "downloading", phase="downloading")
             self.download(task["source_url"], source)
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
+            phase = "processing"
             self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size)
             command = self.algorithm_command(
                 source, output_dir, task.get("arguments") or self.extra_args
@@ -203,12 +206,14 @@ class Worker:
             elapsed = round(time.monotonic() - started, 1)
             output_url = task.get("output_upload_url")
             if output_url:
+                phase = "uploading"
                 self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
                 self.upload(output_url, output)
                 completed_output = output
                 # Do not save a sensitive presigned URL in the Controller database.
                 output_location = task.get("output_object_key") or "uploaded"
             else:
+                phase = "saving_local_output"
                 self.report(task_id, "uploading", phase="saving_local_output", elapsed_seconds=elapsed)
                 completed_output = self.persist_output(output, task_id)
                 output_location = str(completed_output)
@@ -218,9 +223,10 @@ class Worker:
                           "output_location": output_location},
             ))
         except Exception as exc:
-            print(f"[{task_id}] ERROR: {exc}", file=sys.stderr, flush=True)
+            message = f"{phase}: {exc}"
+            print(f"[{task_id}] ERROR: {message}", file=sys.stderr, flush=True)
             try:
-                self.api(f"/api/tasks/{task_id}/fail", self.payload(error_message=str(exc)[:3000]))
+                self.api(f"/api/tasks/{task_id}/fail", self.payload(error_message=message[:3000]))
             except Exception as report_error:
                 print(f"[{task_id}] failed to report error: {report_error}", file=sys.stderr, flush=True)
         finally:

@@ -193,6 +193,23 @@ class ClusterStore:
         return self.task(task_id) or {}
 
     @synchronized
+    def retry_task(self, task_id: str) -> dict[str, Any]:
+        """Return a failed task to the queue with a fresh retry budget."""
+        current = self.task(task_id)
+        if current is None:
+            raise ValueError("task does not exist")
+        if current["status"] != "failed":
+            raise ValueError("only failed tasks can be retried")
+        stamp = now()
+        self.conn.execute("""
+            UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
+              progress_json='{}', error_message=NULL, started_at=NULL, finished_at=NULL, updated_at=?
+            WHERE task_id=?
+        """, (stamp, task_id))
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
     def task(self, task_id: str) -> dict[str, Any] | None:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 

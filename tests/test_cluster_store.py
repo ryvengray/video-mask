@@ -93,6 +93,23 @@ def test_failed_task_retries_until_max_attempts(tmp_path: Path):
     store.close()
 
 
+def test_failed_task_can_be_retried_by_an_admin_action(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    payload = task_payload()
+    payload["max_attempts"] = 1
+    created = store.create_task(payload)
+    store.claim("worker-01", TOKEN)
+    assert store.finish("worker-01", TOKEN, created["task_id"], False, {"error_message": "access denied"})["status"] == "failed"
+
+    retried = store.retry_task(created["task_id"])
+    assert retried["status"] == "pending"
+    assert retried["attempt_count"] == 0
+    assert retried["error_message"] is None
+    store.close()
+
+
 def test_local_ingestor_creates_one_file_task(tmp_path: Path):
     store = new_store(tmp_path)
     source_dir = tmp_path / "sources"

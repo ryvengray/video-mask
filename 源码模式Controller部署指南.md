@@ -370,6 +370,13 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。当前上传方式是单次 S3 `PutObject`，单个结果文件应小于 5 GiB；更大的文件需要后续增加 multipart upload。
 
+若修复 IAM 权限、网络或算法配置后需要重新执行一个已失败的任务，使用管理员 Token 将其重新放回队列（重置该任务的重试次数）：
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:8080/api/tasks/任务ID/retry" \
+  -H "Authorization: Bearer 你的管理员Token"
+```
+
 ### 无 S3 时的远程 Worker 测试
 
 可以只提供一个 Worker 能访问的 HTTP/HTTPS 下载 URL，并省略 `output_upload_url`：

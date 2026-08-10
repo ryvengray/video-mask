@@ -163,6 +163,14 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except (ValueError, sqlite3.IntegrityError) as exc:  # type: ignore[name-defined]
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/{task_id}/retry")
+    def retry_task(task_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return store.retry_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/admin/workers")
     def provision_worker(request: WorkerProvisionRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
