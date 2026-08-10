@@ -39,7 +39,11 @@ class S3Ingestor:
             except ImportError as exc:  # pragma: no cover - deployment dependency guard
                 raise RuntimeError("S3 mode requires boto3; install requirements-cluster.txt") from exc
             session = boto3.Session(profile_name=profile or None, region_name=region or None)
-            client = session.client("s3", region_name=region or None)
+            # Never sign the legacy global endpoint (bucket.s3.amazonaws.com)
+            # for a non-us-east-1 bucket. S3 redirects it to the regional host,
+            # but the redirect changes the signed Host header and causes 403.
+            endpoint_url = f"https://s3.{region}.amazonaws.com" if region else None
+            client = session.client("s3", region_name=region or None, endpoint_url=endpoint_url)
         self.client = client
 
     def output_key(self, source_key: str) -> str:
