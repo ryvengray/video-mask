@@ -164,10 +164,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     @app.get("/api/workers")
     def list_workers(limit: int = 100, authorization: str | None = Header(default=None)):
         require_admin(authorization)
+        store.requeue_stale(stale_after_seconds)
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard():
+        store.requeue_stale(stale_after_seconds)
         rows = store.list_tasks(100)
         task_items = "".join(
             f"<tr><td>{html.escape(str(task['task_id']))}</td><td>{html.escape(str(task['status']))}</td>"

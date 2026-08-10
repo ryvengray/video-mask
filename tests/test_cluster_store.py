@@ -66,6 +66,18 @@ def test_stale_worker_requeues_task(tmp_path: Path):
     store.close()
 
 
+def test_stale_idle_worker_becomes_offline(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-idle", TOKEN)
+    store.register_worker("worker-idle", TOKEN, {})
+    store.conn.execute("UPDATE workers SET last_seen_at=0 WHERE worker_id='worker-idle'")
+    store.conn.commit()
+
+    assert store.requeue_stale(1) == 0
+    assert store.worker("worker-idle")["status"] == "offline"
+    store.close()
+
+
 def test_failed_task_retries_until_max_attempts(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)

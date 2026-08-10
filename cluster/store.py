@@ -288,5 +288,12 @@ class ClusterStore:
                 WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading')
             """, (stamp, row[1]))
             self.conn.execute("UPDATE workers SET status='offline', current_task_id=NULL, updated_at=? WHERE worker_id=?", (stamp, row[0]))
+        # Idle Workers also need to become offline when their process or host
+        # disappears.  Previously only Workers with a leased task changed
+        # state, leaving old ready records misleadingly visible forever.
+        self.conn.execute("""
+            UPDATE workers SET status='offline', updated_at=?
+            WHERE current_task_id IS NULL AND last_seen_at < ? AND status != 'offline'
+        """, (stamp, threshold))
         self.conn.commit()
         return len(rows)
