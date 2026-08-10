@@ -11,6 +11,9 @@ video_mask_controller_url: http://10.0.0.10:8080
 # Store these secrets with ansible-vault, never commit real values.
 video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
 video_mask_worker_token: "{{ vault_video_mask_worker_token }}"
+# Per physical Worker machine. Each slot is a separate Worker identity and
+# processes one task at a time. Start with 2; benchmark before increasing.
+video_mask_worker_slots: 1
 # Testing mode: controller and Worker use their local /home/ubuntu directories.
 # Change to s3 after the external source Bucket grants cross-account read access.
 video_mask_storage_mode: local

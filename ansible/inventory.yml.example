@@ -10,3 +10,5 @@ gpu_workers:
     worker-01:
       ansible_host: 43.166.162.143
       video_mask_worker_id: worker-01
+      # Override the global default for this physical Worker if needed.
+      video_mask_worker_slots: 2

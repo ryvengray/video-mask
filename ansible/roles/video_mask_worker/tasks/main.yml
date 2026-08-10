@@ -8,7 +8,14 @@
     state: present
     update_cache: true
 
-- name: Provision Worker credential on the controller
+- name: Validate Worker slot count
+  ansible.builtin.assert:
+    that:
+      - video_mask_worker_slots | default(1) | int >= 1
+      - video_mask_worker_slots | default(1) | int <= 16
+    fail_msg: video_mask_worker_slots must be between 1 and 16.
+
+- name: Provision Worker slot credentials on the controller
   ansible.builtin.uri:
     url: "{{ video_mask_controller_url }}/api/admin/workers"
     method: POST
@@ -16,9 +23,10 @@
       Authorization: "Bearer {{ video_mask_admin_token }}"
     body_format: json
     body:
-      worker_id: "{{ video_mask_worker_id | default(inventory_hostname) }}"
+      worker_id: "{{ video_mask_worker_id | default(inventory_hostname) }}-slot-{{ item }}"
       token: "{{ video_mask_worker_token }}"
     status_code: 200
+  loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
   no_log: true
 
 - name: Bootstrap CUDA face worker and source dependencies
@@ -27,13 +35,14 @@
     chdir: "{{ video_mask_app_dir }}"
   changed_when: false
 
-- name: Create Worker runtime directory
+- name: Create Worker slot runtime directories
   ansible.builtin.file:
-    path: /home/ubuntu/work/video-mask
+    path: "/home/ubuntu/work/video-mask/slot-{{ item }}"
     state: directory
     owner: ubuntu
     group: ubuntu
     mode: '0750'
+  loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
 
 - name: Create Worker persistent output directory
   ansible.builtin.file:
@@ -43,19 +52,46 @@
     group: ubuntu
     mode: '0750'
 
-- name: Install Worker environment file
+- name: Install Worker slot environment files
   ansible.builtin.template:
     src: video-mask-worker.env.j2
-    dest: /etc/video-mask-worker.env
+    dest: "/etc/video-mask-worker@slot-{{ worker_slot }}.env"
     owner: root
     group: root
     mode: '0600'
+  loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
+  loop_control:
+    loop_var: worker_slot
   notify: Restart video-mask worker
 
-- name: Install Worker systemd service
+- name: Stop legacy single Worker service during slot migration
+  ansible.builtin.systemd:
+    name: video-mask-worker
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Find enabled Worker slot services from an earlier deployment
+  ansible.builtin.find:
+    paths: /etc/systemd/system/multi-user.target.wants
+    patterns: 'video-mask-worker@slot-*.service'
+    file_type: link
+  register: installed_worker_slots
+
+- name: Disable Worker slots above the configured concurrency
+  ansible.builtin.systemd:
+    name: "{{ item.path | basename | regex_replace('\\.service$', '') }}"
+    enabled: false
+    state: stopped
+  loop: "{{ installed_worker_slots.files }}"
+  when: >-
+    (item.path | basename | regex_replace('^video-mask-worker@slot-([0-9]+)\\.service$', '\\1') | int)
+    > (video_mask_worker_slots | default(1) | int)
+
+- name: Install Worker slot systemd service template
   ansible.builtin.template:
     src: video-mask-worker.service.j2
-    dest: /etc/systemd/system/video-mask-worker.service
+    dest: /etc/systemd/system/video-mask-worker@.service
     owner: root
     group: root
     mode: '0644'
@@ -63,8 +99,10 @@
     - Reload systemd
     - Restart video-mask worker
 
-- name: Enable Worker service
+- name: Enable Worker slot services
   ansible.builtin.systemd:
-    name: video-mask-worker
+    name: "video-mask-worker@slot-{{ item }}"
     enabled: true
     state: started
+    daemon_reload: true
+  loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"

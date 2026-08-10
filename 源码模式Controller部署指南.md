@@ -194,6 +194,7 @@ gpu_workers:
     worker-01:
       ansible_host: 10.0.2.20
       video_mask_worker_id: worker-01
+      video_mask_worker_slots: 2
 ```
 
 确认安全组允许 Controller SSH 到 Worker 的 TCP `22`，并允许 Worker 访问 Controller TCP `8080`。然后在 Controller 上执行：
@@ -204,7 +205,11 @@ ansible-playbook -i inventory.yml site.yml \
   -K --ask-vault-pass
 ```
 
-Worker 会自动获得源码只读 Key、clone 源码、安装 CUDA/Python 依赖，并启动 `video-mask-worker.service`。启动后 Worker 会自行轮询 Controller 领取任务；不需要让 Ansible 常驻运行。
+`video_mask_worker_slots` 表示一台物理 Worker 同时处理的任务数，默认值为 `1`。每个槽位会成为一个独立的 Controller Worker，例如上例会注册并启动 `worker-01-slot-1` 与 `worker-01-slot-2`；每个槽位一次领取一个任务。
+
+建议先使用 `2` 个槽位，观察 GPU SM、显存、CPU 与单视频速度后再增至 `4`。同一台 T4 上盲目设置过多槽位可能降低单任务速度，应该以总吞吐量判断。部署会停用旧的单实例 `video-mask-worker.service`，改为 `video-mask-worker@slot-1.service` 等模板实例；请在该 Worker 没有集群任务执行时升级。
+
+Worker 会自动获得源码只读 Key、clone 源码、安装 CUDA/Python 依赖，并启动每个槽位服务。启动后 Worker 会自行轮询 Controller 领取任务；不需要让 Ansible 常驻运行。
 
 ## 8. 添加视频打码任务
 
@@ -302,7 +307,7 @@ ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pa
 更新 Worker 后，可确认新服务参数已生效：
 
 ```bash
-ssh ubuntu@Worker私网IP 'sudo systemctl status video-mask-worker --no-pager && ls -ld ~/outputs'
+ssh ubuntu@Worker私网IP 'sudo systemctl status "video-mask-worker@slot-*" --no-pager && ls -ld ~/outputs'
 ```
 
 ## 10. 常见问题
