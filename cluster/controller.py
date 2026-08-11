@@ -128,8 +128,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def heartbeat(worker_id: str, request: HeartbeatRequest, http_request: Request):
         if request.worker_id != worker_id:
             raise ValueError("worker id does not match path")
-        return store.heartbeat(worker_id, request.token, request.status,
-                               worker_capabilities(request.capabilities, http_request))
+        worker = store.heartbeat(worker_id, request.token, request.status,
+                                 worker_capabilities(request.capabilities, http_request))
+        current_task_id = worker.get("current_task_id")
+        task = store.task(str(current_task_id)) if current_task_id else None
+        return {**worker, "cancel_requested": bool(task and task.get("status") == "cancelling")}
 
     @app.post("/api/workers/{worker_id}/claim")
     def claim(worker_id: str, request: WorkerRequest):
@@ -155,6 +158,14 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def fail(task_id: str, request: FinishRequest):
         return store.finish(request.worker_id, request.token, task_id, False, model_data(request))
 
+    @app.get("/api/tasks/{task_id}")
+    def get_task(task_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        return task
+
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -171,15 +182,40 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/{task_id}/restart")
+    def restart_task(task_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return store.restart_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    def cancel_task(task_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return store.cancel_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/admin/workers")
     def provision_worker(request: WorkerProvisionRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return store.provision_worker(request.worker_id, request.token)
 
     @app.get("/api/tasks")
-    def list_tasks(limit: int = 100, authorization: str | None = Header(default=None)):
+    def list_tasks(limit: int = 100, offset: int = 0, status: str | None = None,
+                   authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"tasks": store.list_tasks(max(1, min(limit, 1000)))}
+        page_size = max(1, min(limit, 1000))
+        page_offset = max(0, offset)
+        statuses = tuple(value.strip() for value in (status or "").split(",") if value.strip()) or None
+        return {
+            "tasks": store.list_tasks(page_size, page_offset, statuses),
+            "total": store.count_tasks(statuses),
+            "limit": page_size,
+            "offset": page_offset,
+        }
 
     @app.get("/api/workers")
     def list_workers(limit: int = 100, authorization: str | None = Header(default=None)):
@@ -188,22 +224,79 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard():
+    def dashboard(page: int = 1):
         store.requeue_stale(stale_after_seconds)
-        rows = store.list_tasks(100)
-        task_items = "".join(
-            f"<tr><td>{html.escape(str(task['task_id']))}</td><td>{html.escape(str(task['status']))}</td>"
-            f"<td>{html.escape(str(task['assigned_worker_id'] or '-'))}</td>"
-            f"<td>{html.escape(str(task['source_object_key'] or task['source_url']))}</td>"
-            f"<td>{task['attempt_count']}</td></tr>"
-            for task in rows
-        ) or "<tr><td colspan='5'>No tasks</td></tr>"
-        workers = store.list_workers(100)
+        page_size = 50
+        total_tasks = store.count_tasks()
+        total_pages = max(1, (total_tasks + page_size - 1) // page_size)
+        page = min(max(1, page), total_pages)
+        rows = store.list_tasks(page_size, (page - 1) * page_size)
+
+        def byte_size(value: Any) -> str:
+            try:
+                size = int(value)
+            except (TypeError, ValueError):
+                return "-"
+            for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+                if size < 1024 or unit == "TiB":
+                    return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+                size /= 1024
+            return "-"
+
+        def seconds(value: Any) -> str:
+            try:
+                elapsed = float(value)
+            except (TypeError, ValueError):
+                return "-"
+            if elapsed < 60:
+                return f"{elapsed:.1f}s"
+            minutes, remainder = divmod(round(elapsed), 60)
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}h {minutes}m {remainder}s" if hours else f"{minutes}m {remainder}s"
+
+        def task_file_info(task: dict[str, Any]) -> str:
+            progress = task.get("progress") or {}
+            source_name = task.get("source_object_key") or task.get("source_url") or "-"
+            output_name = task.get("output_object_key") or progress.get("output_filename") or "-"
+            input_size = progress.get("input_bytes", task.get("source_size_bytes"))
+            output_size = progress.get("output_bytes")
+            output_duration = seconds(task.get("output_duration_seconds"))
+            output_hash = task.get("output_sha256")
+            hash_line = f"<br><small>SHA-256: {html.escape(str(output_hash)[:16])}…</small>" if output_hash else ""
+            return (
+                f"<small>Input</small><br>{html.escape(str(source_name))}<br><small>{byte_size(input_size)}</small>"
+                f"<hr><small>Output</small><br>{html.escape(str(output_name))}<br>"
+                f"<small>{byte_size(output_size)} · {output_duration}</small>{hash_line}"
+            )
+
+        def task_runtime(task: dict[str, Any]) -> str:
+            progress = task.get("progress") or {}
+            processing = progress.get("processing_seconds", progress.get("elapsed_seconds"))
+            started, finished = task.get("started_at"), task.get("finished_at")
+            end_to_end = None
+            if isinstance(started, (int, float)) and isinstance(finished, (int, float)):
+                end_to_end = finished - started
+            parts = [f"Process: {seconds(processing)}"]
+            if end_to_end is not None:
+                parts.append(f"Total: {seconds(end_to_end)}")
+            return "<br>".join(parts)
 
         def last_seen(timestamp: float | None) -> str:
             if not timestamp:
                 return "-"
             return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        task_items = "".join(
+            f"<tr><td>{html.escape(str(task['task_id']))}</td><td>{html.escape(str(task['status']))}</td>"
+            f"<td>{html.escape(str(task['assigned_worker_id'] or '-'))}</td>"
+            f"<td>{task_file_info(task)}</td><td>{task_runtime(task)}</td>"
+            f"<td>{html.escape(str(task.get('algorithm') or '-'))}<br><small>"
+            f"{html.escape(' '.join(str(value) for value in (task.get('arguments') or [])))}</small></td>"
+            f"<td>{task['attempt_count']}</td><td>{last_seen(task.get('finished_at'))}</td>"
+            f"<td>{html.escape(str(task.get('error_message') or '-'))}</td></tr>"
+            for task in rows
+        ) or "<tr><td colspan='9'>No tasks</td></tr>"
+        workers = store.list_workers(100)
 
         def slot_for(worker: dict[str, Any]) -> str:
             capabilities = worker.get("capabilities") or {}
@@ -231,10 +324,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             f"<td>{last_seen(worker.get('last_seen_at'))}</td></tr>"
             for worker in workers
         ) or "<tr><td colspan='9'>No workers registered</td></tr>"
+        previous_link = (f'<a href="/?page={page - 1}">Previous</a>' if page > 1 else "Previous")
+        next_link = (f'<a href="/?page={page + 1}">Next</a>' if page < total_pages else "Next")
         return """<!doctype html><title>Video Mask Cluster</title>
-        <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%;margin:0 0 2rem}td,th{border:1px solid #ddd;padding:.5rem;text-align:left}h2{margin-top:2rem}</style>
+        <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%;margin:0 0 2rem}td,th{border:1px solid #ddd;padding:.5rem;text-align:left;vertical-align:top;word-break:break-word}th{white-space:nowrap}h2{margin-top:2rem}hr{border:0;border-top:1px solid #ddd;margin:.4rem 0}.pagination{display:flex;gap:1rem;align-items:center;margin:.5rem 0 1rem}</style>
         <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>Slot</th><th>GPU</th><th>CUDA</th><th>PID</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
-            "<h2>Tasks</h2><table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Source</th><th>Attempts</th></tr>" + task_items + "</table>"
+            f"<h2>Tasks ({total_tasks})</h2><div class='pagination'>{previous_link}<span>Page {page} / {total_pages} · {page_size} per page</span>{next_link}</div>" + \
+            "<table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Files</th><th>Time</th><th>Algorithm / arguments</th><th>Attempts</th><th>Finished</th><th>Error</th></tr>" + task_items + "</table>"
 
     return app
 

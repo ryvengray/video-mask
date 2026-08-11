@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Interactive daily operations CLI for a Video Mask Cluster Controller."""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+UNFINISHED = ("pending", "assigned", "downloading", "processing", "uploading", "cancelling")
+RESTARTABLE = ("completed", "failed", "cancelled")
+
+
+class ControllerClient:
+    def __init__(self, controller: str, token: str):
+        self.controller = controller.rstrip("/")
+        self.token = token
+
+    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = json.dumps(payload).encode() if payload is not None else None
+        request = urllib.request.Request(
+            self.controller + path,
+            data=data,
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"Controller returned HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Cannot reach Controller: {exc.reason}") from exc
+
+    def task_page(self, statuses: tuple[str, ...] | None, offset: int, limit: int = 20) -> dict[str, Any]:
+        query: dict[str, str | int] = {"limit": limit, "offset": offset}
+        if statuses:
+            query["status"] = ",".join(statuses)
+        return self.request("GET", "/api/tasks?" + urllib.parse.urlencode(query))
+
+    def task(self, task_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}")
+
+    def cancel(self, task_id: str) -> dict[str, Any]:
+        return self.request("POST", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/cancel")
+
+    def restart(self, task_id: str) -> dict[str, Any]:
+        return self.request("POST", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/restart")
+
+
+def read_token(value: str | None, token_file: Path) -> str:
+    if value:
+        return value
+    if os.environ.get("VIDEO_MASK_ADMIN_TOKEN"):
+        return os.environ["VIDEO_MASK_ADMIN_TOKEN"]
+    try:
+        for line in token_file.read_text().splitlines():
+            if line.startswith("VIDEO_MASK_ADMIN_TOKEN="):
+                token = line.partition("=")[2].strip()
+                if token:
+                    return token
+    except OSError:
+        pass
+    return getpass.getpass("Controller admin token: ").strip()
+
+
+def stamp(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "-"
+    return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def duration(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "-"
+    if value < 60:
+        return f"{value:.1f}s"
+    minutes, seconds = divmod(round(value), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{seconds:02d}s"
+
+
+def task_line(task: dict[str, Any]) -> str:
+    progress = task.get("progress") or {}
+    source = str(task.get("source_object_key") or task.get("source_url") or "-")
+    processing = progress.get("processing_seconds", progress.get("elapsed_seconds"))
+    return (
+        f"{task['task_id']}  {task['status']:<11}  {str(task.get('assigned_worker_id') or '-'):<18} "
+        f"{duration(processing):>8}  {source}"
+    )
+
+
+def browse_tasks(client: ControllerClient, statuses: tuple[str, ...] | None) -> None:
+    offset = 0
+    while True:
+        page = client.task_page(statuses, offset)
+        tasks = page["tasks"]
+        total = page["total"]
+        print(f"\nTasks {offset + 1 if total else 0}-{offset + len(tasks)} of {total}")
+        print("Task ID                                Status       Worker              Process  Source")
+        print("-" * 100)
+        for task in tasks:
+            print(task_line(task))
+        if not tasks:
+            return
+        command = input("[n]ext, [p]revious, [q]uit: ").strip().lower() or "q"
+        if command == "n" and offset + page["limit"] < total:
+            offset += page["limit"]
+        elif command == "p" and offset > 0:
+            offset = max(0, offset - page["limit"])
+        elif command == "q":
+            return
+
+
+def show_task(task: dict[str, Any]) -> None:
+    print(json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def confirm(prompt: str) -> bool:
+    return input(f"{prompt} [y/N]: ").strip().lower() in {"y", "yes"}
+
+
+def interactive(client: ControllerClient) -> None:
+    while True:
+        print("""
+Video Mask Cluster Manager
+  1) List unfinished tasks
+  2) List recent tasks
+  3) Show task details
+  4) Cancel a task
+  5) Restart a completed, failed, or cancelled task
+  6) Exit""")
+        choice = input("Choose: ").strip()
+        try:
+            if choice == "1":
+                browse_tasks(client, UNFINISHED)
+            elif choice == "2":
+                browse_tasks(client, None)
+            elif choice == "3":
+                show_task(client.task(input("Full task ID: ").strip()))
+            elif choice == "4":
+                task_id = input("Full task ID to cancel: ").strip()
+                task = client.task(task_id)
+                print(task_line(task))
+                if confirm("Cancel this task?"):
+                    print("Updated:", client.cancel(task_id)["status"])
+            elif choice == "5":
+                task_id = input("Full terminal task ID to restart: ").strip()
+                task = client.task(task_id)
+                print(task_line(task))
+                if task["status"] not in RESTARTABLE:
+                    print("Only completed, failed, or cancelled tasks can be restarted.")
+                elif confirm("Queue this task again?"):
+                    print("Updated:", client.restart(task_id)["status"])
+            elif choice == "6":
+                return
+            else:
+                print("Choose 1-6.")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Manage Video Mask Controller tasks")
+    parser.add_argument("action", nargs="?", default="menu", choices=("menu", "list", "all", "detail", "cancel", "restart"))
+    parser.add_argument("task_id", nargs="?")
+    parser.add_argument("--controller", default="http://127.0.0.1:8080")
+    parser.add_argument("--token", help="Avoid when possible: --token is visible in shell history")
+    parser.add_argument("--token-file", type=Path, default=Path("/etc/video-mask-controller.env"))
+    args = parser.parse_args()
+    client = ControllerClient(args.controller, read_token(args.token, args.token_file))
+    try:
+        if args.action == "menu":
+            interactive(client)
+        elif args.action in {"list", "all"}:
+            browse_tasks(client, UNFINISHED if args.action == "list" else None)
+        else:
+            if not args.task_id:
+                raise SystemExit(f"{args.action} requires TASK_ID")
+            result = client.task(args.task_id) if args.action == "detail" else getattr(client, args.action)(args.task_id)
+            show_task(result)
+    except RuntimeError as exc:
+        raise SystemExit(f"Error: {exc}") from exc
+
+
+if __name__ == "__main__":
+    main()

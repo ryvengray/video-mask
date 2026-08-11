@@ -260,7 +260,7 @@ curl -H "Authorization: Bearer ADMIN_TOKEN" \
 1. 上传完成的视频到 `s3://INPUT_BUCKET/source/inbox/`。
 2. Controller 每 60 秒扫描一次；空闲 Worker 自动领取任务。
 3. 输出写入 `s3://OUTPUT_BUCKET/outputs/`，保存名为 `masked_<原文件名>.mp4`，并保留输入子目录结构。
-4. 查看状态使用 SSH 隧道后的 `http://127.0.0.1:8080/`，或以 Bearer Token 调用 `/api/tasks`、`/api/workers`。
+4. 查看状态使用 SSH 隧道后的 `http://127.0.0.1:8080/`：任务页每页展示 50 条，可翻页查看持续累积的历史任务；完成任务会显示输入/输出文件、大小、输出时长、处理耗时、算法和参数。也可通过 Bearer Token 调用 `/api/tasks?limit=50&offset=0`、`/api/workers`。
 
 常用命令：
 
@@ -271,12 +271,16 @@ sudo journalctl -u video-mask-controller -f
 # 某台 Worker
 sudo journalctl -u video-mask-worker@slot-1 -f
 
+# Controller 日常任务管理：列出未完成任务、查看详情、取消或重新入队。
+# 以 sudo 运行会从 /etc/video-mask-controller.env 读取 Admin Token。
+sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py
+
 # 部署更新后的 Worker 代码；先在 settings.yml 更新 video_mask_ref。
 ansible-playbook -i ansible/inventory.yml ansible/site.yml \
   --limit worker-01 --ask-vault-pass
 ```
 
-当前 Controller 页面是只读状态页；Worker 上下线使用对应主机的 `systemctl start|stop video-mask-worker@slot-1`。已完成任务不会因重新扫描自动重跑；需要保留重处理能力时，应通过新增任务或后续管理 API 实现，而不是删除 Controller SQLite 数据库。
+当前 Controller 页面是只读状态页；Worker 上下线使用对应主机的 `systemctl start|stop video-mask-worker@slot-1`。管理脚本可立即取消 pending 任务；对于运行中的任务，会请求 Worker 在下一次心跳（最长约 15 秒）终止算法并标记为 `cancelled`。已完成、失败或取消的任务可由脚本重新入队，无需删除 Controller SQLite 数据库。
 
 ## 7. 上线验收清单
 

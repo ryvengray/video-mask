@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -98,12 +99,15 @@ class Worker:
     def report(self, task_id: str, status: str, **progress: Any) -> None:
         self.api(f"/api/tasks/{task_id}/progress", self.payload(status=status, progress=progress))
 
-    def busy_heartbeat(self, stop: threading.Event, capabilities: dict[str, Any]) -> None:
+    def busy_heartbeat(self, stop: threading.Event, capabilities: dict[str, Any],
+                       cancel_requested: threading.Event) -> None:
         """Keep long downloads/encodes leased to this Worker."""
         while not stop.wait(15):
             try:
-                self.api(f"/api/workers/{self.worker_id}/heartbeat",
-                         self.payload(status="busy", capabilities=capabilities))
+                response = self.api(f"/api/workers/{self.worker_id}/heartbeat",
+                                    self.payload(status="busy", capabilities=capabilities))
+                if response.get("cancel_requested"):
+                    cancel_requested.set()
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 print(f"Worker heartbeat failed: {exc}", file=sys.stderr, flush=True)
 
@@ -172,8 +176,9 @@ class Worker:
         output_dir = directory / "output"
         output_dir.mkdir(exist_ok=True)
         heartbeat_stop = threading.Event()
+        cancel_requested = threading.Event()
         heartbeat = threading.Thread(target=self.busy_heartbeat,
-                                     args=(heartbeat_stop, self.capabilities()), daemon=True)
+                                     args=(heartbeat_stop, self.capabilities(), cancel_requested), daemon=True)
         heartbeat.start()
         phase = "initializing"
         try:
@@ -189,7 +194,23 @@ class Worker:
             )
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                                       text=True, bufsize=1, start_new_session=True,
+                                       env={**os.environ, "PYTHONUNBUFFERED": "1"})
+
+            cancel_monitor_stop = threading.Event()
+
+            def stop_cancelled_process() -> None:
+                while not cancel_monitor_stop.wait(0.5):
+                    if cancel_requested.is_set() and process.poll() is None:
+                        print(f"[{task_id}] cancellation requested; stopping algorithm", flush=True)
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        return
+
+            cancel_monitor = threading.Thread(target=stop_cancelled_process, daemon=True)
+            cancel_monitor.start()
             tail: list[str] = []
             assert process.stdout is not None
             for line in process.stdout:
@@ -197,7 +218,12 @@ class Worker:
                 if line:
                     print(f"[{task_id}] {line}", flush=True)
                     tail = (tail + [line])[-20:]
-            if process.wait() != 0:
+            exit_code = process.wait()
+            cancel_monitor_stop.set()
+            cancel_monitor.join(timeout=1)
+            if cancel_requested.is_set():
+                raise RuntimeError("cancelled by administrator")
+            if exit_code != 0:
                 raise RuntimeError("algorithm failed: " + " | ".join(tail)[-1500:])
             candidates = sorted(output_dir.glob("masked_*.mp4"))
             if not candidates:
@@ -219,8 +245,16 @@ class Worker:
                 output_location = str(completed_output)
             self.api(f"/api/tasks/{task_id}/complete", self.payload(
                 output_sha256=sha256(completed_output), output_duration_seconds=duration(completed_output),
-                progress={"output_bytes": completed_output.stat().st_size, "elapsed_seconds": elapsed,
-                          "output_location": output_location},
+                progress={
+                    "input_filename": source.name,
+                    "input_bytes": source.stat().st_size,
+                    "output_filename": completed_output.name,
+                    "output_bytes": completed_output.stat().st_size,
+                    "processing_seconds": elapsed,
+                    # Retain the existing field for older Controller databases/API consumers.
+                    "elapsed_seconds": elapsed,
+                    "output_location": output_location,
+                },
             ))
         except Exception as exc:
             message = f"{phase}: {exc}"

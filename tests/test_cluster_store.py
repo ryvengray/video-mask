@@ -52,6 +52,27 @@ def test_task_without_upload_url_is_valid_for_worker_local_output(tmp_path: Path
     store.close()
 
 
+def test_task_list_pagination_returns_total_without_overlapping_pages(tmp_path: Path):
+    store = new_store(tmp_path)
+    task_ids = []
+    for index in range(3):
+        payload = task_payload()
+        payload["source_url"] = f"https://storage.example/input-{index}.mov"
+        task_ids.append(store.create_task(payload)["task_id"])
+
+    first_page = store.list_tasks(limit=2, offset=0)
+    second_page = store.list_tasks(limit=2, offset=2)
+
+    assert store.count_tasks() == 3
+    assert len(first_page) == 2
+    assert len(second_page) == 1
+    assert {task["task_id"] for task in first_page}.isdisjoint(
+        {task["task_id"] for task in second_page}
+    )
+    assert {task["task_id"] for task in first_page + second_page} == set(task_ids)
+    store.close()
+
+
 def test_stale_worker_requeues_task(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)
@@ -107,6 +128,41 @@ def test_failed_task_can_be_retried_by_an_admin_action(tmp_path: Path):
     assert retried["status"] == "pending"
     assert retried["attempt_count"] == 0
     assert retried["error_message"] is None
+    store.close()
+
+
+def test_pending_task_can_be_cancelled_and_restarted(tmp_path: Path):
+    store = new_store(tmp_path)
+    created = store.create_task(task_payload())
+
+    cancelled = store.cancel_task(created["task_id"])
+    assert cancelled["status"] == "cancelled"
+    assert "cancelled by administrator" in cancelled["error_message"]
+
+    restarted = store.restart_task(created["task_id"])
+    assert restarted["status"] == "pending"
+    assert restarted["attempt_count"] == 0
+    assert restarted["error_message"] is None
+    store.close()
+
+
+def test_active_task_cancellation_completes_as_cancelled(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    requested = store.cancel_task(created["task_id"])
+    assert requested["status"] == "cancelling"
+
+    finished = store.finish("worker-01", TOKEN, created["task_id"], False, {
+        "error_message": "cancelled by administrator",
+        "progress": {"processing_seconds": 4.2},
+    })
+    assert finished["status"] == "cancelled"
+    assert finished["progress"]["processing_seconds"] == 4.2
+    assert store.worker("worker-01")["status"] == "ready"
     store.close()
 
 

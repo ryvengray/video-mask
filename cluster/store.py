@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any
 
 
-TERMINAL = {"completed", "failed"}
-ACTIVE = {"assigned", "downloading", "processing", "uploading"}
+TERMINAL = {"completed", "failed", "cancelled"}
+ACTIVE = {"assigned", "downloading", "processing", "uploading", "cancelling"}
 
 
 def now() -> float:
@@ -210,12 +210,74 @@ class ClusterStore:
         return self.task(task_id) or {}
 
     @synchronized
+    def restart_task(self, task_id: str) -> dict[str, Any]:
+        """Queue a terminal task again, including a completed task on request."""
+        current = self.task(task_id)
+        if current is None:
+            raise ValueError("task does not exist")
+        if current["status"] not in TERMINAL:
+            raise ValueError("only completed, failed, or cancelled tasks can be restarted")
+        stamp = now()
+        self.conn.execute("""
+            UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
+              progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
+              error_message=NULL, started_at=NULL, finished_at=NULL, updated_at=?
+            WHERE task_id=?
+        """, (stamp, task_id))
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def cancel_task(self, task_id: str) -> dict[str, Any]:
+        """Cancel a queued task immediately or request cancellation of an active task."""
+        current = self.task(task_id)
+        if current is None:
+            raise ValueError("task does not exist")
+        status = str(current["status"])
+        stamp = now()
+        if status == "pending":
+            self.conn.execute("""
+                UPDATE tasks SET status='cancelled', error_message='cancelled by administrator',
+                  finished_at=?, updated_at=? WHERE task_id=?
+            """, (stamp, stamp, task_id))
+        elif status in ACTIVE - {"cancelling"}:
+            self.conn.execute("""
+                UPDATE tasks SET status='cancelling', error_message='cancellation requested by administrator',
+                  updated_at=? WHERE task_id=?
+            """, (stamp, task_id))
+        elif status == "cancelling":
+            return current
+        else:
+            raise ValueError("task is already terminal")
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
     def task(self, task_id: str) -> dict[str, Any] | None:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
     @synchronized
-    def list_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    def count_tasks(self, statuses: tuple[str, ...] | None = None) -> int:
+        if not statuses:
+            return int(self.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        placeholders = ", ".join("?" for _ in statuses)
+        return int(self.conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE status IN ({placeholders})", statuses
+        ).fetchone()[0])
+
+    @synchronized
+    def list_tasks(self, limit: int = 100, offset: int = 0,
+                   statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        where = ""
+        values: list[Any] = []
+        if statuses:
+            where = " WHERE status IN (" + ", ".join("?" for _ in statuses) + ")"
+            values.extend(statuses)
+        values.extend((limit, max(0, offset)))
+        rows = self.conn.execute(
+            "SELECT * FROM tasks" + where + " ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?",
+            values,
+        ).fetchall()
         return [self._row(row) or {} for row in rows]
 
     @synchronized
@@ -280,11 +342,14 @@ class ClusterStore:
         current = self.task(task_id)
         if current is None or current["assigned_worker_id"] != worker_id or current["status"] not in ACTIVE:
             raise ValueError("task is not assigned to this worker")
-        status = "completed" if success else ("pending" if current["attempt_count"] < current["max_attempts"] else "failed")
+        if current["status"] == "cancelling":
+            status = "cancelled"
+        else:
+            status = "completed" if success else ("pending" if current["attempt_count"] < current["max_attempts"] else "failed")
         cursor = self.conn.execute("""
             UPDATE tasks SET status=?, output_sha256=?, output_duration_seconds=?, error_message=?,
               progress_json=?, finished_at=?, updated_at=?
-            WHERE task_id=? AND assigned_worker_id=? AND status IN ('assigned','downloading','processing','uploading')
+            WHERE task_id=? AND assigned_worker_id=? AND status IN ('assigned','downloading','processing','uploading','cancelling')
         """, (status, payload.get("output_sha256"), payload.get("output_duration_seconds"),
               payload.get("error_message"), json.dumps(payload.get("progress") or {}), stamp, stamp,
               task_id, worker_id))
@@ -300,9 +365,12 @@ class ClusterStore:
         stamp = now()
         for row in rows:
             self.conn.execute("""
-                UPDATE tasks SET status=CASE WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
-                  assigned_worker_id=NULL, error_message='worker heartbeat timeout', updated_at=?
-                WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading')
+                UPDATE tasks SET status=CASE WHEN status='cancelling' THEN 'cancelled'
+                  WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
+                  assigned_worker_id=NULL, error_message=CASE WHEN status='cancelling'
+                    THEN 'cancelled by administrator (worker heartbeat timed out)'
+                    ELSE 'worker heartbeat timeout' END, updated_at=?
+                WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading','cancelling')
             """, (stamp, row[1]))
             self.conn.execute("UPDATE workers SET status='offline', current_task_id=NULL, updated_at=? WHERE worker_id=?", (stamp, row[0]))
         # Idle Workers also need to become offline when their process or host
