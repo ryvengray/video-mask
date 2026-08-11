@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -139,28 +140,46 @@ def confirm(prompt: str) -> bool:
     return input(f"{prompt} [y/N]: ").strip().lower() in {"y", "yes"}
 
 
-def restart_slot(client: ControllerClient, inventory: Path, host: str, slot: int,
-                 ask_vault_pass: bool) -> None:
-    if slot < 1:
-        raise RuntimeError("slot must be a positive integer")
+def parse_slots(specification: str) -> tuple[int, ...]:
+    slots: set[int] = set()
+    for part in specification.split(","):
+        match = re.fullmatch(r"\s*(\d+)(?:\s*-\s*(\d+))?\s*", part)
+        if not match:
+            raise RuntimeError("slots must use forms such as 1, 1-15, or 1,3-5")
+        first, last = int(match.group(1)), int(match.group(2) or match.group(1))
+        if first < 1 or last < first or last > 16:
+            raise RuntimeError("slot numbers must be between 1 and 16")
+        slots.update(range(first, last + 1))
+    return tuple(sorted(slots))
+
+
+def restart_slots(client: ControllerClient, inventory: Path, host: str, slots: tuple[int, ...],
+                  ask_vault_pass: bool) -> None:
+    if not slots:
+        raise RuntimeError("at least one slot is required")
     if not inventory.is_file():
         raise RuntimeError(f"Ansible inventory not found: {inventory}")
-    worker_id = f"{host}-slot-{slot}"
-    worker = client.worker(worker_id)
-    if worker and worker.get("current_task_id"):
-        print(f"Warning: {worker_id} is {worker.get('status')} with task {worker['current_task_id']}.")
-        if not confirm("Restarting will interrupt that task. Continue?"):
-            return
-    elif not confirm(f"Restart {worker_id}?"):
+    worker_ids = [f"{host}-slot-{slot}" for slot in slots]
+    busy = [(worker_id, client.worker(worker_id)) for worker_id in worker_ids]
+    active = [(worker_id, worker) for worker_id, worker in busy if worker and worker.get("current_task_id")]
+    if active:
+        print("Warning: these slots have active tasks and will be interrupted:")
+        for worker_id, worker in active:
+            print(f"  {worker_id}: {worker['current_task_id']}")
+        prompt = f"Restart {len(slots)} slot(s) anyway?"
+    else:
+        prompt = f"Restart {len(slots)} slot(s): {', '.join(worker_ids)}?"
+    if not confirm(prompt):
         return
+    units = " ".join(f"video-mask-worker@slot-{slot}.service" for slot in slots)
     command = [
         "ansible", "-i", str(inventory), host, "-b",
-        "-m", "ansible.builtin.systemd",
-        "-a", f"name=video-mask-worker@slot-{slot}.service state=restarted",
+        "-m", "ansible.builtin.command",
+        "-a", f"systemctl restart {units}",
     ]
     if ask_vault_pass:
         command.append("--ask-vault-pass")
-    print("Restarting", worker_id, "through Ansible...")
+    print("Restarting", ", ".join(worker_ids), "through Ansible...")
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"Ansible restart failed with exit code {result.returncode}")
@@ -201,12 +220,8 @@ Video Mask Cluster Manager
                     print("Updated:", client.restart(task_id)["status"])
             elif choice == "6":
                 host = input("Ansible host (for example worker-01): ").strip()
-                try:
-                    slot = int(input("Slot number: ").strip())
-                except ValueError:
-                    print("Slot number must be a positive integer.")
-                    continue
-                restart_slot(client, inventory, host, slot, ask_vault_pass)
+                slot_specification = input("Slot number/range (for example 1 or 1-15): ").strip()
+                restart_slots(client, inventory, host, parse_slots(slot_specification), ask_vault_pass)
             elif choice == "7":
                 return
             else:
@@ -225,7 +240,7 @@ def main() -> None:
     parser.add_argument("--token-file", type=Path, default=Path("/etc/video-mask-controller.env"))
     parser.add_argument("--inventory", type=Path,
                         default=Path(__file__).resolve().parents[1] / "ansible" / "inventory.yml")
-    parser.add_argument("--slot", type=int, help="Slot number for restart-slot")
+    parser.add_argument("--slot", help="Slot number/range for restart-slot, for example 1 or 1-15")
     parser.add_argument("--no-ask-vault-pass", action="store_true",
                         help="Do not pass --ask-vault-pass to Ansible")
     args = parser.parse_args()
@@ -238,7 +253,7 @@ def main() -> None:
         elif args.action == "restart-slot":
             if not args.task_id or args.slot is None:
                 raise SystemExit("restart-slot requires an Ansible host and --slot N")
-            restart_slot(client, args.inventory, args.task_id, args.slot, not args.no_ask_vault_pass)
+            restart_slots(client, args.inventory, args.task_id, parse_slots(args.slot), not args.no_ask_vault_pass)
         else:
             if not args.task_id:
                 raise SystemExit(f"{args.action} requires TASK_ID")

@@ -155,6 +155,8 @@ def test_active_task_cancellation_completes_as_cancelled(tmp_path: Path):
 
     requested = store.cancel_task(created["task_id"])
     assert requested["status"] == "cancelling"
+    assert store.worker("worker-01")["status"] == "cancelling"
+    assert store.heartbeat("worker-01", TOKEN, "busy")["status"] == "cancelling"
 
     finished = store.finish("worker-01", TOKEN, created["task_id"], False, {
         "error_message": "cancelled by administrator",

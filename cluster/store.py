@@ -151,7 +151,7 @@ class ClusterStore:
     def list_workers(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute("""
             SELECT * FROM workers
-            ORDER BY CASE status WHEN 'busy' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
+            ORDER BY CASE status WHEN 'busy' THEN 0 WHEN 'cancelling' THEN 1 WHEN 'ready' THEN 2 ELSE 3 END,
                      last_seen_at DESC
             LIMIT ?
         """, (limit,)).fetchall()
@@ -162,6 +162,13 @@ class ClusterStore:
                   capabilities: dict[str, Any] | None = None) -> dict[str, Any]:
         self.authenticate_worker(worker_id, token)
         stamp = now()
+        current_task = self.conn.execute(
+            "SELECT current_task_id FROM workers WHERE worker_id=?", (worker_id,)
+        ).fetchone()
+        if current_task and current_task[0]:
+            task = self.conn.execute("SELECT status FROM tasks WHERE task_id=?", (current_task[0],)).fetchone()
+            if task and task[0] == "cancelling":
+                status = "cancelling"
         values: list[Any] = [status, stamp, stamp, worker_id]
         update = "status=?, last_seen_at=?, updated_at=?"
         if capabilities is not None:
@@ -255,6 +262,10 @@ class ClusterStore:
             self.conn.execute("""
                 UPDATE tasks SET status='cancelling', error_message='cancellation requested by administrator',
                   updated_at=? WHERE task_id=?
+            """, (stamp, task_id))
+            self.conn.execute("""
+                UPDATE workers SET status='cancelling', updated_at=?
+                WHERE current_task_id=?
             """, (stamp, task_id))
         elif status == "cancelling":
             return current

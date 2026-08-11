@@ -279,6 +279,10 @@ sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py
 sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
   restart-slot worker-01 --slot 1
 
+# 可一次重启 slot 1 到 15；任何运行中任务都会被中断。
+sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
+  restart-slot worker-01 --slot 1-15
+
 # 部署更新后的 Worker 代码；先在 settings.yml 更新 video_mask_ref。
 ansible-playbook -i ansible/inventory.yml ansible/site.yml \
   --limit worker-01 --ask-vault-pass
