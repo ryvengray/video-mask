@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--no-card", "--face-size", "960",
+DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
                 "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8"]
-DEFAULT_ALGORITHM = "video_mask_batch_fish.py"
+DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:

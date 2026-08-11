@@ -9,11 +9,11 @@ SCHEDULER="$ROOT_DIR/scripts/batch_scheduler.py"
 TASK_HOME="$ROOT_DIR/.task_manager"
 TASKS_DIR="$TASK_HOME/tasks"
 RUNNERS_DIR="$TASK_HOME/runners"
-DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_fish.py"
-DEFAULT_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8)
-DEFAULT_EXTRA_LINE="--fisheye --fisheye-device pico4 --no-card --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8"
-FISH_V1_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8)
-FISH_V1_EXTRA_LINE="--fisheye --fisheye-device pico4 --face-size 960 --face-int 5 --frame-skip 3 --face-model yolov8"
+DEFAULT_ALGORITHM="$ROOT_DIR/video_mask_batch_fish_v1.py"
+DEFAULT_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --face-size 640 --face-int 5 --frame-skip 3 --face-model yolov8)
+DEFAULT_EXTRA_LINE="--fisheye --fisheye-device pico4 --face-size 640 --face-int 5 --frame-skip 3 --face-model yolov8"
+FISH_V1_EXTRA_ARGS=(--fisheye --fisheye-device pico4 --face-size 640 --face-int 5 --frame-skip 3 --face-model yolov8)
+FISH_V1_EXTRA_LINE="--fisheye --fisheye-device pico4 --face-size 640 --face-int 5 --frame-skip 3 --face-model yolov8"
 
 mkdir -p "$TASKS_DIR" "$RUNNERS_DIR"
 LAST_INTERRUPT_AT=0
