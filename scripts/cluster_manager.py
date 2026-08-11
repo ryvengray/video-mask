@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -45,7 +46,12 @@ class ControllerClient:
         query: dict[str, str | int] = {"limit": limit, "offset": offset}
         if statuses:
             query["status"] = ",".join(statuses)
-        return self.request("GET", "/api/tasks?" + urllib.parse.urlencode(query))
+        response = self.request("GET", "/api/tasks?" + urllib.parse.urlencode(query))
+        if not {"tasks", "total", "limit", "offset"}.issubset(response):
+            raise RuntimeError(
+                "Controller API is outdated. Deploy the current Controller code before using cluster_manager.py."
+            )
+        return response
 
     def task(self, task_id: str) -> dict[str, Any]:
         return self.request("GET", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}")
@@ -55,6 +61,10 @@ class ControllerClient:
 
     def restart(self, task_id: str) -> dict[str, Any]:
         return self.request("POST", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/restart")
+
+    def worker(self, worker_id: str) -> dict[str, Any] | None:
+        response = self.request("GET", "/api/workers?limit=1000")
+        return next((worker for worker in response["workers"] if worker["worker_id"] == worker_id), None)
 
 
 def read_token(value: str | None, token_file: Path) -> str:
@@ -129,7 +139,34 @@ def confirm(prompt: str) -> bool:
     return input(f"{prompt} [y/N]: ").strip().lower() in {"y", "yes"}
 
 
-def interactive(client: ControllerClient) -> None:
+def restart_slot(client: ControllerClient, inventory: Path, host: str, slot: int,
+                 ask_vault_pass: bool) -> None:
+    if slot < 1:
+        raise RuntimeError("slot must be a positive integer")
+    if not inventory.is_file():
+        raise RuntimeError(f"Ansible inventory not found: {inventory}")
+    worker_id = f"{host}-slot-{slot}"
+    worker = client.worker(worker_id)
+    if worker and worker.get("current_task_id"):
+        print(f"Warning: {worker_id} is {worker.get('status')} with task {worker['current_task_id']}.")
+        if not confirm("Restarting will interrupt that task. Continue?"):
+            return
+    elif not confirm(f"Restart {worker_id}?"):
+        return
+    command = [
+        "ansible", "-i", str(inventory), host, "-b",
+        "-m", "ansible.builtin.systemd",
+        "-a", f"name=video-mask-worker@slot-{slot}.service state=restarted",
+    ]
+    if ask_vault_pass:
+        command.append("--ask-vault-pass")
+    print("Restarting", worker_id, "through Ansible...")
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"Ansible restart failed with exit code {result.returncode}")
+
+
+def interactive(client: ControllerClient, inventory: Path, ask_vault_pass: bool) -> None:
     while True:
         print("""
 Video Mask Cluster Manager
@@ -138,7 +175,8 @@ Video Mask Cluster Manager
   3) Show task details
   4) Cancel a task
   5) Restart a completed, failed, or cancelled task
-  6) Exit""")
+  6) Restart a Worker slot through Ansible
+  7) Exit""")
         choice = input("Choose: ").strip()
         try:
             if choice == "1":
@@ -162,27 +200,45 @@ Video Mask Cluster Manager
                 elif confirm("Queue this task again?"):
                     print("Updated:", client.restart(task_id)["status"])
             elif choice == "6":
+                host = input("Ansible host (for example worker-01): ").strip()
+                try:
+                    slot = int(input("Slot number: ").strip())
+                except ValueError:
+                    print("Slot number must be a positive integer.")
+                    continue
+                restart_slot(client, inventory, host, slot, ask_vault_pass)
+            elif choice == "7":
                 return
             else:
-                print("Choose 1-6.")
+                print("Choose 1-7.")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage Video Mask Controller tasks")
-    parser.add_argument("action", nargs="?", default="menu", choices=("menu", "list", "all", "detail", "cancel", "restart"))
+    parser.add_argument("action", nargs="?", default="menu",
+                        choices=("menu", "list", "all", "detail", "cancel", "restart", "restart-slot"))
     parser.add_argument("task_id", nargs="?")
     parser.add_argument("--controller", default="http://127.0.0.1:8080")
     parser.add_argument("--token", help="Avoid when possible: --token is visible in shell history")
     parser.add_argument("--token-file", type=Path, default=Path("/etc/video-mask-controller.env"))
+    parser.add_argument("--inventory", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "ansible" / "inventory.yml")
+    parser.add_argument("--slot", type=int, help="Slot number for restart-slot")
+    parser.add_argument("--no-ask-vault-pass", action="store_true",
+                        help="Do not pass --ask-vault-pass to Ansible")
     args = parser.parse_args()
     client = ControllerClient(args.controller, read_token(args.token, args.token_file))
     try:
         if args.action == "menu":
-            interactive(client)
+            interactive(client, args.inventory, not args.no_ask_vault_pass)
         elif args.action in {"list", "all"}:
             browse_tasks(client, UNFINISHED if args.action == "list" else None)
+        elif args.action == "restart-slot":
+            if not args.task_id or args.slot is None:
+                raise SystemExit("restart-slot requires an Ansible host and --slot N")
+            restart_slot(client, args.inventory, args.task_id, args.slot, not args.no_ask_vault_pass)
         else:
             if not args.task_id:
                 raise SystemExit(f"{args.action} requires TASK_ID")

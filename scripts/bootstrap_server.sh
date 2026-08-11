@@ -122,13 +122,13 @@ if [[ ! -x .venv/bin/python ]]; then
   python3 -m venv .venv
 fi
 PYTHON="$APP_DIR/.venv/bin/python"
-"$PYTHON" -m pip install --upgrade pip setuptools wheel
+"$PYTHON" -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 echo "==> 安装 PyTorch（${MODE}）"
-"$PYTHON" -m pip install --upgrade torch torchvision --index-url "$TORCH_INDEX_URL"
+"$PYTHON" -m pip install --no-cache-dir --upgrade torch torchvision --index-url "$TORCH_INDEX_URL"
 
 echo "==> 安装项目依赖"
-"$PYTHON" -m pip install -e '.[cards]'
+"$PYTHON" -m pip install --no-cache-dir -e '.[cards]'
 
 if [[ "$MODE" == "cuda" ]]; then
   echo "==> 安装 YuNet ONNX Runtime CUDA 依赖"

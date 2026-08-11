@@ -188,7 +188,8 @@ class Worker:
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
             phase = "processing"
-            self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size)
+            self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size,
+                        processing_started_at=time.time())
             command = self.algorithm_command(
                 source, output_dir, task.get("arguments") or self.extra_args
             )

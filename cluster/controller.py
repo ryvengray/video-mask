@@ -8,6 +8,7 @@ import html
 import hmac
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -276,7 +277,15 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             end_to_end = None
             if isinstance(started, (int, float)) and isinstance(finished, (int, float)):
                 end_to_end = finished - started
-            parts = [f"Process: {seconds(processing)}"]
+            if isinstance(processing, (int, float)):
+                process_label = f"Process: {seconds(processing)}"
+            elif task.get("status") in {"processing", "uploading", "cancelling"}:
+                processing_started = progress.get("processing_started_at", started)
+                running_for = time.time() - processing_started if isinstance(processing_started, (int, float)) else None
+                process_label = f"Process: running {seconds(max(0, running_for))}"
+            else:
+                process_label = "Process: -"
+            parts = [process_label]
             if end_to_end is not None:
                 parts.append(f"Total: {seconds(end_to_end)}")
             return "<br>".join(parts)

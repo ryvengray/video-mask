@@ -275,6 +275,10 @@ sudo journalctl -u video-mask-worker@slot-1 -f
 # 以 sudo 运行会从 /etc/video-mask-controller.env 读取 Admin Token。
 sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py
 
+# 或重启指定远程 Worker slot（会提示确认，并要求 Vault 密码）。
+sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
+  restart-slot worker-01 --slot 1
+
 # 部署更新后的 Worker 代码；先在 settings.yml 更新 video_mask_ref。
 ansible-playbook -i ansible/inventory.yml ansible/site.yml \
   --limit worker-01 --ask-vault-pass

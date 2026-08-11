@@ -99,15 +99,26 @@ class ClusterStore:
 
     @synchronized
     def provision_worker(self, worker_id: str, token: str) -> dict[str, Any]:
-        """Create or rotate a Worker credential; called only by an admin API."""
+        """Create or rotate a Worker credential; called only by an admin API.
+
+        Ansible calls this on every deployment.  Re-provisioning with the same
+        token must preserve an active lease, otherwise a routine deployment
+        briefly makes every slot look offline and hides its current task.
+        """
         stamp = now()
+        digest = token_hash(token)
+        existing = self.conn.execute(
+            "SELECT token_hash FROM workers WHERE worker_id=?", (worker_id,)
+        ).fetchone()
+        if existing is not None and existing[0] == digest:
+            return self.worker(worker_id) or {}
         self.conn.execute("""
             INSERT INTO workers(worker_id, token_hash, status, last_seen_at, created_at, updated_at)
             VALUES(?, ?, 'offline', ?, ?, ?)
             ON CONFLICT(worker_id) DO UPDATE SET
               token_hash=excluded.token_hash, status='offline', current_task_id=NULL,
               updated_at=excluded.updated_at
-        """, (worker_id, token_hash(token), stamp, stamp, stamp))
+        """, (worker_id, digest, stamp, stamp, stamp))
         self.conn.commit()
         return self.worker(worker_id) or {}
 

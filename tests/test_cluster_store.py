@@ -166,6 +166,21 @@ def test_active_task_cancellation_completes_as_cancelled(tmp_path: Path):
     store.close()
 
 
+def test_provisioning_with_the_same_token_preserves_an_active_worker(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    provisioned = store.provision_worker("worker-01", TOKEN)
+
+    assert provisioned["status"] == "busy"
+    assert provisioned["current_task_id"] == created["task_id"]
+    assert store.task(created["task_id"])["status"] == "assigned"
+    store.close()
+
+
 def test_local_ingestor_creates_one_file_task(tmp_path: Path):
     store = new_store(tmp_path)
     source_dir = tmp_path / "sources"
