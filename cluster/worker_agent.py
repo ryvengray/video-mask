@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -18,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--no-card", "--face-size", "960",
+DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
                 "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8"]
-DEFAULT_ALGORITHM = "video_mask_batch_fish.py"
+DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -66,9 +67,22 @@ class Worker:
     def payload(self, **extra: Any) -> dict[str, Any]:
         return {"worker_id": self.worker_id, "token": self.token, **extra}
 
-    @staticmethod
-    def capabilities() -> dict[str, Any]:
-        info: dict[str, Any] = {"algorithm": DEFAULT_ALGORITHM, "pid": os.getpid()}
+    def capabilities(self) -> dict[str, Any]:
+        """Describe this process so the Controller dashboard can identify it."""
+        hostname = socket.gethostname()
+        info: dict[str, Any] = {
+            "algorithm": DEFAULT_ALGORITHM,
+            "pid": os.getpid(),
+            "hostname": hostname,
+        }
+        prefix, marker, slot = self.worker_id.rpartition("-slot-")
+        if marker and prefix and slot.isdigit():
+            info["slot"] = int(slot)
+        try:
+            addresses = socket.gethostbyname_ex(hostname)[2]
+            info["ip_addresses"] = sorted({address for address in addresses if not address.startswith("127.")})
+        except OSError:
+            pass
         try:
             import torch
             info.update({"cuda_available": torch.cuda.is_available(), "torch": torch.__version__})
@@ -161,11 +175,14 @@ class Worker:
         heartbeat = threading.Thread(target=self.busy_heartbeat,
                                      args=(heartbeat_stop, self.capabilities()), daemon=True)
         heartbeat.start()
+        phase = "initializing"
         try:
+            phase = "downloading"
             self.report(task_id, "downloading", phase="downloading")
             self.download(task["source_url"], source)
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
+            phase = "processing"
             self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size)
             command = self.algorithm_command(
                 source, output_dir, task.get("arguments") or self.extra_args
@@ -189,11 +206,14 @@ class Worker:
             elapsed = round(time.monotonic() - started, 1)
             output_url = task.get("output_upload_url")
             if output_url:
+                phase = "uploading"
                 self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
                 self.upload(output_url, output)
                 completed_output = output
-                output_location = output_url
+                # Do not save a sensitive presigned URL in the Controller database.
+                output_location = task.get("output_object_key") or "uploaded"
             else:
+                phase = "saving_local_output"
                 self.report(task_id, "uploading", phase="saving_local_output", elapsed_seconds=elapsed)
                 completed_output = self.persist_output(output, task_id)
                 output_location = str(completed_output)
@@ -203,9 +223,10 @@ class Worker:
                           "output_location": output_location},
             ))
         except Exception as exc:
-            print(f"[{task_id}] ERROR: {exc}", file=sys.stderr, flush=True)
+            message = f"{phase}: {exc}"
+            print(f"[{task_id}] ERROR: {message}", file=sys.stderr, flush=True)
             try:
-                self.api(f"/api/tasks/{task_id}/fail", self.payload(error_message=str(exc)[:3000]))
+                self.api(f"/api/tasks/{task_id}/fail", self.payload(error_message=message[:3000]))
             except Exception as report_error:
                 print(f"[{task_id}] failed to report error: {report_error}", file=sys.stderr, flush=True)
         finally:

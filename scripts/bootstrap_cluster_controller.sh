@@ -176,10 +176,11 @@ video_mask_local_output_dir: $OUTPUT_DIR
 video_mask_s3_source_bucket: ''
 video_mask_s3_source_prefix: source/inbox/
 video_mask_s3_source_region: ''
-video_mask_s3_assume_role_arn: ''
 video_mask_s3_output_bucket: ''
 video_mask_s3_output_prefix: outputs/
-video_mask_s3_output_region: ''
+video_mask_s3_profile: s3-test
+video_mask_s3_poll_seconds: 60
+video_mask_s3_presign_seconds: 86400
 EOF
   # Keep the generated secrets private, but do not leak this restrictive umask
   # into Ansible: its virtualenv is executed later by the ubuntu service user.

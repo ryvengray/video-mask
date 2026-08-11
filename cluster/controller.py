@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
@@ -21,6 +21,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 
 from cluster.store import ClusterStore
 from cluster.local_ingest import LocalIngestor
+from cluster.s3_ingest import S3Ingestor
 
 
 class WorkerRequest(BaseModel):
@@ -52,9 +53,9 @@ class TaskRequest(BaseModel):
     source_size_bytes: int | None = None
     source_sha256: str | None = None
     source_duration_seconds: float | None = None
-    algorithm: str = "video_mask_batch_fish.py"
+    algorithm: str = "video_mask_batch_fish_v1.py"
     arguments: list[str] = Field(default_factory=lambda: [
-        "--fisheye", "--fisheye-device", "pico4", "--no-card", "--face-size", "960",
+        "--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
         "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8",
     ])
     output_object_key: str | None = None
@@ -67,8 +68,14 @@ class WorkerProvisionRequest(BaseModel):
 
 
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
-               local_source_dir: Path | None = None, local_output_dir: Path | None = None) -> FastAPI:
+               local_source_dir: Path | None = None, local_output_dir: Path | None = None,
+               s3_ingestor: S3Ingestor | None = None,
+               s3_config: dict[str, Any] | None = None) -> FastAPI:
     store = ClusterStore(database)
+    if s3_ingestor and s3_config:
+        raise ValueError("s3_ingestor and s3_config are mutually exclusive")
+    if s3_config:
+        s3_ingestor = S3Ingestor(store, **s3_config)
     local_ingestor = (LocalIngestor(store, local_source_dir, local_output_dir)
                       if local_source_dir and local_output_dir else None)
 
@@ -89,6 +96,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if not authorization or not hmac.compare_digest(authorization, expected):
             raise HTTPException(status_code=401, detail="invalid admin token")
 
+    def worker_capabilities(capabilities: dict[str, Any], http_request: Request) -> dict[str, Any]:
+        """Record the private address seen by the Controller, not a user-supplied address."""
+        result = dict(capabilities)
+        if http_request.client and http_request.client.host:
+            result["controller_seen_ip"] = http_request.client.host
+        return result
+
     @app.exception_handler(PermissionError)
     async def permission_error(_, exc: PermissionError):
         return JSONResponse(status_code=401, content={"detail": str(exc)})
@@ -101,17 +115,21 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def healthz() -> dict[str, str]:
         requeued = store.requeue_stale(stale_after_seconds)
         ingested = local_ingestor.scan() if local_ingestor else 0
-        return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested)}
+        s3_ingested = s3_ingestor.scan_if_due() if s3_ingestor else 0
+        return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested),
+                "s3_ingested": str(s3_ingested)}
 
     @app.post("/api/workers/register")
-    def register_worker(request: WorkerRequest):
-        return store.register_worker(request.worker_id, request.token, request.capabilities)
+    def register_worker(request: WorkerRequest, http_request: Request):
+        return store.register_worker(request.worker_id, request.token,
+                                     worker_capabilities(request.capabilities, http_request))
 
     @app.post("/api/workers/{worker_id}/heartbeat")
-    def heartbeat(worker_id: str, request: HeartbeatRequest):
+    def heartbeat(worker_id: str, request: HeartbeatRequest, http_request: Request):
         if request.worker_id != worker_id:
             raise ValueError("worker id does not match path")
-        return store.heartbeat(worker_id, request.token, request.status, request.capabilities)
+        return store.heartbeat(worker_id, request.token, request.status,
+                               worker_capabilities(request.capabilities, http_request))
 
     @app.post("/api/workers/{worker_id}/claim")
     def claim(worker_id: str, request: WorkerRequest):
@@ -120,7 +138,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         store.requeue_stale(stale_after_seconds)
         if local_ingestor:
             local_ingestor.scan()
-        return {"task": store.claim(worker_id, request.token)}
+        if s3_ingestor:
+            s3_ingestor.scan_if_due()
+        task = store.claim(worker_id, request.token)
+        return {"task": s3_ingestor.materialize(task) if task and s3_ingestor else task}
 
     @app.post("/api/tasks/{task_id}/progress")
     def progress(task_id: str, request: ProgressRequest):
@@ -142,6 +163,14 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except (ValueError, sqlite3.IntegrityError) as exc:  # type: ignore[name-defined]
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/{task_id}/retry")
+    def retry_task(task_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return store.retry_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/admin/workers")
     def provision_worker(request: WorkerProvisionRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -155,10 +184,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     @app.get("/api/workers")
     def list_workers(limit: int = 100, authorization: str | None = Header(default=None)):
         require_admin(authorization)
+        store.requeue_stale(stale_after_seconds)
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard():
+        store.requeue_stale(stale_after_seconds)
         rows = store.list_tasks(100)
         task_items = "".join(
             f"<tr><td>{html.escape(str(task['task_id']))}</td><td>{html.escape(str(task['status']))}</td>"
@@ -174,17 +205,35 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 return "-"
             return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+        def slot_for(worker: dict[str, Any]) -> str:
+            capabilities = worker.get("capabilities") or {}
+            if capabilities.get("slot") is not None:
+                return str(capabilities["slot"])
+            _, marker, slot = str(worker["worker_id"]).rpartition("-slot-")
+            return slot if marker and slot.isdigit() else "-"
+
+        def host_for(worker: dict[str, Any]) -> str:
+            capabilities = worker.get("capabilities") or {}
+            hostname = str(capabilities.get("hostname") or "-")
+            address = capabilities.get("controller_seen_ip")
+            if not address:
+                addresses = capabilities.get("ip_addresses") or []
+                address = ", ".join(str(value) for value in addresses) or "-"
+            return f"{html.escape(hostname)}<br><small>{html.escape(str(address))}</small>"
+
         worker_items = "".join(
             f"<tr><td>{html.escape(str(worker['worker_id']))}</td><td>{html.escape(str(worker['status']))}</td>"
+            f"<td>{host_for(worker)}</td><td>{html.escape(slot_for(worker))}</td>"
             f"<td>{html.escape(str((worker.get('capabilities') or {}).get('gpu', '-')))}</td>"
             f"<td>{html.escape(str((worker.get('capabilities') or {}).get('cuda_available', '-')))}</td>"
+            f"<td>{html.escape(str((worker.get('capabilities') or {}).get('pid', '-')))}</td>"
             f"<td>{html.escape(str(worker.get('current_task_id') or '-'))}</td>"
             f"<td>{last_seen(worker.get('last_seen_at'))}</td></tr>"
             for worker in workers
-        ) or "<tr><td colspan='6'>No workers registered</td></tr>"
+        ) or "<tr><td colspan='9'>No workers registered</td></tr>"
         return """<!doctype html><title>Video Mask Cluster</title>
         <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%;margin:0 0 2rem}td,th{border:1px solid #ddd;padding:.5rem;text-align:left}h2{margin-top:2rem}</style>
-        <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>GPU</th><th>CUDA</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
+        <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>Slot</th><th>GPU</th><th>CUDA</th><th>PID</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
             "<h2>Tasks</h2><table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Source</th><th>Attempts</th></tr>" + task_items + "</table>"
 
     return app
@@ -201,14 +250,40 @@ def main() -> None:
                         help="Testing only: scan local videos and issue file:// tasks")
     parser.add_argument("--local-output-dir", type=Path,
                         help="Testing only: write completed files to this directory")
+    parser.add_argument("--s3-source-bucket")
+    parser.add_argument("--s3-source-prefix", default="")
+    parser.add_argument("--s3-output-bucket")
+    parser.add_argument("--s3-output-prefix", default="outputs/")
+    parser.add_argument("--s3-region")
+    parser.add_argument("--s3-profile")
+    parser.add_argument("--s3-poll-seconds", type=int, default=60)
+    parser.add_argument("--s3-presign-seconds", type=int, default=86400)
     args = parser.parse_args()
     if not args.admin_token or len(args.admin_token) < 16:
         raise SystemExit("Set --admin-token or VIDEO_MASK_ADMIN_TOKEN (at least 16 characters)")
     if bool(args.local_source_dir) != bool(args.local_output_dir):
         raise SystemExit("--local-source-dir and --local-output-dir must be supplied together")
+    s3_options = (args.s3_source_bucket, args.s3_output_bucket, args.s3_region)
+    if any(s3_options) and not all(s3_options):
+        raise SystemExit("--s3-source-bucket, --s3-output-bucket and --s3-region must be supplied together")
+    if args.s3_poll_seconds < 1 or not 1 <= args.s3_presign_seconds <= 604800:
+        raise SystemExit("--s3-poll-seconds must be positive; --s3-presign-seconds must be 1..604800")
+    s3_config = None
+    if args.s3_source_bucket:
+        s3_config = {
+            "source_bucket": args.s3_source_bucket,
+            "source_prefix": args.s3_source_prefix,
+            "output_bucket": args.s3_output_bucket,
+            "output_prefix": args.s3_output_prefix,
+            "region": args.s3_region,
+            "profile": args.s3_profile,
+            "poll_seconds": args.s3_poll_seconds,
+            "presign_seconds": args.s3_presign_seconds,
+        }
     import uvicorn
     uvicorn.run(create_app(args.database, args.admin_token, args.stale_after,
-                           args.local_source_dir, args.local_output_dir), host=args.host, port=args.port)
+                           args.local_source_dir, args.local_output_dir,
+                           s3_config=s3_config), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

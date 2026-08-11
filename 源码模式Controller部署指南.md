@@ -155,9 +155,40 @@ sudo journalctl -u video-mask-controller -n 100 --no-pager
 
 ## 7. 添加 Worker
 
-### 7.1 一次性配置 Controller 到 Worker 的 SSH Key
+### 7.1 选择 Controller 到 Worker 的 SSH 认证方式
 
-Ansible 需要 Controller 无交互登录每台 Worker。若当前只能输入 `ubuntu` 密码 SSH，使用该密码一次性安装 Controller 的 SSH 公钥；之后不再需要把 Worker 登录密码写入 inventory。
+Ansible 需要 Controller 无交互登录每台 Worker。支持两种方式：统一密码 SSH（部署方便）或 Controller 专用 SSH Key（更推荐）。两种方式只能选一种，不要在 inventory 同时配置 `ansible_password` 与 `ansible_ssh_private_key_file`。
+
+#### 方式 A：所有 Worker 使用同一账号密码
+
+Controller 先安装密码 SSH 所需组件：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y sshpass
+```
+
+Worker 会动态新增时，在 inventory 中使用 `StrictHostKeyChecking=accept-new`。它会自动记录**首次出现**的 Worker 主机指纹；若同一个 IP 的指纹之后发生变化，仍会拒绝连接，避免无条件信任未知主机。
+
+将 Worker 的 SSH 登录密码和 sudo 密码加密保存到 Vault。若二者相同，可以填写相同内容：
+
+```bash
+cd ~/video-mask/ansible
+ansible-vault edit group_vars/all/vault.yml
+```
+
+添加：
+
+```yaml
+vault_video_mask_worker_ssh_password: "所有Worker共用的SSH登录密码"
+vault_video_mask_worker_sudo_password: "所有Worker共用的sudo密码"
+```
+
+密码只能存在 `vault.yml` 中，不能写进 `inventory.yml`、Shell 历史或 Git 仓库。
+
+#### 方式 B：Controller 专用 SSH Key（推荐）
+
+若当前只能输入 `ubuntu` 密码 SSH，使用该密码一次性安装 Controller 的 SSH 公钥；之后不再需要保存 Worker 登录密码。
 
 在 Controller 生成管理 Key（若文件已存在，不要覆盖）：
 
@@ -179,11 +210,36 @@ ssh-copy-id -i ~/.ssh/video-mask-ansible.pub ubuntu@10.200.0.7
 ssh -i ~/.ssh/video-mask-ansible -o IdentitiesOnly=yes ubuntu@10.200.0.7 'hostname && nvidia-smi -L'
 ```
 
-若 Worker 的 sudo 需要密码，部署时使用 Playbook 的 `-K` 输入 sudo 密码；更推荐使用云镜像默认的受控免密 sudo。不要把 SSH 登录密码写进 `inventory.yml`。
+若 Worker 的 sudo 需要密码，部署时使用 Playbook 的 `-K` 输入 sudo 密码；更推荐使用云镜像默认的受控免密 sudo。
 
 ### 7.2 添加 inventory
 
-在 `inventory.yml` 增加 Worker 私网 IP：
+在 `inventory.yml` 增加 Worker 私网 IP，并按上一节选择一种认证配置。
+
+**统一密码 SSH 示例：**
+
+```yaml
+gpu_workers:
+  vars:
+    ansible_user: ubuntu
+    ansible_password: "{{ vault_video_mask_worker_ssh_password }}"
+    ansible_become_password: "{{ vault_video_mask_worker_sudo_password }}"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+  hosts:
+    worker-01:
+      ansible_host: 10.0.2.20
+      video_mask_worker_id: worker-01
+      video_mask_worker_slots: 2
+```
+
+没有配置 `accept-new` 时，需要在 Controller 上先手动连接每台新 Worker 并确认一次主机指纹：
+
+```bash
+ssh ubuntu@Worker私网IP
+# 首次提示时输入 yes，再输入 Worker 密码，登录后 exit
+```
+
+**SSH Key 示例：**
 
 ```yaml
 gpu_workers:
@@ -194,17 +250,28 @@ gpu_workers:
     worker-01:
       ansible_host: 10.0.2.20
       video_mask_worker_id: worker-01
+      video_mask_worker_slots: 2
 ```
 
 确认安全组允许 Controller SSH 到 Worker 的 TCP `22`，并允许 Worker 访问 Controller TCP `8080`。然后在 Controller 上执行：
 
 ```bash
+# 密码 SSH：密码已在 Vault 中，不需要 -K
+ansible -i inventory.yml gpu_workers -m ping --ask-vault-pass
+ansible-playbook -i inventory.yml site.yml \
+  --limit gpu_workers --ask-vault-pass
+
+# SSH Key：若 Worker sudo 需要密码，使用 -K
 ansible-playbook -i inventory.yml site.yml \
   --limit gpu_workers \
   -K --ask-vault-pass
 ```
 
-Worker 会自动获得源码只读 Key、clone 源码、安装 CUDA/Python 依赖，并启动 `video-mask-worker.service`。启动后 Worker 会自行轮询 Controller 领取任务；不需要让 Ansible 常驻运行。
+`video_mask_worker_slots` 表示一台物理 Worker 同时处理的任务数，默认值为 `1`。每个槽位会成为一个独立的 Controller Worker，例如上例会注册并启动 `worker-01-slot-1` 与 `worker-01-slot-2`；每个槽位一次领取一个任务。
+
+建议先使用 `2` 个槽位，观察 GPU SM、显存、CPU 与单视频速度后再增至 `4`。同一台 T4 上盲目设置过多槽位可能降低单任务速度，应该以总吞吐量判断。部署会停用旧的单实例 `video-mask-worker.service`，改为 `video-mask-worker@slot-1.service` 等模板实例；请在该 Worker 没有集群任务执行时升级。
+
+Worker 会自动获得源码只读 Key、clone 源码、安装 CUDA/Python 依赖，并启动每个槽位服务。启动后 Worker 会自行轮询 Controller 领取任务；不需要让 Ansible 常驻运行。
 
 ## 8. 添加视频打码任务
 
@@ -254,9 +321,61 @@ curl -fsS "http://127.0.0.1:8080/api/workers" \
   -H "Authorization: Bearer 你的管理员Token"
 ```
 
-浏览器访问 `http://Controller私网IP:8080/` 也可以查看最近任务与 Worker 状态。
+浏览器访问 `http://Controller私网IP:8080/` 也可以查看最近任务与 Worker 状态。Worker 表会显示 Worker ID、主机名、Controller 实际看到的私网 IP、槽位编号、GPU、CUDA 状态、Worker PID、当前任务和最后心跳时间。
 
 > 后续可在 Controller 增加 S3 任务导入服务：扫描指定 Prefix、生成预签名 URL、调用本 API。这样业务人员只需上传视频到 S3，无需手动执行 `curl`。
+
+### S3 自动分发与结果上传
+
+S3 模式下，Controller 使用自身的 AWS Profile 扫描源桶，将视频自动加入任务队列。Worker 领取任务的瞬间，Controller 才生成新的预签名下载 URL 和上传 URL：Worker 不需要 AWS AK/SK，也不会因为任务排队导致 URL 在处理前过期。
+
+在 **Controller** 上以运行服务的 `ubuntu` 用户配置 AWS Profile（不要用 `root` 配置，否则 systemd 服务无法读取）：
+
+```bash
+sudo -u ubuntu -H aws configure --profile s3-test
+sudo -u ubuntu -H aws sts get-caller-identity --profile s3-test
+```
+
+所用 IAM 身份至少需要：源桶 `s3:ListBucket`、`s3:GetObject`；结果桶 `s3:ListBucket`、`s3:GetObject`（用于跳过已有结果）、`s3:PutObject`。AK/SK 只保存在 Controller 的 `/home/ubuntu/.aws/`，不要写入 Git、Ansible inventory 或 Vault 以外的明文文件。
+
+编辑 `ansible/group_vars/all/settings.yml`：
+
+```yaml
+video_mask_storage_mode: s3
+video_mask_s3_source_bucket: dataai-mp4-685538570851-us-east-2-an
+video_mask_s3_source_prefix: ''
+video_mask_s3_source_region: us-east-2
+video_mask_s3_output_bucket: processed-video-685538570851-us-east-2-an
+video_mask_s3_output_prefix: outputs/
+video_mask_s3_profile: s3-test
+video_mask_s3_poll_seconds: 60
+video_mask_s3_presign_seconds: 86400
+```
+
+部署 Controller：
+
+```bash
+cd ~/video-mask/ansible
+ansible-playbook -i inventory.yml site.yml \
+  --limit controller -K --ask-vault-pass
+```
+
+首次健康检查会扫描源桶；之后 Controller 每 60 秒扫描一次，或有 Worker 领取任务时按周期扫描一次：
+
+```bash
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+返回中的 `s3_ingested` 是本次新创建任务数。结果对象会上传至 `s3://processed-video-685538570851-us-east-2-an/outputs/`，保留源视频的子目录，并加上 `masked_` 前缀。数据库已记录的同一对象版本、或结果桶已存在的输出，会自动跳过。
+
+预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。当前上传方式是单次 S3 `PutObject`，单个结果文件应小于 5 GiB；更大的文件需要后续增加 multipart upload。
+
+若修复 IAM 权限、网络或算法配置后需要重新执行一个已失败的任务，使用管理员 Token 将其重新放回队列（重置该任务的重试次数）：
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:8080/api/tasks/任务ID/retry" \
+  -H "Authorization: Bearer 你的管理员Token"
+```
 
 ### 无 S3 时的远程 Worker 测试
 
@@ -302,7 +421,7 @@ ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pa
 更新 Worker 后，可确认新服务参数已生效：
 
 ```bash
-ssh ubuntu@Worker私网IP 'sudo systemctl status video-mask-worker --no-pager && ls -ld ~/outputs'
+ssh ubuntu@Worker私网IP 'sudo systemctl status "video-mask-worker@slot-*" --no-pager && ls -ld ~/outputs'
 ```
 
 ## 10. 常见问题

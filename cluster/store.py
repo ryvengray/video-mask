@@ -193,6 +193,23 @@ class ClusterStore:
         return self.task(task_id) or {}
 
     @synchronized
+    def retry_task(self, task_id: str) -> dict[str, Any]:
+        """Return a failed task to the queue with a fresh retry budget."""
+        current = self.task(task_id)
+        if current is None:
+            raise ValueError("task does not exist")
+        if current["status"] != "failed":
+            raise ValueError("only failed tasks can be retried")
+        stamp = now()
+        self.conn.execute("""
+            UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
+              progress_json='{}', error_message=NULL, started_at=NULL, finished_at=NULL, updated_at=?
+            WHERE task_id=?
+        """, (stamp, task_id))
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
     def task(self, task_id: str) -> dict[str, Any] | None:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
@@ -288,5 +305,12 @@ class ClusterStore:
                 WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading')
             """, (stamp, row[1]))
             self.conn.execute("UPDATE workers SET status='offline', current_task_id=NULL, updated_at=? WHERE worker_id=?", (stamp, row[0]))
+        # Idle Workers also need to become offline when their process or host
+        # disappears.  Previously only Workers with a leased task changed
+        # state, leaving old ready records misleadingly visible forever.
+        self.conn.execute("""
+            UPDATE workers SET status='offline', updated_at=?
+            WHERE current_task_id IS NULL AND last_seen_at < ? AND status != 'offline'
+        """, (stamp, threshold))
         self.conn.commit()
         return len(rows)
