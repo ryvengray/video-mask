@@ -14,7 +14,7 @@ usage() {
   cat <<'EOF'
 用法：bash scripts/bootstrap_server.sh [选项]
 
-  --cuda                    强制使用 CUDA；未检测到可用 NVIDIA GPU 时失败
+  --cuda                    强制使用 CUDA；缺少驱动时自动安装 Ubuntu 推荐驱动
   --cpu                     强制安装 CPU 版 PyTorch
   --face-only               部署仅人脸流水线；默认要求 CUDA，配合 --cpu 才使用 CPU
   --skip-models             不预下载 OWLv2 和 YuNet 模型
@@ -82,7 +82,8 @@ fi
 echo "==> 安装系统依赖"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ffmpeg git curl python3 python3-venv python3-pip ca-certificates util-linux
+  ffmpeg git curl pciutils python3 python3-venv python3-pip ca-certificates \
+  ubuntu-drivers-common util-linux
 
 if [[ "$MODE" == "auto" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
@@ -94,8 +95,19 @@ fi
 
 if [[ "$MODE" == "cuda" ]]; then
   if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
-    echo "错误：请求 CUDA 模式但 nvidia-smi 不可用。请先安装云厂商提供的 NVIDIA 驱动。" >&2
-    exit 1
+    if ! lspci -nn 2>/dev/null | grep -qi 'NVIDIA'; then
+      echo "错误：请求 CUDA 模式，但此机器未检测到 NVIDIA GPU。请确认 Worker 使用 GPU 实例。" >&2
+      exit 1
+    fi
+    echo "==> 未检测到可用 NVIDIA 驱动，安装 Ubuntu 推荐驱动"
+    "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive ubuntu-drivers install
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+      cat >&2 <<'EOF'
+NVIDIA 驱动已安装，但内核模块尚未加载。请重启系统后重新运行本脚本。
+Ansible Worker 部署会识别此状态、重启 Worker 一次并自动继续。
+EOF
+      exit 75
+    fi
   fi
   echo "==> 检测到 NVIDIA GPU"
   nvidia-smi -L

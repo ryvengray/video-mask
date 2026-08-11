@@ -25,8 +25,9 @@ video_mask_s3_source_prefix: source/inbox/
 video_mask_s3_source_region: ''
 video_mask_s3_output_bucket: ''
 video_mask_s3_output_prefix: outputs/
-# The named AWS CLI/Boto3 profile exists only on the Controller under
-# /home/ubuntu/.aws. Do not put AK/SK into this repository or settings file.
-video_mask_s3_profile: s3-test
+# Leave empty when the Controller EC2 instance uses an IAM Role. Set a named
+# profile only when it already exists on the Controller under /home/ubuntu/.aws.
+# Do not put AK/SK into this repository or settings file.
+video_mask_s3_profile: ''
 video_mask_s3_poll_seconds: 60
 video_mask_s3_presign_seconds: 86400

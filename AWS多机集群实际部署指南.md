@@ -18,7 +18,7 @@ S3 outputs/      <──Worker 以预签名 URL 上传── Controller 记录�
 ## 1. 部署前确认
 
 - 所有节点必须使用 **Ubuntu 22.04 或 24.04**，SSH 登录用户为 `ubuntu`。当前 Ansible role 使用 `apt`、`/home/ubuntu` 和 `ubuntu` systemd 服务用户，不支持 Amazon Linux 的 `ec2-user`。
-- Controller 可以是无 GPU 的 EC2；Worker 必须是带 NVIDIA GPU 的实例，且系统中已可运行 `nvidia-smi`。现有 playbook 安装 Python/CUDA 运行库，但不安装 NVIDIA 驱动。
+- Controller 可以是无 GPU 的 EC2；Worker 必须是带 NVIDIA GPU 的实例。Worker 初始化会在缺少 `nvidia-smi` 时安装 Ubuntu 推荐 NVIDIA 驱动，并在需要时自动重启一次后继续；非 GPU 实例仍会明确失败。
 - 建议 Controller 和 Worker 都在私有子网。Controller 需要出站访问 GitHub、Ubuntu 软件源、AWS S3；Worker 首次部署还需访问 GitHub、Ubuntu 软件源、PyTorch/Hugging Face，运行时需访问 S3 预签名 URL。
 - 准备 Terraform 生成的 SSH 私钥 `terraform-host.pem`。它只保存在 Controller（运行 Ansible 的机器）或你的受控运维主机，绝不提交到仓库。
 - 准备 GitHub 仓库的**只读 Deploy Key**。它与 `terraform-host.pem` 不同，用于每台远程 Worker 拉取代码。
@@ -81,7 +81,17 @@ S3 Bucket Policy 还必须允许该 Controller IAM Role 访问。不要先启用
 
 上传输入视频时先传到临时 key，例如 `uploading/<uuid>.partial`；校验完成后复制/移动到 `source/inbox/`。Controller 会周期扫描 `source/inbox/`，不要将未上传完成的对象直接放入此目录。
 
-## 3. 启动 Controller 与 Ansible 控制机
+## 3. 用启动脚本部署同机的 Ansible + Controller
+
+Controller 本机就是 Ansible 控制机：无需在 inventory 为 Controller 配置 SSH、`terraform-host.pem` 或 `ansible_user`。启动脚本会生成以下本地 Controller inventory：
+
+```yaml
+controller:
+  hosts:
+    controller-01:
+      ansible_connection: local
+      video_mask_manage_source: false
+```
 
 以下在新的 Controller 上以 `ubuntu` 用户执行。`CONTROLLER_PRIVATE_IP` 必须是 Worker 可访问的 VPC 私网 IP：
 
@@ -95,29 +105,48 @@ bash scripts/bootstrap_cluster_controller.sh \
   --no-deploy
 ```
 
-脚本会安装 Ansible、创建 `ansible/inventory.yml` 和 `ansible/group_vars/all/settings.yml`，但不会先以本地目录模式启动 Controller。接下来将其改为 S3 正式配置。
+`--no-deploy` 用于正式环境：脚本会安装 Ansible、创建 `ansible/inventory.yml` 和 `ansible/group_vars/all/settings.yml`，但不会先以本地目录模式启动 Controller。接下来将其改为 S3 配置，并在第 4 节通过 Ansible 启动服务。
+
+只有本地单机测试才省略 `--no-deploy`。不要在已有生产配置时随意使用 `--force-config`；它会备份并重新生成 inventory 和 settings 文件。
 
 ## 4. 配置 Vault、S3 与 inventory
 
-创建 Ansible Vault；以下三个值都应只出现在 Vault 中：
+创建 Ansible Vault；以下三个值都应只出现在 Vault 中。`vault_video_mask_source_deploy_key` 的值是专供 Ansible 拉取仓库的 **Git Deploy Key 私钥**，不是 Terraform 的 `terraform-host.pem`：
+
+```bash
+mkdir -p /home/ubuntu/.ssh
+chmod 700 /home/ubuntu/.ssh
+ssh-keygen -t ed25519 -N '' \
+  -C 'video-mask-ansible-deploy' \
+  -f /home/ubuntu/.ssh/video-mask-source-deploy
+chmod 600 /home/ubuntu/.ssh/video-mask-source-deploy
+```
+
+在 GitHub 仓库中打开 **Settings → Deploy keys → Add deploy key**，名称可填 `aws-video-mask-ansible`。将下列命令输出的**公钥**粘贴进去，保持只读，不要勾选 `Allow write access`：
+
+```bash
+cat /home/ubuntu/.ssh/video-mask-source-deploy.pub
+```
+
+然后创建 Vault：
 
 ```bash
 cd /home/ubuntu/video-mask/ansible
 ansible-vault create group_vars/all/vault.yml
 ```
 
-填写内容：
+在编辑器中填写内容。将 `/home/ubuntu/.ssh/video-mask-source-deploy` 的**私钥全部内容**（包括首尾 `BEGIN`/`END` 行）粘贴到 `vault_video_mask_source_deploy_key: |` 下，并且每一行缩进两个空格：
 
 ```yaml
 vault_video_mask_admin_token: REPLACE_WITH_A_RANDOM_32_BYTE_HEX_TOKEN
 vault_video_mask_worker_token: REPLACE_WITH_A_DIFFERENT_RANDOM_32_BYTE_HEX_TOKEN
 vault_video_mask_source_deploy_key: |
   -----BEGIN OPENSSH PRIVATE KEY-----
-  REPLACE_WITH_READ_ONLY_GITHUB_DEPLOY_KEY
+  REPLACE_WITH_THE_PRIVATE_KEY_CONTENT
   -----END OPENSSH PRIVATE KEY-----
 ```
 
-生成 Token 可使用两次 `openssl rand -hex 32`。将只读 Deploy Key 的公钥添加到 GitHub 仓库的 Deploy Keys；不要把 Terraform SSH 私钥填进 Vault。
+生成 Token 可使用两次 `openssl rand -hex 32`。保存 Vault 密码到受控的密码管理器；不要将 Vault 密码、Git Deploy Key 私钥或 Terraform SSH 私钥填入 Git 仓库。远程 Worker 部署时，Ansible 会从 Vault 读取该私钥，并安全地复制到 Worker 的 `/home/ubuntu/.ssh/video-mask-source`，用于拉取 `video_mask_repo`。
 
 编辑 `ansible/group_vars/all/settings.yml`，替换为实际 S3 配置：
 
@@ -213,7 +242,7 @@ ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit worker-01 \
   --ask-vault-pass
 ```
 
-Worker role 会拉取指定 Git ref、安装 CUDA 人脸流水线依赖、校验 CUDA/ONNX Runtime、向 Controller 预注册 Worker slot，并创建和启动 `video-mask-worker@slot-1.service`。
+Worker role 会拉取指定 Git ref、安装 CUDA 人脸流水线依赖、在缺少驱动时安装 Ubuntu 推荐 NVIDIA 驱动并自动重启一次、校验 CUDA/ONNX Runtime、向 Controller 预注册 Worker slot，并创建和启动 `video-mask-worker@slot-1.service`。
 
 验证：
 

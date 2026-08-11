@@ -33,6 +33,21 @@
   ansible.builtin.command:
     cmd: bash scripts/bootstrap_server.sh --cuda --face-only
     chdir: "{{ video_mask_app_dir }}"
+  register: video_mask_bootstrap
+  changed_when: video_mask_bootstrap.rc == 75
+  failed_when: video_mask_bootstrap.rc not in [0, 75]
+
+- name: Reboot Worker after NVIDIA driver installation
+  ansible.builtin.reboot:
+    msg: Rebooting after NVIDIA driver installation for Video Mask Worker
+    reboot_timeout: 900
+  when: video_mask_bootstrap.rc == 75
+
+- name: Complete Worker bootstrap after NVIDIA driver reboot
+  ansible.builtin.command:
+    cmd: bash scripts/bootstrap_server.sh --cuda --face-only
+    chdir: "{{ video_mask_app_dir }}"
+  when: video_mask_bootstrap.rc == 75
   changed_when: false
 
 - name: Create Worker slot runtime directories
