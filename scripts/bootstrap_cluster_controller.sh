@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap a controller-only Video Mask cluster node on Ubuntu/Debian.
+# Bootstrap an Ubuntu node that runs both Ansible and the Video Mask Controller.
 # Run as the ubuntu user from a checked-out video-mask repository.
 set -Eeuo pipefail
 
@@ -20,7 +20,8 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/bootstrap_cluster_controller.sh [options]
 
-Initializes a Controller only.  Workers can be added later through Ansible.
+Initializes an Ubuntu Controller that also runs Ansible. Workers can be added
+later from this same machine through Ansible and a Terraform SSH private key.
 
 Options:
   --controller-url URL     Controller URL workers will use (default: http://127.0.0.1:8080)
@@ -31,7 +32,7 @@ Options:
   --output-dir PATH        Local-test output directory
   --admin-token TOKEN      Reuse a generated admin token; otherwise generate one
   --worker-token TOKEN     Reuse a generated Worker token; otherwise generate one
-  --deploy-user USER       Service/deployment user (default: ubuntu)
+  --deploy-user USER       Must be ubuntu (default: ubuntu)
   --force-config           Back up and recreate Ansible inventory/configuration
   --no-deploy              Generate configuration but do not run Ansible
   -h, --help               Show this help
@@ -43,6 +44,10 @@ Examples:
 
 The default local directories are for Controller-only testing.  S3 task
 ingestion is not configured by this script.
+
+This script uses the source checkout it creates above for the Controller, so
+it does not require a repository Deploy Key. A Deploy Key is still required
+later when Ansible deploys source code to remote Workers.
 EOF
 }
 
@@ -78,6 +83,10 @@ if ! id "$DEPLOY_USER" >/dev/null 2>&1; then
   echo "Error: deployment user '$DEPLOY_USER' does not exist." >&2
   exit 1
 fi
+if [[ "$DEPLOY_USER" != "ubuntu" ]]; then
+  echo "Error: the current Controller and Worker roles run services as ubuntu; --deploy-user must be ubuntu." >&2
+  exit 1
+fi
 
 if [[ $EUID -eq 0 ]]; then
   RUN_AS_DEPLOY_USER=(sudo -u "$DEPLOY_USER")
@@ -92,6 +101,11 @@ SOURCE_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "==> Checking sudo and installing controller prerequisites"
 sudo -v
+if [[ $EUID -ne 0 ]] && sudo -n true; then
+  # EC2 Ubuntu normally grants passwordless sudo. Do not force Ansible to
+  # prompt for a password that the account does not have.
+  ANSIBLE_BECOME_ARGS=()
+fi
 sudo apt-get update
 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
   ansible ca-certificates curl git openssl python3 python3-pip python3-venv
@@ -144,7 +158,8 @@ controller:
   hosts:
     controller-01:
       ansible_connection: local
-      ansible_user: ubuntu
+      # This node is already checked out above, so do not require a Git Deploy Key.
+      video_mask_manage_source: false
 
 gpu_workers:
   hosts: {}
@@ -192,7 +207,8 @@ fi
 
 if [[ "$DEPLOY" -eq 0 ]]; then
   echo "Configuration created. Deploy later with:"
-  echo "  cd $APP_DIR && ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit controller -K"
+  echo "  cd $APP_DIR && ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit controller"
+  echo "  Add -K only if sudo prompts for a password."
   exit 0
 fi
 

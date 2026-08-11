@@ -13,7 +13,31 @@ Controller（127.0.0.1:8080）
 
 这次测试不使用 S3，不会扫描或改动现有的 `/home/ubuntu/sources/`、`/home/ubuntu/outputs/`。先只处理一个短视频，验证 Controller、Worker、GPU、任务领取和输出上传（本地复制）完整链路。
 
-## 0. 前提：确认服务器已拿到集群代码
+## 0. 新 Ubuntu Controller（同时作为 Ansible 控制机）一键启动
+
+以下命令在新的 Ubuntu Controller 上、以 `ubuntu` 用户执行。请把 `CONTROLLER_PRIVATE_IP` 替换为此机器可被 Worker 访问的 VPC 私网 IP；不要填写 `127.0.0.1`，否则远程 Worker 无法领取任务。
+
+```bash
+git clone https://github.com/ryvengray/video-mask.git /home/ubuntu/video-mask
+cd /home/ubuntu/video-mask
+git pull --ff-only
+
+bash scripts/bootstrap_cluster_controller.sh \
+  --controller-url http://CONTROLLER_PRIVATE_IP:8080
+```
+
+脚本会安装 Ansible 和 Controller 依赖、生成随机 Controller/Worker Token、创建本机 Controller inventory，并启动 `video-mask-controller.service`。它不会部署本机 Worker；后续远程 Worker 使用第 5.1 节的 `terraform-host.pem` 流程添加。
+
+首次启动完成后验证：
+
+```bash
+curl http://127.0.0.1:8080/healthz
+sudo systemctl status video-mask-controller --no-pager
+```
+
+脚本依赖 Ubuntu/Debian 的 `apt`，并固定以 `ubuntu` 用户运行服务；请使用 Ubuntu AMI，不支持 Amazon Linux 的 `ec2-user` 运行环境。
+
+### 手动部署前提：确认服务器已拿到集群代码
 
 当前集群代码必须已经提交并推送到仓库后，服务器才能拉取。进入项目后检查：
 

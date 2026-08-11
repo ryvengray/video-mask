@@ -9,12 +9,14 @@
     fail_msg: >-
       Configure video_mask_repo and vault_video_mask_source_deploy_key before
       deploying source mode.
+  when: video_mask_manage_source | default(true) | bool
 
 - name: Install source checkout prerequisite
   ansible.builtin.apt:
     name: git
     state: present
     update_cache: true
+  when: video_mask_manage_source | default(true) | bool
 
 - name: Create source SSH directory
   ansible.builtin.file:
@@ -23,6 +25,7 @@
     owner: ubuntu
     group: ubuntu
     mode: '0700'
+  when: video_mask_manage_source | default(true) | bool
 
 - name: Install source repository Deploy Key
   ansible.builtin.copy:
@@ -32,6 +35,7 @@
     group: ubuntu
     mode: '0600'
   no_log: true
+  when: video_mask_manage_source | default(true) | bool
 
 - name: Checkout video-mask source repository
   ansible.builtin.git:
@@ -42,3 +46,4 @@
     accept_newhostkey: true
     key_file: "{{ video_mask_source_deploy_key_path | default('/home/ubuntu/.ssh/video-mask-source') }}"
   become_user: ubuntu
+  when: video_mask_manage_source | default(true) | bool
