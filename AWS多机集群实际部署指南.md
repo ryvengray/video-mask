@@ -310,6 +310,7 @@ bash scripts/deploy_controller.sh --restart
 
 ```yaml
 video_mask_autoscale_enabled: true
+video_mask_autoscale_controller_url: http://127.0.0.1:8080
 video_mask_autoscale_pool_file: /opt/dataai-ec2/data/ec2_host_pool.yaml
 video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
 video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
