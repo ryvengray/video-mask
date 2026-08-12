@@ -103,6 +103,18 @@
     (item.path | basename | regex_replace('^video-mask-worker@slot-([0-9]+)\\.service$', '\\1') | int)
     > (video_mask_worker_slots | default(1) | int)
 
+- name: Retire disabled excess Worker slots from the controller
+  ansible.builtin.uri:
+    url: "{{ video_mask_controller_url }}/api/admin/workers/{{ video_mask_worker_id | default(inventory_hostname) }}-slot-{{ item }}/retire"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ video_mask_admin_token }}"
+    status_code: 200
+  loop: "{{ range((video_mask_worker_slots | default(1) | int) + 1, 17) | list }}"
+  # A running/busy slot is deliberately rejected by the Controller. Do not
+  # hide it just because a playbook reduced the desired slot count.
+  no_log: true
+
 - name: Install Worker slot systemd service template
   ansible.builtin.template:
     src: video-mask-worker.service.j2

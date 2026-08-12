@@ -300,6 +300,8 @@ bash scripts/deploy_controller.sh --restart
 
 当前 Controller 页面是只读状态页；Worker 上下线使用对应主机的 `systemctl start|stop video-mask-worker@slot-1`。管理脚本可立即取消 pending 任务；对于运行中的任务，会请求 Worker 在下一次心跳（最长约 15 秒）终止算法并标记为 `cancelled`。已完成、失败或取消的任务可由脚本重新入队，无需删除 Controller SQLite 数据库。
 
+当降低某台 Worker 的 `video_mask_worker_slots`（例如 8 改为 6）后，重新部署该 Worker。Ansible 会停止 slot 7/8，并从 Controller 自动退役这些已禁用的 idle slot，因此它们不会以 `offline` 状态影响 autoscaler 的整机空闲判断。若多余 slot 仍有任务，Controller 会拒绝退役并使 playbook 失败；请等待任务完成或先取消任务后再缩容。
+
 ## 7. 按任务量自动启动和关闭 Worker EC2
 
 当运维提供的 EC2 机器池文件和启停脚本都安装在 Controller 上时，可启用 Controller 侧 autoscaler。它不运行在 Worker 上，也不会将 AWS 凭证或 EC2 启停权限下发到 Worker。

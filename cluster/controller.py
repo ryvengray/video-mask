@@ -216,6 +216,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         require_admin(authorization)
         return store.provision_worker(request.worker_id, request.token)
 
+    @app.post("/api/admin/workers/{worker_id}/retire")
+    def retire_worker(worker_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return store.retire_worker(worker_id)
+
     @app.get("/api/tasks")
     def list_tasks(limit: int = 100, offset: int = 0, status: str | None = None,
                    authorization: str | None = Header(default=None)):
