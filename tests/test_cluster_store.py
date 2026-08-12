@@ -168,6 +168,30 @@ def test_active_task_cancellation_completes_as_cancelled(tmp_path: Path):
     store.close()
 
 
+def test_failed_task_retains_worker_reported_output_metadata(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    failed = store.finish("worker-01", TOKEN, created["task_id"], False, {
+        "error_message": "uploading: output upload failed",
+        "progress": {
+            "input_bytes": 100,
+            "output_filename": "masked_input.mp4",
+            "output_bytes": 80,
+            "output_duration_seconds": 12.5,
+            "processing_seconds": 4.2,
+        },
+    })
+
+    assert failed["progress"]["output_bytes"] == 80
+    assert failed["progress"]["output_duration_seconds"] == 12.5
+    assert failed["progress"]["processing_seconds"] == 4.2
+    store.close()
+
+
 def test_provisioning_with_the_same_token_preserves_an_active_worker(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)

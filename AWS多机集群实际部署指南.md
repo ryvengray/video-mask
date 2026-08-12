@@ -57,7 +57,7 @@ ssh -i /absolute/path/to/terraform-host.pem \
     {
       "Sid": "ListInputPrefix",
       "Effect": "Allow",
-      "Action": "s3:ListBucket",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
       "Resource": "arn:aws:s3:::INPUT_BUCKET",
       "Condition": {"StringLike": {"s3:prefix": ["source/inbox/*"]}}
     },
@@ -72,6 +72,12 @@ ssh -i /absolute/path/to/terraform-host.pem \
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::OUTPUT_BUCKET/outputs/*"
+    },
+    {
+      "Sid": "IdentifyOutputBucketRegion",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::OUTPUT_BUCKET"
     }
   ]
 }
@@ -167,6 +173,8 @@ video_mask_s3_source_prefix: source/inbox/
 video_mask_s3_source_region: AWS_REGION
 video_mask_s3_output_bucket: OUTPUT_BUCKET
 video_mask_s3_output_prefix: outputs/
+# 留空时默认使用输入 Region；输出 Bucket 在另一个 Region 时必须明确填写其 Region。
+video_mask_s3_output_region: OUTPUT_AWS_REGION
 # EC2 IAM Role 使用默认凭证链，因此保持为空。
 video_mask_s3_profile: ''
 video_mask_s3_poll_seconds: 60
@@ -284,8 +292,10 @@ sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
   restart-slot worker-01 --slot 1-15
 
 # 部署更新后的 Worker 代码；先在 settings.yml 更新 video_mask_ref。
-ansible-playbook -i ansible/inventory.yml ansible/site.yml \
-  --limit worker-01 --ask-vault-pass
+bash scripts/deploy_worker.sh worker-01
+
+# 部署 Controller 配置/代码；--restart 可强制重启服务。
+bash scripts/deploy_controller.sh --restart
 ```
 
 当前 Controller 页面是只读状态页；Worker 上下线使用对应主机的 `systemctl start|stop video-mask-worker@slot-1`。管理脚本可立即取消 pending 任务；对于运行中的任务，会请求 Worker 在下一次心跳（最长约 15 秒）终止算法并标记为 `cancelled`。已完成、失败或取消的任务可由脚本重新入队，无需删除 Controller SQLite 数据库。

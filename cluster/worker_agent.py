@@ -136,11 +136,12 @@ class Worker:
         # curl streams the file from disk.  Do not use read_bytes() here: long
         # videos must never be loaded into a Worker's RAM for upload.
         result = subprocess.run(
-            ["curl", "--fail", "--silent", "--show-error", "--upload-file", str(source), url],
+            ["curl", "--fail-with-body", "--silent", "--show-error", "--upload-file", str(source), url],
             text=True, capture_output=True, check=False,
         )
         if result.returncode != 0:
-            raise RuntimeError("output upload failed: " + result.stderr[-1000:])
+            diagnostic = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+            raise RuntimeError("output upload failed: " + diagnostic[-3000:])
 
     def algorithm_command(self, source: Path, output_dir: Path, arguments: list[str]) -> list[str]:
         """Build an invocation for either a development script or a release binary.
@@ -181,6 +182,8 @@ class Worker:
                                      args=(heartbeat_stop, self.capabilities(), cancel_requested), daemon=True)
         heartbeat.start()
         phase = "initializing"
+        output: Path | None = None
+        elapsed: float | None = None
         try:
             phase = "downloading"
             self.report(task_id, "downloading", phase="downloading")
@@ -260,8 +263,22 @@ class Worker:
         except Exception as exc:
             message = f"{phase}: {exc}"
             print(f"[{task_id}] ERROR: {message}", file=sys.stderr, flush=True)
+            failure_progress: dict[str, Any] = {
+                "input_filename": source.name,
+                "input_bytes": source.stat().st_size if source.exists() else None,
+            }
+            if elapsed is not None:
+                failure_progress.update({"processing_seconds": elapsed, "elapsed_seconds": elapsed})
+            if output is not None and output.exists():
+                failure_progress.update({
+                    "output_filename": output.name,
+                    "output_bytes": output.stat().st_size,
+                    "output_duration_seconds": duration(output),
+                })
             try:
-                self.api(f"/api/tasks/{task_id}/fail", self.payload(error_message=message[:3000]))
+                self.api(f"/api/tasks/{task_id}/fail", self.payload(
+                    error_message=message[:3000], progress=failure_progress,
+                ))
             except Exception as report_error:
                 print(f"[{task_id}] failed to report error: {report_error}", file=sys.stderr, flush=True)
         finally:

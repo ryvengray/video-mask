@@ -21,14 +21,17 @@ class S3Ingestor:
     """
 
     def __init__(self, store: ClusterStore, source_bucket: str, source_prefix: str,
-                 output_bucket: str, output_prefix: str, region: str,
-                 profile: str | None = None, poll_seconds: int = 60,
-                 presign_seconds: int = 86400, client: Any | None = None):
+                 output_bucket: str, output_prefix: str, source_region: str,
+                 output_region: str | None = None, profile: str | None = None,
+                 poll_seconds: int = 60, presign_seconds: int = 86400,
+                 client: Any | None = None, output_client: Any | None = None):
         self.store = store
         self.source_bucket = source_bucket
         self.source_prefix = source_prefix.strip("/")
         self.output_bucket = output_bucket
         self.output_prefix = output_prefix.strip("/")
+        self.source_region = source_region
+        self.output_region = output_region or source_region
         self.poll_seconds = poll_seconds
         self.presign_seconds = presign_seconds
         self._lock = threading.Lock()
@@ -38,13 +41,17 @@ class S3Ingestor:
                 import boto3
             except ImportError as exc:  # pragma: no cover - deployment dependency guard
                 raise RuntimeError("S3 mode requires boto3; install requirements-cluster.txt") from exc
-            session = boto3.Session(profile_name=profile or None, region_name=region or None)
-            # Never sign the legacy global endpoint (bucket.s3.amazonaws.com)
-            # for a non-us-east-1 bucket. S3 redirects it to the regional host,
-            # but the redirect changes the signed Host header and causes 403.
-            endpoint_url = f"https://s3.{region}.amazonaws.com" if region else None
-            client = session.client("s3", region_name=region or None, endpoint_url=endpoint_url)
-        self.client = client
+            session = boto3.Session(profile_name=profile or None)
+
+            def regional_client(region: str):
+                # Pre-sign against the Bucket's actual regional endpoint.
+                endpoint_url = f"https://s3.{region}.amazonaws.com" if region else None
+                return session.client("s3", region_name=region or None, endpoint_url=endpoint_url)
+
+            client = regional_client(self.source_region)
+            output_client = regional_client(self.output_region)
+        self.source_client = client
+        self.output_client = output_client or client
 
     def output_key(self, source_key: str) -> str:
         relative = source_key
@@ -64,12 +71,28 @@ class S3Ingestor:
 
     def output_exists(self, key: str) -> bool:
         try:
-            self.client.head_object(Bucket=self.output_bucket, Key=key)
+            self.output_client.head_object(Bucket=self.output_bucket, Key=key)
             return True
         except Exception as exc:
             if self._not_found(exc):
                 return False
             raise
+
+    def validate_bucket_regions(self) -> None:
+        """Fail fast when a configured signing Region does not match its Bucket."""
+        for label, bucket, region, client in (
+            ("source", self.source_bucket, self.source_region, self.source_client),
+            ("output", self.output_bucket, self.output_region, self.output_client),
+        ):
+            try:
+                location = client.get_bucket_location(Bucket=bucket).get("LocationConstraint")
+            except Exception as exc:
+                raise RuntimeError(f"cannot determine {label} bucket region for {bucket}: {exc}") from exc
+            bucket_region = "us-east-1" if location in (None, "") else str(location)
+            if bucket_region != region:
+                raise RuntimeError(
+                    f"{label} bucket {bucket} is in {bucket_region}, but its configured region is {region}"
+                )
 
     def scan_if_due(self) -> int:
         with self._lock:
@@ -81,7 +104,7 @@ class S3Ingestor:
 
     def scan(self) -> int:
         created = 0
-        paginator = self.client.get_paginator("list_objects_v2")
+        paginator = self.source_client.get_paginator("list_objects_v2")
         prefix = f"{self.source_prefix}/" if self.source_prefix else ""
         for page in paginator.paginate(Bucket=self.source_bucket, Prefix=prefix):
             for object_info in page.get("Contents", []):
@@ -120,11 +143,11 @@ class S3Ingestor:
         source_key = parsed.path.lstrip("/")
         output_key = str(task.get("output_object_key") or self.output_key(source_key))
         result = dict(task)
-        result["source_url"] = self.client.generate_presigned_url(
+        result["source_url"] = self.source_client.generate_presigned_url(
             "get_object", Params={"Bucket": self.source_bucket, "Key": source_key},
             ExpiresIn=self.presign_seconds,
         )
-        result["output_upload_url"] = self.client.generate_presigned_url(
+        result["output_upload_url"] = self.output_client.generate_presigned_url(
             "put_object", Params={"Bucket": self.output_bucket, "Key": output_key},
             ExpiresIn=self.presign_seconds,
         )

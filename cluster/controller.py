@@ -87,6 +87,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if s3_ingestor:
+            s3_ingestor.validate_bucket_regions()
         yield
         store.close()
 
@@ -261,7 +263,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             output_name = task.get("output_object_key") or progress.get("output_filename") or "-"
             input_size = progress.get("input_bytes", task.get("source_size_bytes"))
             output_size = progress.get("output_bytes")
-            output_duration = seconds(task.get("output_duration_seconds"))
+            output_duration = seconds(task.get("output_duration_seconds", progress.get("output_duration_seconds")))
             output_hash = task.get("output_sha256")
             hash_line = f"<br><small>SHA-256: {html.escape(str(output_hash)[:16])}…</small>" if output_hash else ""
             return (
@@ -287,7 +289,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 process_label = "Process: -"
             parts = [process_label]
             if end_to_end is not None:
-                parts.append(f"Total: {seconds(end_to_end)}")
+                parts.append(f"Task lifetime: {seconds(end_to_end)}")
             return "<br>".join(parts)
 
         def last_seen(timestamp: float | None) -> str:
@@ -359,7 +361,8 @@ def main() -> None:
     parser.add_argument("--s3-source-prefix", default="")
     parser.add_argument("--s3-output-bucket")
     parser.add_argument("--s3-output-prefix", default="outputs/")
-    parser.add_argument("--s3-region")
+    parser.add_argument("--s3-source-region")
+    parser.add_argument("--s3-output-region")
     parser.add_argument("--s3-profile")
     parser.add_argument("--s3-poll-seconds", type=int, default=60)
     parser.add_argument("--s3-presign-seconds", type=int, default=86400)
@@ -368,9 +371,9 @@ def main() -> None:
         raise SystemExit("Set --admin-token or VIDEO_MASK_ADMIN_TOKEN (at least 16 characters)")
     if bool(args.local_source_dir) != bool(args.local_output_dir):
         raise SystemExit("--local-source-dir and --local-output-dir must be supplied together")
-    s3_options = (args.s3_source_bucket, args.s3_output_bucket, args.s3_region)
+    s3_options = (args.s3_source_bucket, args.s3_output_bucket, args.s3_source_region)
     if any(s3_options) and not all(s3_options):
-        raise SystemExit("--s3-source-bucket, --s3-output-bucket and --s3-region must be supplied together")
+        raise SystemExit("--s3-source-bucket, --s3-output-bucket and --s3-source-region must be supplied together")
     if args.s3_poll_seconds < 1 or not 1 <= args.s3_presign_seconds <= 604800:
         raise SystemExit("--s3-poll-seconds must be positive; --s3-presign-seconds must be 1..604800")
     s3_config = None
@@ -380,7 +383,8 @@ def main() -> None:
             "source_prefix": args.s3_source_prefix,
             "output_bucket": args.s3_output_bucket,
             "output_prefix": args.s3_output_prefix,
-            "region": args.s3_region,
+            "source_region": args.s3_source_region,
+            "output_region": args.s3_output_region or args.s3_source_region,
             "profile": args.s3_profile,
             "poll_seconds": args.s3_poll_seconds,
             "presign_seconds": args.s3_presign_seconds,

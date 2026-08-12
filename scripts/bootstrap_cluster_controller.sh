@@ -193,6 +193,7 @@ video_mask_s3_source_prefix: source/inbox/
 video_mask_s3_source_region: ''
 video_mask_s3_output_bucket: ''
 video_mask_s3_output_prefix: outputs/
+video_mask_s3_output_region: ''
 # Leave empty when this EC2 instance uses an IAM Role (the default production setup).
 video_mask_s3_profile: ''
 video_mask_s3_poll_seconds: 60
