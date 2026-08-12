@@ -81,6 +81,8 @@ class Autoscaler:
         self.controller_url = args.controller_url.rstrip("/")
         self.admin_token = args.admin_token or os.environ.get("VIDEO_MASK_ADMIN_TOKEN", "")
         self.pool_file = Path(args.pool_file)
+        self.pool_refresh_command = Path(args.pool_refresh_command)
+        self.pool_refresh_timeout_seconds = args.pool_refresh_timeout_seconds
         self.start_command = Path(args.start_command)
         self.stop_command = Path(args.stop_command)
         self.state_file = Path(args.state_file)
@@ -90,6 +92,8 @@ class Autoscaler:
         self.max_start_per_check = args.max_start_per_check
         self.max_stop_per_check = args.max_stop_per_check
         self.start_grace_seconds = args.start_grace_seconds
+        self.stop_grace_seconds = args.stop_grace_seconds
+        self.command_timeout_seconds = args.command_timeout_seconds
         self.pending_grace_seconds = args.pending_grace_seconds
         self.dry_run = args.dry_run
 
@@ -104,6 +108,27 @@ class Autoscaler:
             raise RuntimeError(f"unexpected Controller response from {path}")
         return payload
 
+    def refresh_pool(self) -> None:
+        """Ask the operations tooling to refresh EC2 states before planning.
+
+        Never act on a stale cached YAML file: in particular, a submitted stop
+        commonly transitions through ``stopping`` before it becomes ``stopped``.
+        """
+        if not self.pool_refresh_command.is_file():
+            raise RuntimeError(f"EC2 pool refresh command does not exist: {self.pool_refresh_command}")
+        invocation = ["sudo", "-n", str(self.pool_refresh_command)]
+        logging.info("Refreshing EC2 host pool: %s", " ".join(invocation))
+        try:
+            result = subprocess.run(invocation, text=True, capture_output=True, check=False,
+                                    timeout=self.pool_refresh_timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"EC2 pool refresh timed out after {self.pool_refresh_timeout_seconds}s"
+            ) from exc
+        if result.returncode:
+            diagnostic = "\n".join(value for value in (result.stdout, result.stderr) if value).strip()
+            raise RuntimeError(f"EC2 pool refresh failed: {diagnostic[-2000:]}")
+
     def queue_and_workers(self) -> tuple[int, float | None, list[dict[str, Any]]]:
         pending = self.api("/api/tasks?status=pending&limit=1")
         workers = self.api("/api/workers?limit=1000")
@@ -114,13 +139,14 @@ class Autoscaler:
         try:
             raw = json.loads(self.state_file.read_text())
         except FileNotFoundError:
-            return {"idle_since": {}, "start_requested_at": {}}
+            return {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}}
         except (OSError, json.JSONDecodeError) as exc:
             logging.warning("Ignoring unreadable autoscaler state %s: %s", self.state_file, exc)
-            return {"idle_since": {}, "start_requested_at": {}}
+            return {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}}
         return {
             "idle_since": {str(key): float(value) for key, value in (raw.get("idle_since") or {}).items()},
             "start_requested_at": {str(key): float(value) for key, value in (raw.get("start_requested_at") or {}).items()},
+            "stop_requested_at": {str(key): float(value) for key, value in (raw.get("stop_requested_at") or {}).items()},
         }
 
     def save_state(self, state: dict[str, dict[str, float]]) -> None:
@@ -142,13 +168,20 @@ class Autoscaler:
     def plan(self, hosts: list[PoolHost], workers: list[dict[str, Any]], pending: int,
              oldest_pending_created_at: float | None,
              state: dict[str, dict[str, float]], stamp: float) -> list[Action]:
+        # Accept state files created by earlier autoscaler versions.
+        state.setdefault("idle_since", {})
+        state.setdefault("start_requested_at", {})
+        state.setdefault("stop_requested_at", {})
         ready_slots = sum(1 for worker in workers if worker.get("status") == "ready")
         running = [host for host in hosts if host.status == "running"]
         stopped = [host for host in hosts if host.status == "stopped"]
 
-        # Clear cooldown state once the pool file reports a completed start.
+        # Clear action cooldown state only when the operations pool reports the
+        # corresponding EC2 state transition as complete.
         for host in running:
             state["start_requested_at"].pop(host.private_ip, None)
+        for host in stopped:
+            state["stop_requested_at"].pop(host.private_ip, None)
 
         needed_slots = max(0, pending - ready_slots)
         requested_capacity = sum(
@@ -183,6 +216,11 @@ class Autoscaler:
         # unknown/booting host is deliberately not eligible for shutdown.
         candidates: list[PoolHost] = []
         for host in running:
+            stop_requested_at = state["stop_requested_at"].get(host.private_ip, 0)
+            if stamp - stop_requested_at < self.stop_grace_seconds:
+                # The stop script may be waiting for AWS to reach `stopped`.
+                # Never send it again before the pool file confirms that state.
+                continue
             host_workers = self.host_workers(host, workers)
             statuses = {str(worker.get("status") or "") for worker in host_workers}
             if not host_workers or statuses != {"ready"}:
@@ -211,26 +249,35 @@ class Autoscaler:
                         action.reason, " ".join(invocation))
         if self.dry_run:
             return
-        result = subprocess.run(invocation, text=True, capture_output=True, check=False, timeout=300)
+        # Record before calling the slow operational command.  AWS requests can
+        # succeed while a script is still waiting for EC2 to settle; if that
+        # wait times out, the next autoscaler pass must not hammer the same IP.
+        request_key = "start_requested_at" if action.kind == "start" else "stop_requested_at"
+        state[request_key][action.host.private_ip] = stamp
+        result = subprocess.run(invocation, text=True, capture_output=True, check=False,
+                                timeout=self.command_timeout_seconds)
         if result.returncode:
             diagnostic = "\n".join(value for value in (result.stdout, result.stderr) if value).strip()
             raise RuntimeError(f"{action.kind} command failed for {action.host.private_ip}: {diagnostic[-2000:]}")
-        if action.kind == "start":
-            state["start_requested_at"][action.host.private_ip] = stamp
-        else:
+        if action.kind == "stop":
             state["idle_since"].pop(action.host.private_ip, None)
 
     def reconcile(self) -> list[Action]:
         if not self.admin_token:
             raise RuntimeError("VIDEO_MASK_ADMIN_TOKEN is required for autoscaling")
+        self.refresh_pool()
         hosts = load_pool(self.pool_file, self.managed_ips)
         pending, oldest_pending_created_at, workers = self.queue_and_workers()
         state = self.load_state()
         stamp = time.time()
         actions = self.plan(hosts, workers, pending, oldest_pending_created_at, state, stamp)
-        for action in actions:
-            self.execute(action, state, stamp)
-        self.save_state(state)
+        try:
+            for action in actions:
+                self.execute(action, state, stamp)
+        finally:
+            # Preserve a submitted start/stop action even when the operations
+            # script times out or returns an error after AWS accepted it.
+            self.save_state(state)
         logging.info("Autoscaler check: pending=%s, workers=%s, actions=%s", pending, len(workers),
                      ", ".join(f"{item.kind}:{item.host.private_ip}" for item in actions) or "none")
         return actions
@@ -240,6 +287,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Controller-side EC2 Worker autoscaler")
     parser.add_argument("--controller-url", required=True)
     parser.add_argument("--pool-file", required=True)
+    parser.add_argument("--pool-refresh-command", default="/opt/dataai-ec2/bin/ec2_pool.sh")
+    parser.add_argument("--pool-refresh-timeout-seconds", type=int, default=120)
     parser.add_argument("--start-command", required=True)
     parser.add_argument("--stop-command", required=True)
     parser.add_argument("--managed-ips", required=True, help="Comma-separated private IP allowlist")
@@ -251,12 +300,18 @@ def main() -> None:
     parser.add_argument("--max-start-per-check", type=int, default=1)
     parser.add_argument("--max-stop-per-check", type=int, default=1)
     parser.add_argument("--start-grace-seconds", type=int, default=900)
+    parser.add_argument("--stop-grace-seconds", type=int, default=1800,
+                        help="Do not repeat a stop request until the pool file reports stopped")
+    parser.add_argument("--command-timeout-seconds", type=int, default=900,
+                        help="Maximum time to wait for an operations start/stop script")
     parser.add_argument("--pending-grace-seconds", type=int, default=60,
                         help="Wait for a newly queued task to be claimed before starting EC2")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if (args.check_seconds < 5 or args.idle_shutdown_seconds < 60 or args.start_grace_seconds < 60
+            or args.stop_grace_seconds < 60 or args.command_timeout_seconds < 10
+            or args.pool_refresh_timeout_seconds < 10
             or args.pending_grace_seconds < 0):
         raise SystemExit("check/start grace must be at least 60 seconds and idle shutdown at least 60 seconds")
     if args.min_running_hosts < 0 or args.max_start_per_check < 1 or args.max_stop_per_check < 1:

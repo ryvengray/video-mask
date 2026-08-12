@@ -373,6 +373,18 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             f"<span class='summary-count'>{count} {html.escape(status)}</span>"
             for status, count in sorted(worker_status_counts.items())
         ) or "No registered slots"
+        worker_filter_options = "<option value=''>All statuses</option>" + "".join(
+            f"<option value='{html.escape(status, quote=True)}'>{html.escape(status)} ({count})</option>"
+            for status, count in sorted(worker_status_counts.items())
+        )
+        fleet_worker_rows = "".join(
+            f"<tr data-worker-status='{html.escape(str(worker.get('status') or 'unknown'), quote=True)}'>"
+            f"<td class='mono'>{html.escape(str(worker['worker_id']))}</td><td>{status_badge(worker['status'])}</td>"
+            f"<td>{host_for(worker)}</td><td>{html.escape(str((worker.get('capabilities') or {}).get('gpu', '-')))}</td>"
+            f"<td class='mono'>{html.escape(str(worker.get('current_task_id') or '-'))}</td>"
+            f"<td>{last_seen(worker.get('last_seen_at'))}</td></tr>"
+            for worker in workers
+        ) or "<tr><td colspan='6'>No workers registered</td></tr>"
         previous_link = (f'<a href="/?page={page - 1}">Previous</a>' if page > 1 else "Previous")
         next_link = (f'<a href="/?page={page + 1}">Next</a>' if page < total_pages else "Next")
         return f"""<!doctype html>
@@ -388,7 +400,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 table{{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}} th{{position:sticky;top:0;z-index:1;background:#f8f9fa;color:#3c4043;font-size:11px;text-transform:uppercase;letter-spacing:.5px;text-align:left;padding:12px 14px;border-bottom:1px solid var(--line);white-space:nowrap}} td{{padding:12px 14px;vertical-align:top;border-bottom:1px solid #edf0f2;max-width:300px;word-break:break-word}} tr:last-child td{{border-bottom:0}} tbody tr:hover{{background:#f8fbff}} small{{color:var(--muted);font-size:12px}} hr{{border:0;border-top:1px solid #edf0f2;margin:8px 0}} .mono{{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:12px}} .task-id{{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .badge{{display:inline-flex;align-items:center;border-radius:12px;font-size:12px;font-weight:600;padding:3px 9px;white-space:nowrap}} .success{{color:var(--green);background:var(--green-soft)}} .active{{color:#174ea6;background:var(--blue-soft)}} .pending{{color:#5f6368;background:#f1f3f4}} .warning{{color:var(--yellow);background:var(--yellow-soft)}} .danger{{color:var(--red);background:var(--red-soft)}} .muted{{color:#5f6368;background:#f1f3f4}}
 .pagination{{display:flex;justify-content:flex-end;align-items:center;gap:16px;padding:12px 14px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}} .pagination a{{color:var(--blue);text-decoration:none;font-weight:500}} .pagination a:hover{{text-decoration:underline}}
-.fleet-title{{padding:16px 18px 12px}} .fleet-title h2{{margin-bottom:4px}} .fleet-summary{{padding:0 18px 14px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--line)}} .summary-count{{margin-right:10px;white-space:nowrap}} .fleet-panel th,.fleet-panel td{{padding:10px 12px}} .fleet-panel td{{max-width:180px}} .fleet-panel .mono{{font-size:11px}}
+.fleet-title{{padding:16px 18px 12px}} .fleet-title h2{{margin-bottom:4px}} .fleet-summary{{padding:0 18px 14px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--line)}} .fleet-controls{{display:flex;align-items:center;gap:8px;margin-left:auto}} .fleet-filter{{appearance:auto;border:1px solid var(--line);background:var(--surface);border-radius:4px;color:var(--ink);font:12px Arial,Roboto,sans-serif;padding:6px 24px 6px 8px}} .summary-count{{margin-right:10px;white-space:nowrap}} .fleet-panel th,.fleet-panel td{{padding:10px 12px}} .fleet-panel td{{max-width:180px}} .fleet-panel .mono{{font-size:11px}}
 @media(max-width:1120px){{.operations-grid{{grid-template-columns:1fr}}.worker-table{{height:420px;min-height:0;max-height:420px}}}} @media(max-width:850px){{.topbar{{padding:0 18px}}.shell{{padding:20px 18px}}.metrics{{grid-template-columns:repeat(2,minmax(130px,1fr));gap:10px}}.metric{{padding:13px}}.task-table{{min-height:360px}}.updated{{display:none}}}}
 </style></head><body>
 <header class="topbar"><span class="brand-dot"></span><span class="brand">Video Mask</span><span class="subtle">Operations</span><span class="updated">Auto-refreshes every 60 seconds · {html.escape(dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))}</span></header>
@@ -401,9 +413,13 @@ table{{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}} th{
   </section>
   <section class="operations-grid">
     <div><div class="section-head"><h2>Tasks</h2><span class="subtle">{total_tasks} total</span></div><section class="panel"><div class="table-scroll task-table"><table><thead><tr><th>Task</th><th>Status</th><th>Worker</th><th>Files</th><th>Time</th><th>Algorithm / arguments</th><th>Attempts</th><th>Finished</th><th>Error</th></tr></thead><tbody>{task_items}</tbody></table></div><div class="pagination">{previous_link}<span>Page {page} of {total_pages} · {page_size} per page</span>{next_link}</div></section></div>
-    <aside><div class="section-head"><h2>Worker fleet</h2><span class="subtle">Live slots</span></div><section class="panel fleet-panel"><div class="fleet-title"><h2>{len(workers)} registered slots</h2><span class="subtle">Slot health and host details</span></div><div class="fleet-summary">{worker_summary}</div><div class="table-scroll worker-table"><table><thead><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>GPU</th><th>Current task</th><th>Last heartbeat</th></tr></thead><tbody>{''.join(f"<tr><td class='mono'>{html.escape(str(worker['worker_id']))}</td><td>{status_badge(worker['status'])}</td><td>{host_for(worker)}</td><td>{html.escape(str((worker.get('capabilities') or {}).get('gpu', '-')))}</td><td class='mono'>{html.escape(str(worker.get('current_task_id') or '-'))}</td><td>{last_seen(worker.get('last_seen_at'))}</td></tr>" for worker in workers) or "<tr><td colspan='6'>No workers registered</td></tr>"}</tbody></table></div></section></aside>
+    <aside><div class="section-head"><h2>Worker fleet</h2><span class="subtle">Live slots</span><label class="fleet-controls"><span class="subtle">Status</span><select id="worker-status-filter" class="fleet-filter" aria-label="Filter workers by status">{worker_filter_options}</select></label></div><section class="panel fleet-panel"><div class="fleet-title"><h2>{len(workers)} registered slots</h2><span class="subtle">Slot health and host details</span></div><div class="fleet-summary">{worker_summary}</div><div class="table-scroll worker-table"><table><thead><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>GPU</th><th>Current task</th><th>Last heartbeat</th></tr></thead><tbody id="worker-fleet-rows">{fleet_worker_rows}</tbody></table></div></section></aside>
   </section>
-</main></body></html>"""
+</main><script>
+const workerFilter=document.getElementById('worker-status-filter');
+const workerRows=document.querySelectorAll('#worker-fleet-rows tr[data-worker-status]');
+workerFilter.addEventListener('change',()=>{{const selected=workerFilter.value;workerRows.forEach(row=>{{row.hidden=Boolean(selected)&&row.dataset.workerStatus!==selected;}});}});
+</script></body></html>"""
 
     return app
 

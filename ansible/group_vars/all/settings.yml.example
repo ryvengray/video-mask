@@ -41,6 +41,8 @@ video_mask_autoscale_enabled: false
 # when autoscaler and Controller share the same machine.
 video_mask_autoscale_controller_url: http://127.0.0.1:8080
 video_mask_autoscale_pool_file: /opt/dataai-ec2/data/ec2_host_pool.yaml
+video_mask_autoscale_pool_refresh_command: /opt/dataai-ec2/bin/ec2_pool.sh
+video_mask_autoscale_pool_refresh_timeout_seconds: 120
 video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
 video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
 video_mask_autoscale_managed_ips: []
@@ -54,3 +56,7 @@ video_mask_autoscale_max_start_per_check: 1
 video_mask_autoscale_max_stop_per_check: 1
 # Avoid repeating start requests while EC2 boots and Worker slots register.
 video_mask_autoscale_start_grace_seconds: 900
+# A stop script may wait for AWS to finish. Record the submitted request and
+# do not repeat it while the pool still says running.
+video_mask_autoscale_stop_grace_seconds: 1800
+video_mask_autoscale_command_timeout_seconds: 900

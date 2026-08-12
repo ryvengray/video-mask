@@ -2,6 +2,8 @@ import argparse
 import time
 from pathlib import Path
 
+import pytest
+
 from cluster.autoscaler import Autoscaler, PoolHost, load_pool
 
 
@@ -10,6 +12,8 @@ def scaler_args(tmp_path: Path, **overrides):
         "controller_url": "http://127.0.0.1:8080",
         "admin_token": "x" * 16,
         "pool_file": str(tmp_path / "pool.yml"),
+        "pool_refresh_command": str(tmp_path / "ec2_pool.sh"),
+        "pool_refresh_timeout_seconds": 120,
         "start_command": str(tmp_path / "start_ec2.sh"),
         "stop_command": str(tmp_path / "stop_ec2.sh"),
         "state_file": str(tmp_path / "state.json"),
@@ -19,6 +23,8 @@ def scaler_args(tmp_path: Path, **overrides):
         "max_start_per_check": 1,
         "max_stop_per_check": 1,
         "start_grace_seconds": 900,
+        "stop_grace_seconds": 1800,
+        "command_timeout_seconds": 900,
         "pending_grace_seconds": 60,
         "dry_run": True,
     }
@@ -111,3 +117,24 @@ def test_newly_pending_task_waits_for_ready_worker_to_claim(tmp_path: Path):
                           state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp)
 
     assert actions == []
+
+
+def test_stop_grace_skips_a_host_while_its_prior_stop_is_still_settling(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path, min_running_hosts=0))
+    hosts = [PoolHost("172.31.35.195", "running", "slave-01"),
+             PoolHost("172.31.47.141", "running", "slave-02")]
+    stamp = time.time()
+    state = {"idle_since": {"172.31.35.195": stamp - 3600, "172.31.47.141": stamp - 3600},
+             "start_requested_at": {}, "stop_requested_at": {"172.31.35.195": stamp - 10}}
+
+    actions = scaler.plan(hosts, [worker("172.31.35.195"), worker("172.31.47.141")],
+                          pending=0, oldest_pending_created_at=None, state=state, stamp=stamp)
+
+    assert [(action.kind, action.host.private_ip) for action in actions] == [("stop", "172.31.47.141")]
+
+
+def test_pool_refresh_requires_an_operations_command(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path))
+
+    with pytest.raises(RuntimeError, match="refresh command does not exist"):
+        scaler.refresh_pool()

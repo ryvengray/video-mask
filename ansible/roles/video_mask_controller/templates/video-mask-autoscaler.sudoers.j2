@@ -2,3 +2,4 @@
 # operations pool file and invokes these two fixed management commands.
 ubuntu ALL=(root) NOPASSWD: {{ video_mask_autoscale_start_command | default('/opt/dataai-ec2/bin/start_ec2.sh') }} --ips *
 ubuntu ALL=(root) NOPASSWD: {{ video_mask_autoscale_stop_command | default('/opt/dataai-ec2/bin/stop_ec2.sh') }} --ips *
+ubuntu ALL=(root) NOPASSWD: {{ video_mask_autoscale_pool_refresh_command | default('/opt/dataai-ec2/bin/ec2_pool.sh') }}

@@ -312,6 +312,8 @@ bash scripts/deploy_controller.sh --restart
 video_mask_autoscale_enabled: true
 video_mask_autoscale_controller_url: http://127.0.0.1:8080
 video_mask_autoscale_pool_file: /opt/dataai-ec2/data/ec2_host_pool.yaml
+video_mask_autoscale_pool_refresh_command: /opt/dataai-ec2/bin/ec2_pool.sh
+video_mask_autoscale_pool_refresh_timeout_seconds: 120
 video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
 video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
 video_mask_autoscale_managed_ips:
@@ -324,6 +326,8 @@ video_mask_autoscale_min_running_hosts: 0
 video_mask_autoscale_max_start_per_check: 1
 video_mask_autoscale_max_stop_per_check: 1
 video_mask_autoscale_start_grace_seconds: 900 # EC2 启动和 Worker 注册的等待窗口
+video_mask_autoscale_stop_grace_seconds: 1800 # stop 已提交后不重复下发的等待窗口
+video_mask_autoscale_command_timeout_seconds: 900 # 运维启停脚本最长等待 15 分钟
 ```
 
 部署 Controller：
@@ -360,7 +364,7 @@ sudo systemd-run --wait --collect --pipe \
   --once --dry-run
 ```
 
-前提：机器池 YAML 的 `status` 必须由运维脚本或其刷新机制及时更新；Worker slot 服务必须是 `enabled`，让实例启动后自动注册。新任务先等待 `video_mask_autoscale_pending_grace_seconds`（默认 60 秒），给已有空闲 Worker 的下一轮轮询/领取机会；仅当队列持续积压且 `pending > ready slots` 时才扩容。若机器池状态长时间未更新，autoscaler 的 15 分钟启动等待窗口会避免重复 start，但应先修复运维侧刷新再长期启用。
+每一轮 autoscaler 都先执行 `/opt/dataai-ec2/bin/ec2_pool.sh`，仅在该命令成功后读取 YAML；刷新失败时该轮不会启动或关闭任何机器。YAML 中仅 `running` 的机器可参与缩容，`stopped` 的机器可参与扩容；`stopping`、`pending` 等任何其他状态一律跳过。Worker slot 服务必须是 `enabled`，让实例启动后自动注册。新任务先等待 `video_mask_autoscale_pending_grace_seconds`（默认 60 秒），给已有空闲 Worker 的下一轮轮询/领取机会；仅当队列持续积压且 `pending > ready slots` 时才扩容。
 
 ## 8. 上线验收清单
 
