@@ -123,6 +123,24 @@ class ClusterStore:
         return self.worker(worker_id) or {}
 
     @synchronized
+    def retire_worker(self, worker_id: str) -> dict[str, Any]:
+        """Remove a deliberately disabled idle Worker slot registration.
+
+        This is an administrator action used after Ansible has stopped a slot
+        while reducing a host's configured concurrency.  It never removes a
+        slot that still has a task lease, so an accidental slot reduction
+        cannot hide an active task from stale-worker recovery.
+        """
+        worker = self.worker(worker_id)
+        if worker is None:
+            return {"worker_id": worker_id, "retired": False}
+        if worker.get("current_task_id") or worker.get("status") not in {"ready", "offline"}:
+            raise ValueError("only an idle ready or offline worker slot can be retired")
+        self.conn.execute("DELETE FROM workers WHERE worker_id=?", (worker_id,))
+        self.conn.commit()
+        return {"worker_id": worker_id, "retired": True}
+
+    @synchronized
     def register_worker(self, worker_id: str, token: str,
                         capabilities: dict[str, Any]) -> dict[str, Any]:
         stamp = now()

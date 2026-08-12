@@ -209,6 +209,27 @@ def test_provisioning_with_the_same_token_preserves_an_active_worker(tmp_path: P
     store.close()
 
 
+def test_retire_removes_only_idle_worker_slots(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01-slot-2", TOKEN)
+    store.register_worker("worker-01-slot-2", TOKEN, {})
+
+    assert store.retire_worker("worker-01-slot-2") == {
+        "worker_id": "worker-01-slot-2", "retired": True,
+    }
+    assert store.worker("worker-01-slot-2") is None
+    assert store.retire_worker("worker-01-slot-9")["retired"] is False
+
+    store.provision_worker("worker-01-slot-3", TOKEN)
+    store.register_worker("worker-01-slot-3", TOKEN, {})
+    task = store.create_task(task_payload())
+    store.claim("worker-01-slot-3", TOKEN)
+    with pytest.raises(ValueError, match="only an idle"):
+        store.retire_worker("worker-01-slot-3")
+    assert store.worker("worker-01-slot-3")["current_task_id"] == task["task_id"]
+    store.close()
+
+
 def test_active_task_lookup_rejects_a_different_worker_or_terminal_task(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)
