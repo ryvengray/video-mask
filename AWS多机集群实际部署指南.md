@@ -339,16 +339,23 @@ Ansible 会为 `ubuntu` 安装最小 sudo 权限，仅允许 autoscaler 调用�
 /opt/dataai-ec2/bin/stop_ec2.sh
 ```
 
-首次建议先手工以 dry-run 核验决策，确认日志只显示预期 IP 后再部署正式服务：
+首次建议先手工以 dry-run 核验决策，确认日志只显示预期 IP 后再部署正式服务。必须通过临时 systemd service 运行：它会安全读取 root-only 的 `/etc/video-mask-controller.env`，不把 Admin Token 写进命令行、终端历史或环境变量文件。
 
 ```bash
-sudo -u ubuntu /home/ubuntu/video-mask/.venv/bin/python -m cluster.autoscaler \
+sudo systemd-run --wait --collect --pipe \
+  --unit=video-mask-autoscaler-dry-run \
+  --property=User=ubuntu \
+  --property=WorkingDirectory=/home/ubuntu/video-mask \
+  --property=EnvironmentFile=/etc/video-mask-controller.env \
+  /home/ubuntu/video-mask/.venv/bin/python -m cluster.autoscaler \
   --controller-url http://127.0.0.1:8080 \
   --pool-file /opt/dataai-ec2/data/ec2_host_pool.yaml \
   --start-command /opt/dataai-ec2/bin/start_ec2.sh \
   --stop-command /opt/dataai-ec2/bin/stop_ec2.sh \
   --managed-ips 172.31.35.195,172.31.47.141 \
-  --idle-shutdown-seconds 1800 --once --dry-run
+  --idle-shutdown-seconds 1800 \
+  --state-file /tmp/video-mask-autoscaler-dry-run.json \
+  --once --dry-run
 ```
 
 前提：机器池 YAML 的 `status` 必须由运维脚本或其刷新机制及时更新；Worker slot 服务必须是 `enabled`，让实例启动后自动注册。若机器池状态长时间未更新，autoscaler 的 15 分钟启动等待窗口会避免重复 start，但应先修复运维侧刷新再长期启用。

@@ -257,6 +257,10 @@ def main() -> None:
             scaler.reconcile()
         except Exception as exc:
             logging.exception("Autoscaler check failed: %s", exc)
+            # A manual --once check is an operator command: make failure
+            # visible to its caller instead of returning a misleading 0.
+            if args.once:
+                raise
         if args.once:
             return
         time.sleep(args.check_seconds)
