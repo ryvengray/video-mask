@@ -300,7 +300,60 @@ bash scripts/deploy_controller.sh --restart
 
 当前 Controller 页面是只读状态页；Worker 上下线使用对应主机的 `systemctl start|stop video-mask-worker@slot-1`。管理脚本可立即取消 pending 任务；对于运行中的任务，会请求 Worker 在下一次心跳（最长约 15 秒）终止算法并标记为 `cancelled`。已完成、失败或取消的任务可由脚本重新入队，无需删除 Controller SQLite 数据库。
 
-## 7. 上线验收清单
+## 7. 按任务量自动启动和关闭 Worker EC2
+
+当运维提供的 EC2 机器池文件和启停脚本都安装在 Controller 上时，可启用 Controller 侧 autoscaler。它不运行在 Worker 上，也不会将 AWS 凭证或 EC2 启停权限下发到 Worker。
+
+它会每分钟读取 Controller 队列与 `/opt/dataai-ec2/data/ec2_host_pool.yaml`：当 `pending` 任务数大于 `ready` slot 数时，从白名单内 `stopped` 的机器中启动一台；当没有 pending 任务，且一台机器的全部已注册 slot 都持续 `ready` 达到指定时间时，才关闭该机器。`busy`、下载中、处理中、上传中、取消中，以及尚未注册到 Controller 的机器均不会被关闭。
+
+在 `ansible/group_vars/all/settings.yml` 添加（IP 必须是你允许本系统自动启停的 Worker 私网 IP）：
+
+```yaml
+video_mask_autoscale_enabled: true
+video_mask_autoscale_pool_file: /opt/dataai-ec2/data/ec2_host_pool.yaml
+video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
+video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
+video_mask_autoscale_managed_ips:
+  - 172.31.35.195 # slave-01
+  - 172.31.47.141 # slave-02
+video_mask_autoscale_check_seconds: 60
+video_mask_autoscale_idle_shutdown_seconds: 1800 # 30 分钟
+video_mask_autoscale_min_running_hosts: 0
+video_mask_autoscale_max_start_per_check: 1
+video_mask_autoscale_max_stop_per_check: 1
+video_mask_autoscale_start_grace_seconds: 900 # EC2 启动和 Worker 注册的等待窗口
+```
+
+部署 Controller：
+
+```bash
+bash scripts/deploy_controller.sh --restart
+sudo systemctl status video-mask-autoscaler --no-pager
+sudo journalctl -u video-mask-autoscaler -f
+```
+
+Ansible 会为 `ubuntu` 安装最小 sudo 权限，仅允许 autoscaler 调用以下两个固定脚本并传入 `--ips`：
+
+```text
+/opt/dataai-ec2/bin/start_ec2.sh
+/opt/dataai-ec2/bin/stop_ec2.sh
+```
+
+首次建议先手工以 dry-run 核验决策，确认日志只显示预期 IP 后再部署正式服务：
+
+```bash
+sudo -u ubuntu /home/ubuntu/video-mask/.venv/bin/python -m cluster.autoscaler \
+  --controller-url http://127.0.0.1:8080 \
+  --pool-file /opt/dataai-ec2/data/ec2_host_pool.yaml \
+  --start-command /opt/dataai-ec2/bin/start_ec2.sh \
+  --stop-command /opt/dataai-ec2/bin/stop_ec2.sh \
+  --managed-ips 172.31.35.195,172.31.47.141 \
+  --idle-shutdown-seconds 1800 --once --dry-run
+```
+
+前提：机器池 YAML 的 `status` 必须由运维脚本或其刷新机制及时更新；Worker slot 服务必须是 `enabled`，让实例启动后自动注册。若机器池状态长时间未更新，autoscaler 的 15 分钟启动等待窗口会避免重复 start，但应先修复运维侧刷新再长期启用。
+
+## 8. 上线验收清单
 
 - [ ] Controller 和所有 Worker 均为 Ubuntu，Controller API 仅对 Worker 安全组开放 TCP 8080。
 - [ ] `nvidia-smi`、`torch.cuda.is_available()`、ONNX Runtime CUDA Provider 均在每台 Worker 可用。
@@ -308,3 +361,4 @@ bash scripts/deploy_controller.sh --restart
 - [ ] Git Deploy Key、Ansible Vault 密码、`terraform-host.pem` 不在 Git 工作区或日志中。
 - [ ] 以一个短视频验证 S3 下载、打码、S3 上传、哈希和时长记录全链路。
 - [ ] 再以多个视频和至少两台 Worker 验证并发领取；一台 Worker 停止后验证心跳超时重试。
+- [ ] autoscaler 先以 `--once --dry-run` 验证，再用一条 pending 任务验证仅启动一个 stopped Worker；最后以空闲阈值验证不会关闭 busy 或未注册的机器。

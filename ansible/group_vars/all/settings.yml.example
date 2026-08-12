@@ -34,3 +34,17 @@ video_mask_s3_output_region: ''
 video_mask_s3_profile: ''
 video_mask_s3_poll_seconds: 60
 video_mask_s3_presign_seconds: 86400
+# Optional Controller-side EC2 autoscaling. It is disabled by default and can
+# manage only the explicitly listed private IPs in the operations pool file.
+video_mask_autoscale_enabled: false
+video_mask_autoscale_pool_file: /opt/dataai-ec2/data/ec2_host_pool.yaml
+video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
+video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
+video_mask_autoscale_managed_ips: []
+video_mask_autoscale_check_seconds: 60
+video_mask_autoscale_idle_shutdown_seconds: 1800
+video_mask_autoscale_min_running_hosts: 0
+video_mask_autoscale_max_start_per_check: 1
+video_mask_autoscale_max_stop_per_check: 1
+# Avoid repeating start requests while EC2 boots and Worker slots register.
+video_mask_autoscale_start_grace_seconds: 900

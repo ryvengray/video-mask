@@ -3,3 +3,4 @@ fastapi>=0.110,<1
 uvicorn[standard]>=0.27,<1
 # Reserved for the S3 ingestion adapter; EC2 IAM Roles provide credentials.
 boto3>=1.34,<2
+PyYAML>=6.0,<7

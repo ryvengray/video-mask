@@ -51,6 +51,31 @@
     virtualenv: "{{ video_mask_app_dir }}/.venv"
     virtualenv_command: python3 -m venv
 
+- name: Validate EC2 autoscaling configuration
+  ansible.builtin.assert:
+    that:
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_managed_ips | default([]) | length > 0)
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_check_seconds | default(60) | int >= 5)
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_idle_shutdown_seconds | default(1800) | int >= 60)
+    fail_msg: Autoscaling requires at least one explicitly allowlisted Worker IP and safe timing values.
+
+- name: Check Controller-local autoscaling dependencies
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ video_mask_autoscale_pool_file }}"
+    - "{{ video_mask_autoscale_start_command }}"
+    - "{{ video_mask_autoscale_stop_command }}"
+  register: video_mask_autoscale_dependencies
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Require Controller-local autoscaling dependencies
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "Required autoscaling file is missing on the Controller: {{ item.stat.path }}"
+  loop: "{{ video_mask_autoscale_dependencies.results | default([]) }}"
+  when: video_mask_autoscale_enabled | default(false) | bool
+
 - name: Create controller state directory
   ansible.builtin.file:
     path: /var/lib/video-mask-controller
@@ -58,6 +83,15 @@
     owner: ubuntu
     group: ubuntu
     mode: '0750'
+
+- name: Create autoscaler state directory
+  ansible.builtin.file:
+    path: /var/lib/video-mask-autoscaler
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+  when: video_mask_autoscale_enabled | default(false) | bool
 
 - name: Install controller environment file
   ansible.builtin.template:
@@ -78,6 +112,50 @@
   notify:
     - Reload systemd controller
     - Restart video-mask controller
+
+- name: Allow autoscaler to run approved EC2 operations scripts
+  ansible.builtin.template:
+    src: video-mask-autoscaler.sudoers.j2
+    dest: /etc/sudoers.d/video-mask-autoscaler
+    owner: root
+    group: root
+    mode: '0440'
+    validate: visudo -cf %s
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Remove autoscaler sudo permission when autoscaling is disabled
+  ansible.builtin.file:
+    path: /etc/sudoers.d/video-mask-autoscaler
+    state: absent
+  when: not (video_mask_autoscale_enabled | default(false) | bool)
+
+- name: Install autoscaler systemd service
+  ansible.builtin.template:
+    src: video-mask-autoscaler.service.j2
+    dest: /etc/systemd/system/video-mask-autoscaler.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - Reload systemd controller
+    - Restart video-mask autoscaler
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Disable autoscaler when not configured
+  ansible.builtin.systemd:
+    name: video-mask-autoscaler
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: not (video_mask_autoscale_enabled | default(false) | bool)
+
+- name: Enable autoscaler service
+  ansible.builtin.systemd:
+    name: video-mask-autoscaler
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: video_mask_autoscale_enabled | default(false) | bool
 
 - name: Enable controller service
   ansible.builtin.systemd:

@@ -7,3 +7,8 @@
   ansible.builtin.systemd:
     name: video-mask-controller
     state: restarted
+
+- name: Restart video-mask autoscaler
+  ansible.builtin.systemd:
+    name: video-mask-autoscaler
+    state: restarted

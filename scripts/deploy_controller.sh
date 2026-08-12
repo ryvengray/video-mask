@@ -39,6 +39,10 @@ COMMAND+=("${EXTRA_ARGS[@]}")
 
 if [[ "$RESTART" -eq 1 ]]; then
   sudo systemctl restart video-mask-controller
+  sudo systemctl try-restart video-mask-autoscaler
 fi
 sudo systemctl status video-mask-controller --no-pager
 curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+if systemctl is-enabled video-mask-autoscaler >/dev/null 2>&1; then
+  sudo systemctl status video-mask-autoscaler --no-pager
+fi

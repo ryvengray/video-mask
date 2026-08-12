@@ -1,0 +1,4 @@
+# Managed by Ansible. The autoscaler selects IPs only from its allowlisted
+# operations pool file and invokes these two fixed management commands.
+ubuntu ALL=(root) NOPASSWD: {{ video_mask_autoscale_start_command }} --ips *
+ubuntu ALL=(root) NOPASSWD: {{ video_mask_autoscale_stop_command }} --ips *

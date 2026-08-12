@@ -1,0 +1,16 @@
+[Unit]
+Description=Video Mask EC2 Worker Autoscaler
+After=network-online.target video-mask-controller.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+EnvironmentFile=/etc/video-mask-controller.env
+WorkingDirectory={{ video_mask_app_dir }}
+ExecStart={{ video_mask_app_dir }}/.venv/bin/python -m cluster.autoscaler --controller-url {{ video_mask_controller_url }} --pool-file {{ video_mask_autoscale_pool_file }} --start-command {{ video_mask_autoscale_start_command }} --stop-command {{ video_mask_autoscale_stop_command }} --managed-ips {{ video_mask_autoscale_managed_ips | join(',') }} --state-file /var/lib/video-mask-autoscaler/state.json --check-seconds {{ video_mask_autoscale_check_seconds }} --idle-shutdown-seconds {{ video_mask_autoscale_idle_shutdown_seconds }} --min-running-hosts {{ video_mask_autoscale_min_running_hosts }} --max-start-per-check {{ video_mask_autoscale_max_start_per_check }} --max-stop-per-check {{ video_mask_autoscale_max_stop_per_check }} --start-grace-seconds {{ video_mask_autoscale_start_grace_seconds }}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
