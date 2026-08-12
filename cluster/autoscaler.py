@@ -8,6 +8,8 @@ calls the approved local start/stop scripts with one private IP at a time.
 from __future__ import annotations
 
 import argparse
+import copy
+import datetime as dt
 import ipaddress
 import json
 import logging
@@ -86,7 +88,13 @@ class Autoscaler:
         self.start_command = Path(args.start_command)
         self.stop_command = Path(args.stop_command)
         self.state_file = Path(args.state_file)
-        self.managed_ips = set(args.managed_ips.split(",")) - {""}
+        self.event_log = Path(args.event_log)
+        self.host_slots = self.parse_host_slots(args.host_slot or [])
+        # The configured capacity map is also the explicit allowlist of hosts
+        # that this autoscaler may start or stop.
+        self.managed_ips = set(self.host_slots)
+        if not self.managed_ips:
+            raise ValueError("at least one --host-slot PRIVATE_IP=SLOTS is required")
         self.idle_shutdown_seconds = args.idle_shutdown_seconds
         self.min_running_hosts = args.min_running_hosts
         self.max_start_per_check = args.max_start_per_check
@@ -96,6 +104,40 @@ class Autoscaler:
         self.command_timeout_seconds = args.command_timeout_seconds
         self.pending_grace_seconds = args.pending_grace_seconds
         self.dry_run = args.dry_run
+
+    def event(self, event: str, ip: str, **details: Any) -> None:
+        """Append a concise audit record for an autoscaler state transition."""
+        fields = " ".join(f"{name}={json.dumps(value, ensure_ascii=False)}"
+                          for name, value in sorted(details.items()))
+        line = f"{dt.datetime.now(dt.timezone.utc).isoformat()} event={event} ip={ip}"
+        if fields:
+            line += " " + fields
+        try:
+            self.event_log.parent.mkdir(parents=True, exist_ok=True)
+            with self.event_log.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            # A missing audit log must be visible, but must not make the
+            # autoscaler take an unsafe partial action.
+            logging.error("Cannot write autoscaler event log %s: %s", self.event_log, exc)
+
+    @staticmethod
+    def parse_host_slots(values: list[str]) -> dict[str, int]:
+        """Parse repeated ``PRIVATE_IP=SLOTS`` configuration values."""
+        result: dict[str, int] = {}
+        for value in values:
+            ip, separator, raw_slots = value.partition("=")
+            try:
+                ipaddress.ip_address(ip)
+                slots = int(raw_slots)
+            except ValueError as exc:
+                raise ValueError(f"invalid --host-slot value {value!r}; use PRIVATE_IP=SLOTS") from exc
+            if not separator or slots < 1 or slots > 16:
+                raise ValueError(f"invalid --host-slot value {value!r}; slots must be 1..16")
+            if ip in result:
+                raise ValueError(f"duplicate --host-slot entry for {ip}")
+            result[ip] = slots
+        return result
 
     def api(self, path: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -135,43 +177,96 @@ class Autoscaler:
         oldest = pending.get("oldest_created_at")
         return int(pending.get("total") or 0), float(oldest) if oldest is not None else None, list(workers.get("workers") or [])
 
-    def load_state(self) -> dict[str, dict[str, float]]:
+    def load_state(self) -> dict[str, dict[str, Any]]:
         try:
             raw = json.loads(self.state_file.read_text())
         except FileNotFoundError:
-            return {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}}
+            return {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}, "pool_status": {}}
         except (OSError, json.JSONDecodeError) as exc:
             logging.warning("Ignoring unreadable autoscaler state %s: %s", self.state_file, exc)
-            return {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}}
+            return {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}, "pool_status": {}}
         return {
             "idle_since": {str(key): float(value) for key, value in (raw.get("idle_since") or {}).items()},
             "start_requested_at": {str(key): float(value) for key, value in (raw.get("start_requested_at") or {}).items()},
             "stop_requested_at": {str(key): float(value) for key, value in (raw.get("stop_requested_at") or {}).items()},
+            "pool_status": {str(key): str(value) for key, value in (raw.get("pool_status") or {}).items()},
         }
 
-    def save_state(self, state: dict[str, dict[str, float]]) -> None:
+    def save_state(self, state: dict[str, dict[str, Any]]) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_file.with_suffix(".tmp")
         temporary.write_text(json.dumps(state, sort_keys=True) + "\n")
         temporary.replace(self.state_file)
 
+    def record_state_events(self, before: dict[str, dict[str, Any]],
+                            after: dict[str, dict[str, Any]]) -> None:
+        """Record idle and EC2 transition state changes without poll noise."""
+        for ip in sorted(set(after["idle_since"]) - set(before["idle_since"])):
+            self.event("idle_since_set", ip, timestamp=after["idle_since"][ip])
+        for ip in sorted(set(before["idle_since"]) - set(after["idle_since"])):
+            self.event("idle_since_cleared", ip, previous_timestamp=before["idle_since"][ip])
+        for ip in sorted(set(after["start_requested_at"]) - set(before["start_requested_at"])):
+            self.event("start_requested", ip, timestamp=after["start_requested_at"][ip])
+        for ip in sorted(set(before["stop_requested_at"]) - set(after["stop_requested_at"])):
+            self.event("stop_requested", ip, timestamp=after["stop_requested_at"][ip])
+        for name in ("start_requested_at", "stop_requested_at"):
+            event = "start_confirmed" if name == "start_requested_at" else "stop_confirmed"
+            for ip in sorted(set(before[name]) - set(after[name])):
+                self.event(event, ip, requested_at=before[name][ip])
+        for ip in sorted(set(after["pool_status"]) | set(before["pool_status"])):
+            old_status = before["pool_status"].get(ip)
+            new_status = after["pool_status"].get(ip)
+            if old_status != new_status:
+                self.event("pool_status_changed", ip, previous_status=old_status, status=new_status)
+
+    @staticmethod
+    def sync_pool_status(hosts: list[PoolHost], state: dict[str, dict[str, Any]]) -> None:
+        state.setdefault("pool_status", {})
+        state["pool_status"] = {host.private_ip: host.status for host in hosts}
+
     @staticmethod
     def host_workers(host: PoolHost, workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [worker for worker in workers if worker_ip(worker) == host.private_ip]
 
-    @staticmethod
-    def estimated_slots(host: PoolHost, workers: list[dict[str, Any]]) -> int:
-        # A deployed, stopped Worker has historical slot rows. For a host that
-        # has never registered, conservatively assume one slot.
-        return max(1, len(Autoscaler.host_workers(host, workers)))
+    def estimated_slots(self, host: PoolHost, workers: list[dict[str, Any]]) -> int:
+        """Return configured physical-host capacity, falling back safely.
+
+        Retired slots intentionally disappear from the Controller database, so
+        stopped hosts must have a configured capacity to be selected correctly.
+        The fallback preserves compatibility but logs the configuration gap.
+        """
+        configured = self.host_slots.get(host.private_ip)
+        if configured is not None:
+            return configured
+        registered = len(self.host_workers(host, workers))
+        if registered:
+            return registered
+        logging.warning("No slot capacity configured for %s; assuming one slot", host.private_ip)
+        return 1
+
+    def start_candidates(self, hosts: list[PoolHost], workers: list[dict[str, Any]],
+                         remaining_slots: int, state: dict[str, dict[str, Any]],
+                         stamp: float) -> list[PoolHost]:
+        """Choose the smallest host that covers the missing capacity first."""
+        eligible = [
+            host for host in hosts
+            if stamp - state["start_requested_at"].get(host.private_ip, 0) >= self.start_grace_seconds
+        ]
+        enough = [host for host in eligible if self.estimated_slots(host, workers) >= remaining_slots]
+        if enough:
+            return sorted(enough, key=lambda host: (self.estimated_slots(host, workers), host.private_ip))
+        # No individual machine can cover the shortfall. Start the largest one
+        # first, then subsequent planning iterations can fill any remainder.
+        return sorted(eligible, key=lambda host: (-self.estimated_slots(host, workers), host.private_ip))
 
     def plan(self, hosts: list[PoolHost], workers: list[dict[str, Any]], pending: int,
              oldest_pending_created_at: float | None,
-             state: dict[str, dict[str, float]], stamp: float) -> list[Action]:
+             state: dict[str, dict[str, Any]], stamp: float) -> list[Action]:
         # Accept state files created by earlier autoscaler versions.
         state.setdefault("idle_since", {})
         state.setdefault("start_requested_at", {})
         state.setdefault("stop_requested_at", {})
+        state.setdefault("pool_status", {})
         ready_slots = sum(1 for worker in workers if worker.get("status") == "ready")
         running = [host for host in hosts if host.status == "running"]
         stopped = [host for host in hosts if host.status == "stopped"]
@@ -192,17 +287,16 @@ class Autoscaler:
         actions: list[Action] = []
         pending_age = max(0, stamp - oldest_pending_created_at) if oldest_pending_created_at else 0
         if needed_slots > requested_capacity and pending_age >= self.pending_grace_seconds:
-            for host in stopped:
+            remaining_slots = needed_slots - requested_capacity
+            for host in self.start_candidates(stopped, workers, remaining_slots, state, stamp):
                 if len(actions) >= self.max_start_per_check:
                     break
-                last_request = state["start_requested_at"].get(host.private_ip, 0)
-                if stamp - last_request < self.start_grace_seconds:
-                    continue
+                capacity = self.estimated_slots(host, workers)
                 actions.append(Action("start", host,
                                       f"{pending} pending task(s) waited {round(pending_age)}s, "
-                                      f"{ready_slots} ready slot(s)"))
-                needed_slots -= self.estimated_slots(host, workers)
-                if needed_slots <= requested_capacity:
+                                      f"{ready_slots} ready slot(s), starting {capacity}-slot host"))
+                remaining_slots -= capacity
+                if remaining_slots <= 0:
                     break
             return actions  # Never scale down while the queue needs capacity.
 
@@ -240,7 +334,7 @@ class Autoscaler:
                                   f"{self.idle_shutdown_seconds}s"))
         return actions
 
-    def execute(self, action: Action, state: dict[str, dict[str, float]], stamp: float) -> None:
+    def execute(self, action: Action, state: dict[str, dict[str, Any]], stamp: float) -> None:
         command = self.start_command if action.kind == "start" else self.stop_command
         if not command.is_file():
             raise RuntimeError(f"{action.kind} command does not exist: {command}")
@@ -248,6 +342,7 @@ class Autoscaler:
         logging.warning("Autoscaler %s %s (%s): %s", action.kind, action.host.name,
                         action.reason, " ".join(invocation))
         if self.dry_run:
+            self.event(f"{action.kind}_dry_run", action.host.private_ip, reason=action.reason)
             return
         # Record before calling the slow operational command.  AWS requests can
         # succeed while a script is still waiting for EC2 to settle; if that
@@ -269,7 +364,9 @@ class Autoscaler:
         hosts = load_pool(self.pool_file, self.managed_ips)
         pending, oldest_pending_created_at, workers = self.queue_and_workers()
         state = self.load_state()
+        previous_state = copy.deepcopy(state)
         stamp = time.time()
+        self.sync_pool_status(hosts, state)
         actions = self.plan(hosts, workers, pending, oldest_pending_created_at, state, stamp)
         try:
             for action in actions:
@@ -277,6 +374,7 @@ class Autoscaler:
         finally:
             # Preserve a submitted start/stop action even when the operations
             # script times out or returns an error after AWS accepted it.
+            self.record_state_events(previous_state, state)
             self.save_state(state)
         logging.info("Autoscaler check: pending=%s, workers=%s, actions=%s", pending, len(workers),
                      ", ".join(f"{item.kind}:{item.host.private_ip}" for item in actions) or "none")
@@ -291,8 +389,10 @@ def main() -> None:
     parser.add_argument("--pool-refresh-timeout-seconds", type=int, default=120)
     parser.add_argument("--start-command", required=True)
     parser.add_argument("--stop-command", required=True)
-    parser.add_argument("--managed-ips", required=True, help="Comma-separated private IP allowlist")
+    parser.add_argument("--host-slot", action="append", default=[], metavar="PRIVATE_IP=SLOTS",
+                        help="Configured Worker slot capacity and allowlisted host; repeat per host")
     parser.add_argument("--state-file", default="/var/lib/video-mask-autoscaler/state.json")
+    parser.add_argument("--event-log", default="/var/log/video-mask-autoscaler/events.log")
     parser.add_argument("--admin-token", help="Defaults to VIDEO_MASK_ADMIN_TOKEN")
     parser.add_argument("--check-seconds", type=int, default=60)
     parser.add_argument("--idle-shutdown-seconds", type=int, default=1800)

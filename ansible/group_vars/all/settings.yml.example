@@ -45,7 +45,9 @@ video_mask_autoscale_pool_refresh_command: /opt/dataai-ec2/bin/ec2_pool.sh
 video_mask_autoscale_pool_refresh_timeout_seconds: 120
 video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
 video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
-video_mask_autoscale_managed_ips: []
+# Physical Worker capacity and autoscaler allowlist. Required for accurate
+# expansion after a stopped machine's slots have been retired from Controller.
+video_mask_autoscale_host_slots: {}
 video_mask_autoscale_check_seconds: 60
 # Wait for an existing ready Worker to claim a newly queued task before
 # starting an EC2 instance.  Workers poll at 10 seconds by default.
@@ -60,3 +62,5 @@ video_mask_autoscale_start_grace_seconds: 900
 # do not repeat it while the pool still says running.
 video_mask_autoscale_stop_grace_seconds: 1800
 video_mask_autoscale_command_timeout_seconds: 900
+# Event-only audit log; routine autoscaler polls remain in journald.
+video_mask_autoscale_event_log: /var/log/video-mask-autoscaler/events.log

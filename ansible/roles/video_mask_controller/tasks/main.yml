@@ -54,10 +54,10 @@
 - name: Validate EC2 autoscaling configuration
   ansible.builtin.assert:
     that:
-      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_managed_ips | default([]) | length > 0)
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_host_slots | default({}) | length > 0)
       - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_check_seconds | default(60) | int >= 5)
       - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_idle_shutdown_seconds | default(1800) | int >= 60)
-    fail_msg: Autoscaling requires at least one explicitly allowlisted Worker IP and safe timing values.
+    fail_msg: Autoscaling requires at least one Worker private-IP-to-slot-capacity entry and safe timing values.
 
 - name: Check Controller-local autoscaling dependencies
   ansible.builtin.stat:
@@ -93,6 +93,30 @@
     group: ubuntu
     mode: '0750'
   when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Create autoscaler event log directory
+  ansible.builtin.file:
+    path: "{{ (video_mask_autoscale_event_log | default('/var/log/video-mask-autoscaler/events.log')) | dirname }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Install autoscaler event log rotation
+  ansible.builtin.template:
+    src: video-mask-autoscaler.logrotate.j2
+    dest: /etc/logrotate.d/video-mask-autoscaler
+    owner: root
+    group: root
+    mode: '0644'
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Remove autoscaler event log rotation when disabled
+  ansible.builtin.file:
+    path: /etc/logrotate.d/video-mask-autoscaler
+    state: absent
+  when: not (video_mask_autoscale_enabled | default(false) | bool)
 
 - name: Install controller environment file
   ansible.builtin.template:

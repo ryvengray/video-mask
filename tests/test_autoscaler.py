@@ -17,7 +17,8 @@ def scaler_args(tmp_path: Path, **overrides):
         "start_command": str(tmp_path / "start_ec2.sh"),
         "stop_command": str(tmp_path / "stop_ec2.sh"),
         "state_file": str(tmp_path / "state.json"),
-        "managed_ips": "172.31.35.195,172.31.47.141",
+        "event_log": str(tmp_path / "events.log"),
+        "host_slot": ["172.31.35.195=15", "172.31.47.141=6"],
         "idle_shutdown_seconds": 1800,
         "min_running_hosts": 0,
         "max_start_per_check": 1,
@@ -65,6 +66,50 @@ def test_pending_work_starts_one_stopped_host(tmp_path: Path):
                           state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp)
 
     assert [(action.kind, action.host.private_ip) for action in actions] == [("start", "172.31.35.195")]
+
+
+def test_start_selection_uses_smallest_host_that_covers_pending_capacity(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path))
+    hosts = [PoolHost("172.31.35.195", "stopped", "15-slot"),
+             PoolHost("172.31.47.141", "stopped", "6-slot")]
+    stamp = time.time()
+
+    small_need = scaler.plan(hosts, [], pending=4, oldest_pending_created_at=stamp - 61,
+                             state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp)
+    large_need = scaler.plan(hosts, [], pending=7, oldest_pending_created_at=stamp - 61,
+                             state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp)
+
+    assert small_need[0].host.private_ip == "172.31.47.141"
+    assert large_need[0].host.private_ip == "172.31.35.195"
+
+
+def test_host_slot_values_require_a_private_ip_and_slot_count(tmp_path: Path):
+    with pytest.raises(ValueError, match="invalid --host-slot"):
+        Autoscaler(scaler_args(tmp_path, host_slot=["not-an-ip=3"]))
+
+
+def test_at_least_one_host_slot_is_required(tmp_path: Path):
+    with pytest.raises(ValueError, match="at least one --host-slot"):
+        Autoscaler(scaler_args(tmp_path, host_slot=[]))
+
+
+def test_event_log_records_state_transitions_without_poll_records(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path))
+    before = {"idle_since": {}, "start_requested_at": {}, "stop_requested_at": {}, "pool_status": {}}
+    after = {
+        "idle_since": {"172.31.47.141": 123.0},
+        "start_requested_at": {"172.31.35.195": 124.0},
+        "stop_requested_at": {},
+        "pool_status": {"172.31.35.195": "starting", "172.31.47.141": "running"},
+    }
+
+    scaler.record_state_events(before, after)
+    events = (tmp_path / "events.log").read_text()
+
+    assert "event=idle_since_set ip=172.31.47.141" in events
+    assert "event=start_requested ip=172.31.35.195" in events
+    assert "event=pool_status_changed ip=172.31.35.195" in events
+    assert "Autoscaler check" not in events
 
 
 def test_start_grace_prevents_repeating_the_same_ec2_start_request(tmp_path: Path):

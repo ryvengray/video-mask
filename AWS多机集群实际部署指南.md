@@ -318,9 +318,12 @@ video_mask_autoscale_pool_refresh_command: /opt/dataai-ec2/bin/ec2_pool.sh
 video_mask_autoscale_pool_refresh_timeout_seconds: 120
 video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
 video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
-video_mask_autoscale_managed_ips:
-  - 172.31.35.195 # slave-01
-  - 172.31.47.141 # slave-02
+# 每台物理 Worker 的已部署 slot 数。停机后 slot 会从 Controller 退役，
+# 因此 autoscaler 通过此配置准确选择最节约的启动目标；这些 IP 同时是
+# 唯一允许本 autoscaler 启停的机器白名单。
+video_mask_autoscale_host_slots:
+  172.31.35.195: 15
+  172.31.47.141: 6
 video_mask_autoscale_check_seconds: 60
 video_mask_autoscale_pending_grace_seconds: 60 # 新任务至少持续排队 1 分钟后才扩容
 video_mask_autoscale_idle_shutdown_seconds: 1800 # 30 分钟
@@ -338,6 +341,8 @@ video_mask_autoscale_command_timeout_seconds: 900 # 运维启停脚本最长等�
 bash scripts/deploy_controller.sh --restart
 sudo systemctl status video-mask-autoscaler --no-pager
 sudo journalctl -u video-mask-autoscaler -f
+# 只记录关键 autoscaler 状态变化和启停动作的审计日志。
+sudo tail -f /var/log/video-mask-autoscaler/events.log
 ```
 
 Ansible 会为 `ubuntu` 安装最小 sudo 权限，仅允许 autoscaler 调用以下两个固定脚本并传入 `--ips`：
@@ -360,13 +365,18 @@ sudo systemd-run --wait --collect --pipe \
   --pool-file /opt/dataai-ec2/data/ec2_host_pool.yaml \
   --start-command /opt/dataai-ec2/bin/start_ec2.sh \
   --stop-command /opt/dataai-ec2/bin/stop_ec2.sh \
-  --managed-ips 172.31.35.195,172.31.47.141 \
+  --host-slot 172.31.35.195=15 \
+  --host-slot 172.31.47.141=6 \
   --idle-shutdown-seconds 1800 \
   --state-file /tmp/video-mask-autoscaler-dry-run.json \
   --once --dry-run
 ```
 
 每一轮 autoscaler 都先执行 `/opt/dataai-ec2/bin/ec2_pool.sh`，仅在该命令成功后读取 YAML；刷新失败时该轮不会启动或关闭任何机器。YAML 中仅 `running` 的机器可参与缩容，`stopped` 的机器可参与扩容；`stopping`、`pending` 等任何其他状态一律跳过。Worker slot 服务必须是 `enabled`，让实例启动后自动注册。新任务先等待 `video_mask_autoscale_pending_grace_seconds`（默认 60 秒），给已有空闲 Worker 的下一轮轮询/领取机会；仅当队列持续积压且 `pending > ready slots` 时才扩容。
+
+关键 autoscaler 事件单独写入 `/var/log/video-mask-autoscaler/events.log`：`idle_since_set`、`idle_since_cleared`、`start_requested`、`start_confirmed`、`stop_requested`、`stop_confirmed` 以及机器池状态变化。普通每分钟检查仍只进入 `journalctl`，不会污染该审计日志。日志按天轮转，保留 30 天并压缩旧文件。
+
+`video_mask_autoscale_host_slots` 是唯一的受管机器配置：它的 key 同时构成启停白名单，value 必须反映各机器实际部署的 slot 数，尤其适用于机器 slot 数不一致的集群。扩容时 autoscaler 会选择容量**刚好覆盖缺口的最小 stopped 机器**（例如缺 4 个 slot 时选 6-slot 机器；缺 7 个时选 15-slot 机器），以减少空闲 GPU 容量和实例成本。
 
 ## 8. 上线验收清单
 
