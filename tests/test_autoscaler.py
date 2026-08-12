@@ -99,7 +99,7 @@ def test_event_log_records_state_transitions_without_poll_records(tmp_path: Path
     after = {
         "idle_since": {"172.31.47.141": 123.0},
         "start_requested_at": {"172.31.35.195": 124.0},
-        "stop_requested_at": {},
+        "stop_requested_at": {"172.31.47.141": 125.0},
         "pool_status": {"172.31.35.195": "starting", "172.31.47.141": "running"},
     }
 
@@ -108,6 +108,7 @@ def test_event_log_records_state_transitions_without_poll_records(tmp_path: Path
 
     assert "event=idle_since_set ip=172.31.47.141" in events
     assert "event=start_requested ip=172.31.35.195" in events
+    assert "event=stop_requested ip=172.31.47.141" in events
     assert "event=pool_status_changed ip=172.31.35.195" in events
     assert "Autoscaler check" not in events
 

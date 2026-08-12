@@ -207,7 +207,7 @@ class Autoscaler:
             self.event("idle_since_cleared", ip, previous_timestamp=before["idle_since"][ip])
         for ip in sorted(set(after["start_requested_at"]) - set(before["start_requested_at"])):
             self.event("start_requested", ip, timestamp=after["start_requested_at"][ip])
-        for ip in sorted(set(before["stop_requested_at"]) - set(after["stop_requested_at"])):
+        for ip in sorted(set(after["stop_requested_at"]) - set(before["stop_requested_at"])):
             self.event("stop_requested", ip, timestamp=after["stop_requested_at"][ip])
         for name in ("start_requested_at", "stop_requested_at"):
             event = "start_confirmed" if name == "start_requested_at" else "stop_confirmed"
