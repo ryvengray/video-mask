@@ -90,6 +90,7 @@ class Autoscaler:
         self.max_start_per_check = args.max_start_per_check
         self.max_stop_per_check = args.max_stop_per_check
         self.start_grace_seconds = args.start_grace_seconds
+        self.pending_grace_seconds = args.pending_grace_seconds
         self.dry_run = args.dry_run
 
     def api(self, path: str) -> dict[str, Any]:
@@ -103,10 +104,11 @@ class Autoscaler:
             raise RuntimeError(f"unexpected Controller response from {path}")
         return payload
 
-    def queue_and_workers(self) -> tuple[int, list[dict[str, Any]]]:
+    def queue_and_workers(self) -> tuple[int, float | None, list[dict[str, Any]]]:
         pending = self.api("/api/tasks?status=pending&limit=1")
         workers = self.api("/api/workers?limit=1000")
-        return int(pending.get("total") or 0), list(workers.get("workers") or [])
+        oldest = pending.get("oldest_created_at")
+        return int(pending.get("total") or 0), float(oldest) if oldest is not None else None, list(workers.get("workers") or [])
 
     def load_state(self) -> dict[str, dict[str, float]]:
         try:
@@ -138,6 +140,7 @@ class Autoscaler:
         return max(1, len(Autoscaler.host_workers(host, workers)))
 
     def plan(self, hosts: list[PoolHost], workers: list[dict[str, Any]], pending: int,
+             oldest_pending_created_at: float | None,
              state: dict[str, dict[str, float]], stamp: float) -> list[Action]:
         ready_slots = sum(1 for worker in workers if worker.get("status") == "ready")
         running = [host for host in hosts if host.status == "running"]
@@ -154,7 +157,8 @@ class Autoscaler:
             if stamp - state["start_requested_at"].get(host.private_ip, 0) < self.start_grace_seconds
         )
         actions: list[Action] = []
-        if needed_slots > requested_capacity:
+        pending_age = max(0, stamp - oldest_pending_created_at) if oldest_pending_created_at else 0
+        if needed_slots > requested_capacity and pending_age >= self.pending_grace_seconds:
             for host in stopped:
                 if len(actions) >= self.max_start_per_check:
                     break
@@ -162,13 +166,17 @@ class Autoscaler:
                 if stamp - last_request < self.start_grace_seconds:
                     continue
                 actions.append(Action("start", host,
-                                      f"{pending} pending task(s), {ready_slots} ready slot(s)"))
+                                      f"{pending} pending task(s) waited {round(pending_age)}s, "
+                                      f"{ready_slots} ready slot(s)"))
                 needed_slots -= self.estimated_slots(host, workers)
                 if needed_slots <= requested_capacity:
                     break
             return actions  # Never scale down while the queue needs capacity.
 
         if pending:
+            if needed_slots > requested_capacity:
+                logging.info("Autoscaler is waiting for pending tasks to age: %.0fs / %ss",
+                             pending_age, self.pending_grace_seconds)
             return actions
 
         # A host is eligible only when every registered slot is ready. An
@@ -216,10 +224,10 @@ class Autoscaler:
         if not self.admin_token:
             raise RuntimeError("VIDEO_MASK_ADMIN_TOKEN is required for autoscaling")
         hosts = load_pool(self.pool_file, self.managed_ips)
-        pending, workers = self.queue_and_workers()
+        pending, oldest_pending_created_at, workers = self.queue_and_workers()
         state = self.load_state()
         stamp = time.time()
-        actions = self.plan(hosts, workers, pending, state, stamp)
+        actions = self.plan(hosts, workers, pending, oldest_pending_created_at, state, stamp)
         for action in actions:
             self.execute(action, state, stamp)
         self.save_state(state)
@@ -243,10 +251,13 @@ def main() -> None:
     parser.add_argument("--max-start-per-check", type=int, default=1)
     parser.add_argument("--max-stop-per-check", type=int, default=1)
     parser.add_argument("--start-grace-seconds", type=int, default=900)
+    parser.add_argument("--pending-grace-seconds", type=int, default=60,
+                        help="Wait for a newly queued task to be claimed before starting EC2")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.check_seconds < 5 or args.idle_shutdown_seconds < 60 or args.start_grace_seconds < 60:
+    if (args.check_seconds < 5 or args.idle_shutdown_seconds < 60 or args.start_grace_seconds < 60
+            or args.pending_grace_seconds < 0):
         raise SystemExit("check/start grace must be at least 60 seconds and idle shutdown at least 60 seconds")
     if args.min_running_hosts < 0 or args.max_start_per_check < 1 or args.max_stop_per_check < 1:
         raise SystemExit("host limits must be non-negative, and per-check limits at least 1")

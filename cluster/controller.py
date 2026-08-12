@@ -226,6 +226,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {
             "tasks": store.list_tasks(page_size, page_offset, statuses),
             "total": store.count_tasks(statuses),
+            "oldest_created_at": store.oldest_task_created_at(statuses) if statuses else None,
             "limit": page_size,
             "offset": page_offset,
         }
@@ -307,9 +308,27 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 return "-"
             return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+        workers = store.list_workers(1000)
+        task_status_counts = {
+            status: store.count_tasks((status,))
+            for status in ("pending", "assigned", "downloading", "processing", "uploading", "cancelling", "completed", "failed", "cancelled")
+        }
+
+        def status_badge(status: Any) -> str:
+            value = str(status or "unknown")
+            tone = {
+                "ready": "success", "completed": "success",
+                "busy": "active", "assigned": "active", "downloading": "active",
+                "processing": "active", "uploading": "active",
+                "pending": "pending", "cancelling": "warning", "cancelled": "warning",
+                "offline": "muted", "failed": "danger",
+            }.get(value, "muted")
+            return f"<span class='badge {tone}'>{html.escape(value)}</span>"
+
         task_items = "".join(
-            f"<tr><td>{html.escape(str(task['task_id']))}</td><td>{html.escape(str(task['status']))}</td>"
-            f"<td>{html.escape(str(task['assigned_worker_id'] or '-'))}</td>"
+            f"<tr><td class='mono task-id' title='{html.escape(str(task['task_id']))}'>{html.escape(str(task['task_id']))}</td>"
+            f"<td>{status_badge(task['status'])}</td>"
+            f"<td class='mono'>{html.escape(str(task['assigned_worker_id'] or '-'))}</td>"
             f"<td>{task_file_info(task)}</td><td>{task_runtime(task)}</td>"
             f"<td>{html.escape(str(task.get('algorithm') or '-'))}<br><small>"
             f"{html.escape(' '.join(str(value) for value in (task.get('arguments') or [])))}</small></td>"
@@ -317,8 +336,6 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             f"<td>{html.escape(str(task.get('error_message') or '-'))}</td></tr>"
             for task in rows
         ) or "<tr><td colspan='9'>No tasks</td></tr>"
-        workers = store.list_workers(100)
-
         def slot_for(worker: dict[str, Any]) -> str:
             capabilities = worker.get("capabilities") or {}
             if capabilities.get("slot") is not None:
@@ -336,7 +353,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             return f"{html.escape(hostname)}<br><small>{html.escape(str(address))}</small>"
 
         worker_items = "".join(
-            f"<tr><td>{html.escape(str(worker['worker_id']))}</td><td>{html.escape(str(worker['status']))}</td>"
+            f"<tr><td class='mono'>{html.escape(str(worker['worker_id']))}</td><td>{status_badge(worker['status'])}</td>"
             f"<td>{host_for(worker)}</td><td>{html.escape(slot_for(worker))}</td>"
             f"<td>{html.escape(str((worker.get('capabilities') or {}).get('gpu', '-')))}</td>"
             f"<td>{html.escape(str((worker.get('capabilities') or {}).get('cuda_available', '-')))}</td>"
@@ -345,13 +362,48 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             f"<td>{last_seen(worker.get('last_seen_at'))}</td></tr>"
             for worker in workers
         ) or "<tr><td colspan='9'>No workers registered</td></tr>"
+        worker_status_counts: dict[str, int] = {}
+        for worker in workers:
+            status = str(worker.get("status") or "unknown")
+            worker_status_counts[status] = worker_status_counts.get(status, 0) + 1
+        ready_slots = worker_status_counts.get("ready", 0)
+        active_tasks = sum(task_status_counts[status] for status in
+                           ("assigned", "downloading", "processing", "uploading", "cancelling"))
+        worker_summary = " ".join(
+            f"<span class='summary-count'>{count} {html.escape(status)}</span>"
+            for status, count in sorted(worker_status_counts.items())
+        ) or "No registered slots"
         previous_link = (f'<a href="/?page={page - 1}">Previous</a>' if page > 1 else "Previous")
         next_link = (f'<a href="/?page={page + 1}">Next</a>' if page < total_pages else "Next")
-        return """<!doctype html><title>Video Mask Cluster</title>
-        <style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%;margin:0 0 2rem}td,th{border:1px solid #ddd;padding:.5rem;text-align:left;vertical-align:top;word-break:break-word}th{white-space:nowrap}h2{margin-top:2rem}hr{border:0;border-top:1px solid #ddd;margin:.4rem 0}.pagination{display:flex;gap:1rem;align-items:center;margin:.5rem 0 1rem}</style>
-        <h1>Video Mask Cluster</h1><h2>Workers</h2><table><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>Slot</th><th>GPU</th><th>CUDA</th><th>PID</th><th>Current task</th><th>Last heartbeat</th></tr>""" + worker_items + "</table>" + \
-            f"<h2>Tasks ({total_tasks})</h2><div class='pagination'>{previous_link}<span>Page {page} / {total_pages} · {page_size} per page</span>{next_link}</div>" + \
-            "<table><tr><th>Task</th><th>Status</th><th>Worker</th><th>Files</th><th>Time</th><th>Algorithm / arguments</th><th>Attempts</th><th>Finished</th><th>Error</th></tr>" + task_items + "</table>"
+        return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60"><title>Video Mask · Operations</title>
+<style>
+:root{{--ink:#202124;--muted:#5f6368;--line:#dadce0;--canvas:#f8f9fa;--surface:#fff;--blue:#1a73e8;--blue-soft:#e8f0fe;--green:#137333;--green-soft:#e6f4ea;--red:#b3261e;--red-soft:#fce8e6;--yellow:#b06000;--yellow-soft:#fef7e0}}
+*{{box-sizing:border-box}} body{{margin:0;background:var(--canvas);color:var(--ink);font:14px/1.45 Arial,Roboto,"Helvetica Neue",sans-serif}}
+.topbar{{height:64px;background:var(--surface);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 32px;gap:14px}} .brand{{font-size:20px;font-weight:500;letter-spacing:-.2px}} .brand-dot{{height:10px;width:10px;border-radius:50%;background:var(--blue)}} .updated{{margin-left:auto;color:var(--muted);font-size:12px}}
+.shell{{max-width:1800px;margin:0 auto;padding:26px 32px 40px}} h1,h2{{margin:0;font-weight:500}} h2{{font-size:18px}} .section-head{{display:flex;align-items:center;gap:12px;margin:30px 0 12px}} .section-head:first-child{{margin-top:0}} .subtle{{color:var(--muted);font-size:13px}}
+.metrics{{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:16px;margin:0 0 26px}} .metric{{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:17px 18px;min-height:92px;box-shadow:0 1px 2px rgba(60,64,67,.08)}} .metric-label{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.55px}} .metric-value{{font-size:29px;font-weight:500;margin-top:5px}} .metric-note{{color:var(--muted);font-size:12px}}
+.panel{{background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(60,64,67,.08)}} .table-scroll{{overflow:auto}} .task-table{{max-height:calc(100vh - 310px);min-height:420px}} .worker-table{{max-height:440px;border-top:1px solid var(--line)}}
+table{{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}} th{{position:sticky;top:0;z-index:1;background:#f8f9fa;color:#3c4043;font-size:11px;text-transform:uppercase;letter-spacing:.5px;text-align:left;padding:12px 14px;border-bottom:1px solid var(--line);white-space:nowrap}} td{{padding:12px 14px;vertical-align:top;border-bottom:1px solid #edf0f2;max-width:300px;word-break:break-word}} tr:last-child td{{border-bottom:0}} tbody tr:hover{{background:#f8fbff}} small{{color:var(--muted);font-size:12px}} hr{{border:0;border-top:1px solid #edf0f2;margin:8px 0}} .mono{{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:12px}} .task-id{{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.badge{{display:inline-flex;align-items:center;border-radius:12px;font-size:12px;font-weight:600;padding:3px 9px;white-space:nowrap}} .success{{color:var(--green);background:var(--green-soft)}} .active{{color:#174ea6;background:var(--blue-soft)}} .pending{{color:#5f6368;background:#f1f3f4}} .warning{{color:var(--yellow);background:var(--yellow-soft)}} .danger{{color:var(--red);background:var(--red-soft)}} .muted{{color:#5f6368;background:#f1f3f4}}
+.pagination{{display:flex;justify-content:flex-end;align-items:center;gap:16px;padding:12px 14px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}} .pagination a{{color:var(--blue);text-decoration:none;font-weight:500}} .pagination a:hover{{text-decoration:underline}}
+details{{overflow:hidden}} summary{{list-style:none;cursor:pointer;padding:16px 18px;display:flex;align-items:center;gap:12px;user-select:none}} summary::-webkit-details-marker{{display:none}} summary:before{{content:"›";font-size:24px;line-height:12px;color:var(--muted);transform:rotate(0);transition:transform .15s}} details[open] summary:before{{transform:rotate(90deg)}} .worker-meta{{margin-left:auto;color:var(--muted);font-size:12px}} .summary-count{{margin-left:8px;color:var(--muted)}}
+@media(max-width:850px){{.topbar{{padding:0 18px}}.shell{{padding:20px 18px}}.metrics{{grid-template-columns:repeat(2,minmax(130px,1fr));gap:10px}}.metric{{padding:13px}}.task-table{{min-height:360px}}.updated{{display:none}}}}
+</style></head><body>
+<header class="topbar"><span class="brand-dot"></span><span class="brand">Video Mask</span><span class="subtle">Operations</span><span class="updated">Auto-refreshes every 60 seconds · {html.escape(dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))}</span></header>
+<main class="shell">
+  <section class="metrics" aria-label="Cluster summary">
+    <div class="metric"><div class="metric-label">Queued</div><div class="metric-value">{task_status_counts['pending']}</div><div class="metric-note">Awaiting a slot</div></div>
+    <div class="metric"><div class="metric-label">Active tasks</div><div class="metric-value">{active_tasks}</div><div class="metric-note">Download, process, upload</div></div>
+    <div class="metric"><div class="metric-label">Ready slots</div><div class="metric-value">{ready_slots}</div><div class="metric-note">of {len(workers)} registered</div></div>
+    <div class="metric"><div class="metric-label">Failed tasks</div><div class="metric-value">{task_status_counts['failed']}</div><div class="metric-note">Action may be required</div></div>
+  </section>
+  <div class="section-head"><h2>Tasks</h2><span class="subtle">{total_tasks} total</span></div>
+  <section class="panel"><div class="table-scroll task-table"><table><thead><tr><th>Task</th><th>Status</th><th>Worker</th><th>Files</th><th>Time</th><th>Algorithm / arguments</th><th>Attempts</th><th>Finished</th><th>Error</th></tr></thead><tbody>{task_items}</tbody></table></div><div class="pagination">{previous_link}<span>Page {page} of {total_pages} · {page_size} per page</span>{next_link}</div></section>
+  <div class="section-head"><h2>Worker fleet</h2><span class="subtle">Slot health and host details</span></div>
+  <section class="panel"><details><summary><strong>{len(workers)} registered slots</strong><span class="worker-meta">{worker_summary}</span></summary><div class="table-scroll worker-table"><table><thead><tr><th>Worker</th><th>Status</th><th>Host / private IP</th><th>Slot</th><th>GPU</th><th>CUDA</th><th>PID</th><th>Current task</th><th>Last heartbeat</th></tr></thead><tbody>{worker_items}</tbody></table></div></details></section>
+</main></body></html>"""
 
     return app
 

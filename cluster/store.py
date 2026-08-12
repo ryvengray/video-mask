@@ -297,6 +297,17 @@ class ClusterStore:
         ).fetchone()[0])
 
     @synchronized
+    def oldest_task_created_at(self, statuses: tuple[str, ...]) -> float | None:
+        """Return the oldest queued task timestamp for autoscaling decisions."""
+        if not statuses:
+            return None
+        placeholders = ", ".join("?" for _ in statuses)
+        value = self.conn.execute(
+            f"SELECT MIN(created_at) FROM tasks WHERE status IN ({placeholders})", statuses
+        ).fetchone()[0]
+        return float(value) if value is not None else None
+
+    @synchronized
     def list_tasks(self, limit: int = 100, offset: int = 0,
                    statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         where = ""

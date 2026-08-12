@@ -19,6 +19,7 @@ def scaler_args(tmp_path: Path, **overrides):
         "max_start_per_check": 1,
         "max_stop_per_check": 1,
         "start_grace_seconds": 900,
+        "pending_grace_seconds": 60,
         "dry_run": True,
     }
     values.update(overrides)
@@ -52,8 +53,10 @@ def test_pending_work_starts_one_stopped_host(tmp_path: Path):
     hosts = [PoolHost("172.31.35.195", "stopped", "slave-01"),
              PoolHost("172.31.47.141", "running", "slave-02")]
 
+    stamp = time.time()
     actions = scaler.plan(hosts, [worker("172.31.47.141")], pending=2,
-                          state={"idle_since": {}, "start_requested_at": {}}, stamp=time.time())
+                          oldest_pending_created_at=stamp - 61,
+                          state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp)
 
     assert [(action.kind, action.host.private_ip) for action in actions] == [("start", "172.31.35.195")]
 
@@ -63,7 +66,7 @@ def test_start_grace_prevents_repeating_the_same_ec2_start_request(tmp_path: Pat
     hosts = [PoolHost("172.31.35.195", "stopped", "slave-01")]
     stamp = time.time()
 
-    actions = scaler.plan(hosts, [], pending=1,
+    actions = scaler.plan(hosts, [], pending=1, oldest_pending_created_at=stamp - 1000,
                           state={"idle_since": {}, "start_requested_at": {"172.31.35.195": stamp}},
                           stamp=stamp)
 
@@ -77,6 +80,7 @@ def test_busy_or_unregistered_host_is_never_stopped(tmp_path: Path):
     stamp = time.time()
 
     actions = scaler.plan(hosts, [worker("172.31.35.195", "busy")], pending=0,
+                          oldest_pending_created_at=None,
                           state={"idle_since": {"172.31.35.195": stamp - 3600},
                                  "start_requested_at": {}}, stamp=stamp)
 
@@ -92,7 +96,18 @@ def test_only_idle_host_can_stop_after_timeout_and_minimum_is_preserved(tmp_path
              "start_requested_at": {}}
 
     actions = scaler.plan(hosts, [worker("172.31.35.195"), worker("172.31.47.141")],
-                          pending=0, state=state, stamp=stamp)
+                          pending=0, oldest_pending_created_at=None, state=state, stamp=stamp)
 
     assert len(actions) == 1
     assert actions[0].kind == "stop"
+
+
+def test_newly_pending_task_waits_for_ready_worker_to_claim(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path))
+    hosts = [PoolHost("172.31.35.195", "stopped", "slave-01")]
+    stamp = time.time()
+
+    actions = scaler.plan(hosts, [], pending=1, oldest_pending_created_at=stamp - 20,
+                          state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp)
+
+    assert actions == []

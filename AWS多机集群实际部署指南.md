@@ -318,6 +318,7 @@ video_mask_autoscale_managed_ips:
   - 172.31.35.195 # slave-01
   - 172.31.47.141 # slave-02
 video_mask_autoscale_check_seconds: 60
+video_mask_autoscale_pending_grace_seconds: 60 # 新任务至少持续排队 1 分钟后才扩容
 video_mask_autoscale_idle_shutdown_seconds: 1800 # 30 分钟
 video_mask_autoscale_min_running_hosts: 0
 video_mask_autoscale_max_start_per_check: 1
@@ -359,7 +360,7 @@ sudo systemd-run --wait --collect --pipe \
   --once --dry-run
 ```
 
-前提：机器池 YAML 的 `status` 必须由运维脚本或其刷新机制及时更新；Worker slot 服务必须是 `enabled`，让实例启动后自动注册。若机器池状态长时间未更新，autoscaler 的 15 分钟启动等待窗口会避免重复 start，但应先修复运维侧刷新再长期启用。
+前提：机器池 YAML 的 `status` 必须由运维脚本或其刷新机制及时更新；Worker slot 服务必须是 `enabled`，让实例启动后自动注册。新任务先等待 `video_mask_autoscale_pending_grace_seconds`（默认 60 秒），给已有空闲 Worker 的下一轮轮询/领取机会；仅当队列持续积压且 `pending > ready slots` 时才扩容。若机器池状态长时间未更新，autoscaler 的 15 分钟启动等待窗口会避免重复 start，但应先修复运维侧刷新再长期启用。
 
 ## 8. 上线验收清单
 
