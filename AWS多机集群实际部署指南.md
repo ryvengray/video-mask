@@ -268,7 +268,7 @@ curl -H "Authorization: Bearer ADMIN_TOKEN" \
 1. 上传完成的视频到 `s3://INPUT_BUCKET/source/inbox/`。
 2. Controller 每 60 秒扫描一次；空闲 Worker 自动领取任务。
 3. 输出写入 `s3://OUTPUT_BUCKET/outputs/`，保存名为 `masked_<原文件名>.mp4`，并保留输入子目录结构。
-4. 查看状态使用 SSH 隧道后的 `http://127.0.0.1:8080/`：任务页每页展示 50 条，可翻页查看持续累积的历史任务；完成任务会显示输入/输出文件、大小、输出时长、处理耗时、算法和参数。也可通过 Bearer Token 调用 `/api/tasks?limit=50&offset=0`、`/api/workers`。
+4. 查看状态使用 SSH 隧道后的 `http://127.0.0.1:8080/`：任务页每页展示 50 条，可翻页查看持续累积的历史任务；完成任务会显示输入/输出文件、大小、输出时长、处理耗时、算法和参数。也可通过 Bearer Token 调用 `/api/tasks?limit=50&offset=0`、`/api/workers`。若 S3 上传首次失败（例如预签名 PUT URL 过期），Worker 会向 Controller 获取一个新的上传 URL 并重试一次，不重新下载或处理视频。
 
 常用命令：
 

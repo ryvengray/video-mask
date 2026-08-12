@@ -149,6 +149,16 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         task = store.claim(worker_id, request.token)
         return {"task": s3_ingestor.materialize(task) if task and s3_ingestor else task}
 
+    @app.post("/api/workers/{worker_id}/tasks/{task_id}/upload-url")
+    def refresh_upload_url(worker_id: str, task_id: str, request: WorkerRequest):
+        if request.worker_id != worker_id:
+            raise ValueError("worker id does not match path")
+        task = store.active_task_for_worker(worker_id, request.token, task_id)
+        if s3_ingestor:
+            return s3_ingestor.materialize_upload_url(task)
+        return {"output_upload_url": str(task.get("output_upload_url") or ""),
+                "output_object_key": str(task.get("output_object_key") or "")}
+
     @app.post("/api/tasks/{task_id}/progress")
     def progress(task_id: str, request: ProgressRequest):
         return store.progress(request.worker_id, request.token, task_id, request.status, request.progress)

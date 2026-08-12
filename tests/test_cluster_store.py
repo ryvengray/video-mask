@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from cluster.local_ingest import LocalIngestor
 from cluster.store import ClusterStore
 
@@ -204,6 +206,24 @@ def test_provisioning_with_the_same_token_preserves_an_active_worker(tmp_path: P
     assert provisioned["status"] == "busy"
     assert provisioned["current_task_id"] == created["task_id"]
     assert store.task(created["task_id"])["status"] == "assigned"
+    store.close()
+
+
+def test_active_task_lookup_rejects_a_different_worker_or_terminal_task(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    store.provision_worker("worker-02", TOKEN)
+    store.register_worker("worker-02", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    assert store.active_task_for_worker("worker-01", TOKEN, created["task_id"])["task_id"] == created["task_id"]
+    with pytest.raises(ValueError, match="not actively assigned"):
+        store.active_task_for_worker("worker-02", TOKEN, created["task_id"])
+    store.finish("worker-01", TOKEN, created["task_id"], True, {})
+    with pytest.raises(ValueError, match="not actively assigned"):
+        store.active_task_for_worker("worker-01", TOKEN, created["task_id"])
     store.close()
 
 

@@ -279,6 +279,15 @@ class ClusterStore:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
     @synchronized
+    def active_task_for_worker(self, worker_id: str, token: str, task_id: str) -> dict[str, Any]:
+        """Return a task only while its lease belongs to this Worker."""
+        self.authenticate_worker(worker_id, token)
+        task = self.task(task_id)
+        if task is None or task["assigned_worker_id"] != worker_id or task["status"] not in ACTIVE:
+            raise ValueError("task is not actively assigned to this worker")
+        return task
+
+    @synchronized
     def count_tasks(self, statuses: tuple[str, ...] | None = None) -> int:
         if not statuses:
             return int(self.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])

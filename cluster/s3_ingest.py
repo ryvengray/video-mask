@@ -152,3 +152,18 @@ class S3Ingestor:
             ExpiresIn=self.presign_seconds,
         )
         return result
+
+    def materialize_upload_url(self, task: dict[str, Any]) -> dict[str, str]:
+        """Issue a fresh output PUT URL without exposing the source URL again."""
+        parsed = urlparse(str(task.get("source_url") or ""))
+        if parsed.scheme != "s3" or parsed.netloc != self.source_bucket:
+            return {"output_upload_url": str(task.get("output_upload_url") or "")}
+        source_key = parsed.path.lstrip("/")
+        output_key = str(task.get("output_object_key") or self.output_key(source_key))
+        return {
+            "output_upload_url": self.output_client.generate_presigned_url(
+                "put_object", Params={"Bucket": self.output_bucket, "Key": output_key},
+                ExpiresIn=self.presign_seconds,
+            ),
+            "output_object_key": output_key,
+        }

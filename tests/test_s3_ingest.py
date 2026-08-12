@@ -64,3 +64,17 @@ def test_s3_separate_output_region_uses_its_own_client(tmp_path: Path):
     assert claimed["source_url"].startswith("https://signed.us-east-2.example/")
     assert claimed["output_upload_url"].startswith("https://signed.ap-southeast-1.example/")
     store.close()
+
+
+def test_s3_upload_url_can_be_refreshed_without_returning_the_source_url(tmp_path: Path):
+    store = ClusterStore(tmp_path / "controller.sqlite3")
+    ingestor = S3Ingestor(store, "source-bucket", "incoming/", "output-bucket", "masked/",
+                          "us-east-2", client=FakeS3("us-east-2"))
+    assert ingestor.scan() == 1
+
+    refreshed = ingestor.materialize_upload_url(store.list_tasks()[0])
+
+    assert refreshed["output_object_key"] == "masked/masked_a.mp4"
+    assert refreshed["output_upload_url"].startswith("https://signed.us-east-2.example/put_object/")
+    assert "source_url" not in refreshed
+    store.close()

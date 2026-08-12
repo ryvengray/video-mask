@@ -238,7 +238,36 @@ class Worker:
             if output_url:
                 phase = "uploading"
                 self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
-                self.upload(output_url, output)
+                try:
+                    self.upload(output_url, output)
+                except RuntimeError as first_upload_error:
+                    # Long-running tasks may reach S3 after their original PUT
+                    # URL expires. Refresh only the output URL: the completed
+                    # video stays local, so no download or inference is repeated.
+                    print(f"[{task_id}] upload failed; requesting a fresh upload URL", flush=True)
+                    try:
+                        refreshed = self.api(
+                            f"/api/workers/{self.worker_id}/tasks/{task_id}/upload-url", self.payload()
+                        )
+                    except Exception as refresh_error:
+                        raise RuntimeError(
+                            "output upload failed and the refreshed URL request failed; "
+                            f"first error: {first_upload_error}; refresh error: {refresh_error}"
+                        ) from refresh_error
+                    refreshed_url = str(refreshed.get("output_upload_url") or "")
+                    if not refreshed_url:
+                        raise RuntimeError(
+                            "output upload failed and Controller did not provide a refreshed URL: "
+                            + str(first_upload_error)
+                        ) from first_upload_error
+                    self.report(task_id, "uploading", phase="uploading_retry", elapsed_seconds=elapsed,
+                                upload_retry_reason=str(first_upload_error)[-500:])
+                    try:
+                        self.upload(refreshed_url, output)
+                    except RuntimeError as retry_error:
+                        raise RuntimeError(
+                            "output upload failed after refreshed URL: " + str(retry_error)
+                        ) from retry_error
                 completed_output = output
                 # Do not save a sensitive presigned URL in the Controller database.
                 output_location = task.get("output_object_key") or "uploaded"
