@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
-import html
 import hmac
 import logging
 import os
@@ -18,6 +17,8 @@ from typing import Any
 try:
     from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.templating import Jinja2Templates
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("Install cluster requirements: pip install -r requirements-cluster.txt") from exc
@@ -28,6 +29,14 @@ from cluster.s3_ingest import S3Ingestor
 
 
 logger = logging.getLogger(__name__)
+WEB_DIR = Path(__file__).with_name("web")
+STATUS_TONES = {
+    "ready": "success", "completed": "success",
+    "busy": "active", "assigned": "active", "downloading": "active",
+    "processing": "active", "uploading": "active",
+    "pending": "pending", "cancelling": "warning", "cancelled": "warning",
+    "offline": "muted", "failed": "danger",
+}
 
 
 class WorkerRequest(BaseModel):
@@ -125,6 +134,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             store.close()
 
     app = FastAPI(title="Video Mask Cluster Controller", lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
+    templates = Jinja2Templates(directory=WEB_DIR / "templates")
 
     def require_admin(authorization: str | None) -> None:
         expected = f"Bearer {admin_token}"
@@ -275,7 +286,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(page: int = 1):
+    def dashboard(request: Request, page: int = 1):
         store.requeue_stale(stale_after_seconds)
         page_size = 50
         total_tasks = store.count_tasks()
@@ -305,53 +316,6 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             hours, minutes = divmod(minutes, 60)
             return f"{hours}h {minutes}m {remainder}s" if hours else f"{minutes}m {remainder}s"
 
-        def file_row(label: str, name: Any, meta: str) -> str:
-            return (
-                f"<div class='file-row'><span class='file-label'>{label}</span>"
-                f"<span class='file-name' title='{html.escape(str(name))}'>{html.escape(str(name))}</span>"
-                f"<span class='file-meta'>{html.escape(meta)}</span></div>"
-            )
-
-        def task_file_info(task: dict[str, Any]) -> str:
-            progress = task.get("progress") or {}
-            source_name = task.get("source_object_key") or task.get("source_url") or "-"
-            output_name = task.get("output_object_key") or progress.get("output_filename") or "-"
-            input_size = byte_size(progress.get("input_bytes", task.get("source_size_bytes")))
-            output_size = byte_size(progress.get("output_bytes"))
-            output_duration = seconds(task.get("output_duration_seconds", progress.get("output_duration_seconds")))
-            output_hash = task.get("output_sha256")
-            hash_line = (
-                f"<div class='file-row file-hash'><span class='file-label'>SHA</span>"
-                f"<span class='file-name'>{html.escape(str(output_hash)[:16])}…</span></div>"
-                if output_hash else ""
-            )
-            return (
-                f"<div class='files'>"
-                f"{file_row('In', source_name, input_size)}"
-                f"{file_row('Out', output_name, f'{output_size} · {output_duration}')}"
-                f"{hash_line}</div>"
-            )
-
-        def task_runtime(task: dict[str, Any]) -> str:
-            progress = task.get("progress") or {}
-            processing = progress.get("processing_seconds", progress.get("elapsed_seconds"))
-            started, finished = task.get("started_at"), task.get("finished_at")
-            end_to_end = None
-            if isinstance(started, (int, float)) and isinstance(finished, (int, float)):
-                end_to_end = finished - started
-            if isinstance(processing, (int, float)):
-                process_label = f"Process: {seconds(processing)}"
-            elif task.get("status") in {"processing", "uploading", "cancelling"}:
-                processing_started = progress.get("processing_started_at", started)
-                running_for = time.time() - processing_started if isinstance(processing_started, (int, float)) else None
-                process_label = f"Process: running {seconds(max(0, running_for))}"
-            else:
-                process_label = "Process: -"
-            parts = [process_label]
-            if end_to_end is not None:
-                parts.append(f"Task lifetime: {seconds(end_to_end)}")
-            return "<br>".join(parts)
-
         def last_seen(timestamp: float | None) -> str:
             if not timestamp:
                 return "-"
@@ -363,36 +327,38 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             for status in ("pending", "assigned", "downloading", "processing", "uploading", "cancelling", "completed", "failed", "cancelled")
         }
 
-        def status_badge(status: Any) -> str:
-            value = str(status or "unknown")
-            tone = {
-                "ready": "success", "completed": "success",
-                "busy": "active", "assigned": "active", "downloading": "active",
-                "processing": "active", "uploading": "active",
-                "pending": "pending", "cancelling": "warning", "cancelled": "warning",
-                "offline": "muted", "failed": "danger",
-            }.get(value, "muted")
-            return f"<span class='badge {tone}'>{html.escape(value)}</span>"
+        def task_view(task: dict[str, Any]) -> dict[str, Any]:
+            progress = task.get("progress") or {}
+            worker_id = str(task.get("assigned_worker_id") or "").strip()
+            worker_name, marker, worker_slot = worker_id.rpartition("-slot-")
+            if not (marker and worker_name and worker_slot.isdigit()):
+                worker_name, worker_slot = worker_id or "-", ""
+            processing = progress.get("processing_seconds", progress.get("elapsed_seconds"))
+            started, finished = task.get("started_at"), task.get("finished_at")
+            if isinstance(processing, (int, float)):
+                process_label = f"Process: {seconds(processing)}"
+            elif task.get("status") in {"processing", "uploading", "cancelling"}:
+                processing_started = progress.get("processing_started_at", started)
+                running_for = time.time() - processing_started if isinstance(processing_started, (int, float)) else None
+                process_label = f"Process: running {seconds(max(0, running_for))}"
+            else:
+                process_label = "Process: -"
+            lifetime = (f"Task lifetime: {seconds(finished - started)}"
+                        if isinstance(started, (int, float)) and isinstance(finished, (int, float)) else "")
+            return {
+                "task_id": str(task["task_id"]), "status": str(task["status"]),
+                "worker_name": worker_name, "worker_slot": worker_slot,
+                "source_name": str(task.get("source_object_key") or task.get("source_url") or "-"),
+                "input_size": byte_size(progress.get("input_bytes", task.get("source_size_bytes"))),
+                "output_name": str(task.get("output_object_key") or progress.get("output_filename") or "-"),
+                "output_meta": f"{byte_size(progress.get('output_bytes'))} · {seconds(task.get('output_duration_seconds', progress.get('output_duration_seconds')))}",
+                "output_hash": str(task.get("output_sha256") or ""), "process_label": process_label,
+                "lifetime": lifetime, "attempt_count": task["attempt_count"],
+                "created_at": last_seen(task.get("created_at")), "finished_at": last_seen(task.get("finished_at")),
+                "error_message": str(task.get("error_message") or "-"),
+            }
 
-        def worker_display(worker_id: Any) -> str:
-            wid = str(worker_id or "").strip()
-            if not wid:
-                return "-"
-            base, marker, slot = wid.rpartition("-slot-")
-            if marker and base and slot.isdigit():
-                return f"{html.escape(base)} <span class='subtle'>(slot-{html.escape(slot)})</span>"
-            return html.escape(wid)
-
-        task_items = "".join(
-            f"<tr><td class='mono task-id' title='{html.escape(str(task['task_id']))}'>{html.escape(str(task['task_id']))}</td>"
-            f"<td>{status_badge(task['status'])}</td>"
-            f"<td class='mono'>{worker_display(task['assigned_worker_id'])}</td>"
-            f"<td>{task_file_info(task)}</td><td>{task_runtime(task)}</td>"
-            f"<td>{task['attempt_count']}</td><td>{last_seen(task.get('created_at'))}</td>"
-            f"<td>{last_seen(task.get('finished_at'))}</td>"
-            f"<td>{html.escape(str(task.get('error_message') or '-'))}</td></tr>"
-            for task in rows
-        ) or "<tr><td colspan='9'>No tasks</td></tr>"
+        task_rows = [task_view(task) for task in rows]
         def base_worker_id(worker_id: str) -> str:
             prefix, marker, _ = str(worker_id).rpartition("-slot-")
             return prefix if marker and prefix else str(worker_id)
@@ -432,7 +398,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                     "ready": sum(status == "ready" for status in statuses),
                     "busy": sum(status in ACTIVE_SLOT for status in statuses),
                     "online": online,
-                    "last_seen": max((slot.get("last_seen_at") or 0) for slot in slots),
+                    "last_seen": last_seen(max((slot.get("last_seen_at") or 0) for slot in slots)),
+                    "status": "online" if online else "offline",
+                    "slots": [{
+                        "label": slot_label(slot), "status": str(slot.get("status") or "unknown"),
+                        "current_task_id": str(slot.get("current_task_id") or "-"),
+                        "last_seen": last_seen(slot.get("last_seen_at")),
+                    } for slot in slots],
                 })
             result.sort(key=lambda group: (not group["online"], group["hostname"].lower(), group["base_id"]))
             return result
@@ -440,98 +412,33 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         groups = server_groups()
         active_workers = sum(1 for group in groups if group["online"])
 
-        def server_card(group: dict[str, Any]) -> str:
-            card_class = "server-card" if group["online"] else "server-card offline"
-            label = "online" if group["online"] else "offline"
-            tone = "success" if group["online"] else "muted"
-            slot_rows = "".join(
-                f"<tr data-worker-status='{html.escape(str(slot.get('status') or 'unknown'), quote=True)}'>"
-                f"<td class='mono'>{html.escape(slot_label(slot))}</td>"
-                f"<td>{status_badge(slot.get('status'))}</td>"
-                f"<td class='mono task-id' title='{html.escape(str(slot.get('current_task_id') or ''))}'>"
-                f"{html.escape(str(slot.get('current_task_id') or '-'))}</td>"
-                f"<td>{last_seen(slot.get('last_seen_at'))}</td></tr>"
-                for slot in group["slots"]
-            ) or "<tr><td colspan='4'>No slots</td></tr>"
-            return (
-                f"<div class='{card_class}'>"
-                f"<div class='server-head'>"
-                f"<span class='server-name'>{html.escape(group['hostname'])}</span>"
-                f"<span class='badge {tone}'>{label}</span>"
-                f"<span class='subtle server-host'>{html.escape(group['address'])}</span>"
-                f"<span class='server-gpu'>{html.escape(group['gpu'])}</span>"
-                f"<span class='server-meta'>{group['slot_count']} slot{'s' if group['slot_count'] != 1 else ''} · "
-                f"{group['ready']} ready · {group['busy']} busy</span>"
-                f"<span class='server-seen'>heartbeat {last_seen(group['last_seen'])}</span>"
-                f"</div>"
-                f"<div class='table-scroll'><table class='slot-table'><thead><tr>"
-                f"<th>Slot</th><th>Status</th><th>Current task</th><th>Last heartbeat</th>"
-                f"</tr></thead><tbody>{slot_rows}</tbody></table></div>"
-                f"</div>"
-            )
-
-        server_cards = "".join(server_card(group) for group in groups) or "<p class='empty-state'>No workers registered</p>"
         worker_status_counts: dict[str, int] = {}
         for worker in workers:
             status = str(worker.get("status") or "unknown")
             worker_status_counts[status] = worker_status_counts.get(status, 0) + 1
         active_tasks = sum(task_status_counts[status] for status in
                            ("assigned", "downloading", "processing", "uploading", "cancelling"))
-        worker_filter_options = "<option value=''>All statuses</option>" + "".join(
-            f"<option value='{html.escape(status, quote=True)}'>{html.escape(status)} ({count})</option>"
-            for status, count in sorted(worker_status_counts.items())
+        worker_filter_options = sorted(worker_status_counts.items())
+        return templates.TemplateResponse(
+            request=request,
+            name="dashboard.html",
+            context={
+                "active_tasks": active_tasks,
+                "active_workers": active_workers,
+                "groups": groups,
+                "next_page": page + 1 if page < total_pages else None,
+                "page": page,
+                "page_size": page_size,
+                "previous_page": page - 1 if page > 1 else None,
+                "status_tones": STATUS_TONES,
+                "task_rows": task_rows,
+                "task_status_counts": task_status_counts,
+                "total_pages": total_pages,
+                "total_tasks": total_tasks,
+                "updated_at": dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "worker_filter_options": worker_filter_options,
+            },
         )
-        previous_link = (f'<a href="/?page={page - 1}">Previous</a>' if page > 1 else "Previous")
-        next_link = (f'<a href="/?page={page + 1}">Next</a>' if page < total_pages else "Next")
-        return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="60"><title>Video Mask · Operations</title>
-<style>
-:root{{--ink:#202124;--muted:#5f6368;--line:#dadce0;--canvas:#f8f9fa;--surface:#fff;--blue:#1a73e8;--blue-soft:#e8f0fe;--green:#137333;--green-soft:#e6f4ea;--red:#b3261e;--red-soft:#fce8e6;--yellow:#b06000;--yellow-soft:#fef7e0}}
-*{{box-sizing:border-box}} body{{margin:0;background:var(--canvas);color:var(--ink);font:14px/1.45 Arial,Roboto,"Helvetica Neue",sans-serif}}
-.topbar{{height:64px;background:var(--surface);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 32px;gap:14px}} .brand{{font-size:20px;font-weight:500;letter-spacing:-.2px}} .brand-dot{{height:10px;width:10px;border-radius:50%;background:var(--blue)}} .updated{{margin-left:auto;color:var(--muted);font-size:12px}}
-.shell{{max-width:1800px;margin:0 auto;padding:26px 32px 40px}} h1,h2{{margin:0;font-weight:500}} h2{{font-size:18px}} .section-head{{display:flex;align-items:center;gap:12px;margin:0 0 12px;padding:6px 0 0 6px}} .subtle{{color:var(--muted);font-size:13px}}
-.metrics{{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:16px;margin:0 0 26px}} .metric{{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:17px 18px;min-height:92px;box-shadow:0 1px 2px rgba(60,64,67,.08)}} .metric-label{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.55px}} .metric-value{{font-size:29px;font-weight:500;margin-top:5px}} .metric-note{{color:var(--muted);font-size:12px}}
-.panel{{background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(60,64,67,.08)}} .table-scroll{{overflow:auto}} .task-table{{max-height:calc(100vh - 310px);min-height:420px}}
-table{{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}} th{{position:sticky;top:0;z-index:1;background:#f8f9fa;color:#3c4043;font-size:11px;text-transform:uppercase;letter-spacing:.5px;text-align:left;padding:12px 14px;border-bottom:1px solid var(--line);white-space:nowrap}} td{{padding:12px 14px;vertical-align:top;border-bottom:1px solid #edf0f2;max-width:300px;word-break:break-word}} tr:last-child td{{border-bottom:0}} tbody tr:hover{{background:#f8fbff}} small{{color:var(--muted);font-size:12px}} hr{{border:0;border-top:1px solid #edf0f2;margin:8px 0}} .mono{{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:12px}} .task-id{{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.badge{{display:inline-flex;align-items:center;border-radius:12px;font-size:12px;font-weight:600;padding:3px 9px;white-space:nowrap}} .success{{color:var(--green);background:var(--green-soft)}} .active{{color:#174ea6;background:var(--blue-soft)}} .pending{{color:#5f6368;background:#f1f3f4}} .warning{{color:var(--yellow);background:var(--yellow-soft)}} .danger{{color:var(--red);background:var(--red-soft)}} .muted{{color:#5f6368;background:#f1f3f4}}
-.pagination{{display:flex;justify-content:flex-end;align-items:center;gap:16px;padding:12px 14px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}} .pagination a{{color:var(--blue);text-decoration:none;font-weight:500}} .pagination a:hover{{text-decoration:underline}}
-.fleet-title{{padding:16px 18px 12px}} .fleet-title h2{{margin-bottom:4px}} .fleet-summary{{padding:0 18px 14px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--line)}} .fleet-controls{{display:flex;align-items:center;gap:8px;margin-left:auto}} .fleet-filter{{appearance:auto;border:1px solid var(--line);background:var(--surface);border-radius:4px;color:var(--ink);font:12px Arial,Roboto,sans-serif;padding:6px 24px 6px 8px}} .summary-count{{margin-right:10px;white-space:nowrap}} .fleet-panel th,.fleet-panel td{{padding:10px 12px}} .fleet-panel td{{max-width:180px}} .fleet-panel .mono{{font-size:11px}}
-.tabs{{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:0 0 22px}} .tab{{appearance:none;border:0;background:transparent;color:var(--muted);font:500 14px Arial,Roboto,sans-serif;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}} .tab:hover{{color:var(--ink)}} .tab.active{{color:var(--blue);border-bottom-color:var(--blue)}} .tab-panel{{display:none}} .tab-panel.active{{display:block}}
-.server-list{{display:flex;flex-direction:column;gap:14px}} .server-card{{background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(60,64,67,.08);overflow:hidden}} .server-card.offline{{opacity:.78}} .server-head{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:13px 16px;border-bottom:1px solid var(--line);background:#f8f9fa}} .server-name{{font-size:14px;font-weight:600}} .server-host{{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px}} .server-gpu{{color:var(--muted);font-size:12px}} .server-meta{{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}} .server-seen{{color:var(--muted);font-size:12px}} .slot-table{{font-size:12px}} .slot-table th{{font-size:10px;padding:8px 14px}} .slot-table td{{padding:8px 14px;max-width:220px}} .empty-state{{color:var(--muted);padding:24px;text-align:center}}
-.files{{display:flex;flex-direction:column;gap:3px;min-width:0}} .file-row{{display:flex;align-items:baseline;gap:7px;min-width:0}} .file-label{{flex:0 0 auto;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);background:#f1f3f4;border-radius:4px;padding:1px 6px}} .file-name{{flex:1 1 auto;min-width:0;font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}} .file-meta{{flex:0 0 auto;color:var(--muted);font-size:11px;white-space:nowrap}} .file-hash .file-name{{color:var(--muted);font-size:11px}}
-@media(max-width:850px){{.topbar{{padding:0 18px}}.shell{{padding:20px 18px}}.metrics{{grid-template-columns:repeat(2,minmax(130px,1fr));gap:10px}}.metric{{padding:13px}}.task-table{{min-height:360px}}.updated{{display:none}}}}
-</style></head><body>
-<header class="topbar"><span class="brand-dot"></span><span class="brand">Video Mask</span><span class="subtle">Operations</span><span class="updated">Auto-refreshes every 60 seconds · {html.escape(dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))}</span></header>
-<main class="shell">
-  <section class="metrics" aria-label="Cluster summary">
-    <div class="metric"><div class="metric-label">Queued</div><div class="metric-value">{task_status_counts['pending']}</div><div class="metric-note">Awaiting a worker</div></div>
-    <div class="metric"><div class="metric-label">Active tasks</div><div class="metric-value">{active_tasks}</div><div class="metric-note">Download, process, upload</div></div>
-    <div class="metric"><div class="metric-label">Active workers</div><div class="metric-value">{active_workers}</div><div class="metric-note">of {len(groups)} servers</div></div>
-    <div class="metric"><div class="metric-label">Failed tasks</div><div class="metric-value">{task_status_counts['failed']}</div><div class="metric-note">Action may be required</div></div>
-  </section>
-  <nav class="tabs" role="tablist">
-    <button class="tab" data-tab="tasks" role="tab">Tasks</button>
-    <button class="tab" data-tab="workers" role="tab">Workers</button>
-  </nav>
-  <section id="panel-tasks" class="tab-panel" role="tabpanel">
-    <div class="section-head"><h2>Tasks</h2><span class="subtle">{total_tasks} total</span></div>
-    <section class="panel"><div class="table-scroll task-table"><table><thead><tr><th>Task</th><th>Status</th><th>Worker</th><th>Files</th><th>Time</th><th>Attempts</th><th>Created</th><th>Finished</th><th>Error</th></tr></thead><tbody>{task_items}</tbody></table></div><div class="pagination">{previous_link}<span>Page {page} of {total_pages} · {page_size} per page</span>{next_link}</div></section>
-  </section>
-  <section id="panel-workers" class="tab-panel" role="tabpanel">
-    <div class="section-head"><h2>Worker servers</h2><span class="subtle">{active_workers} active · {len(groups)} registered</span><label class="fleet-controls"><span class="subtle">Status</span><select id="worker-status-filter" class="fleet-filter" aria-label="Filter slots by status">{worker_filter_options}</select></label></div>
-    <div class="server-list">{server_cards}</div>
-  </section>
-</main><script>
-const tabs=document.querySelectorAll('.tab');
-const panels={{tasks:document.getElementById('panel-tasks'),workers:document.getElementById('panel-workers')}};
-function activate(name){{tabs.forEach(t=>t.classList.toggle('active',t.dataset.tab===name));Object.entries(panels).forEach(([k,p])=>p.classList.toggle('active',k===name));if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);}}
-tabs.forEach(t=>t.addEventListener('click',()=>activate(t.dataset.tab)));
-activate(location.hash==='#workers'?'workers':'tasks');
-const workerFilter=document.getElementById('worker-status-filter');
-workerFilter.addEventListener('change',()=>{{const selected=workerFilter.value;document.querySelectorAll('.server-card').forEach(card=>{{let visible=false;card.querySelectorAll('tbody tr[data-worker-status]').forEach(row=>{{const hidden=Boolean(selected)&&row.dataset.workerStatus!==selected;row.hidden=hidden;if(!hidden)visible=true;}});card.style.display=visible?'':'none';}});}});
-</script></body></html>"""
-
     return app
 
 

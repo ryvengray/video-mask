@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
+  <title>Video Mask · Operations</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand-dot"></span><span class="brand">Video Mask</span><span class="subtle">Operations</span>
+    <span class="updated">Auto-refreshes every 60 seconds · {{ updated_at }}</span>
+  </header>
+  <main class="shell">
+    <section class="metrics" aria-label="Cluster summary">
+      <div class="metric"><div class="metric-label">Queued</div><div class="metric-value">{{ task_status_counts.pending }}</div><div class="metric-note">Awaiting a worker</div></div>
+      <div class="metric"><div class="metric-label">Active tasks</div><div class="metric-value">{{ active_tasks }}</div><div class="metric-note">Download, process, upload</div></div>
+      <div class="metric"><div class="metric-label">Active workers</div><div class="metric-value">{{ active_workers }}</div><div class="metric-note">of {{ groups | length }} servers</div></div>
+      <div class="metric"><div class="metric-label">Failed tasks</div><div class="metric-value">{{ task_status_counts.failed }}</div><div class="metric-note">Action may be required</div></div>
+    </section>
+    <nav class="tabs" role="tablist">
+      <button class="tab" data-tab="tasks" role="tab">Tasks</button>
+      <button class="tab" data-tab="workers" role="tab">Workers</button>
+    </nav>
+    <section id="panel-tasks" class="tab-panel" role="tabpanel">
+      <div class="section-head"><h2>Tasks</h2><span class="subtle">{{ total_tasks }} total</span></div>
+      <section class="panel"><div class="table-scroll task-table"><table><thead><tr><th>Task</th><th>Status</th><th>Worker</th><th>Files</th><th>Time</th><th>Attempts</th><th>Created</th><th>Finished</th><th>Error</th></tr></thead><tbody>{% for task in task_rows %}<tr><td class="mono task-id" title="{{ task.task_id }}">{{ task.task_id }}</td><td><span class="badge {{ status_tones.get(task.status, 'muted') }}">{{ task.status }}</span></td><td class="mono">{{ task.worker_name }}{% if task.worker_slot %} <span class="subtle">(slot-{{ task.worker_slot }})</span>{% endif %}</td><td><div class="files"><div class="file-row"><span class="file-label">In</span><span class="file-name" title="{{ task.source_name }}">{{ task.source_name }}</span><span class="file-meta">{{ task.input_size }}</span></div><div class="file-row"><span class="file-label">Out</span><span class="file-name" title="{{ task.output_name }}">{{ task.output_name }}</span><span class="file-meta">{{ task.output_meta }}</span></div>{% if task.output_hash %}<div class="file-row file-hash"><span class="file-label">SHA</span><span class="file-name">{{ task.output_hash[:16] }}…</span></div>{% endif %}</div></td><td>{{ task.process_label }}{% if task.lifetime %}<br>{{ task.lifetime }}{% endif %}</td><td>{{ task.attempt_count }}</td><td>{{ task.created_at }}</td><td>{{ task.finished_at }}</td><td>{{ task.error_message }}</td></tr>{% else %}<tr><td colspan="9">No tasks</td></tr>{% endfor %}</tbody></table></div><div class="pagination">{% if previous_page %}<a href="/?page={{ previous_page }}">Previous</a>{% else %}Previous{% endif %}<span>Page {{ page }} of {{ total_pages }} · {{ page_size }} per page</span>{% if next_page %}<a href="/?page={{ next_page }}">Next</a>{% else %}Next{% endif %}</div></section>
+    </section>
+    <section id="panel-workers" class="tab-panel" role="tabpanel">
+      <div class="section-head"><h2>Worker servers</h2><span class="subtle">{{ active_workers }} active · {{ groups | length }} registered</span><label class="fleet-controls"><span class="subtle">Status</span><select id="worker-status-filter" class="fleet-filter" aria-label="Filter slots by status"><option value="">All statuses</option>{% for status, count in worker_filter_options %}<option value="{{ status }}">{{ status }} ({{ count }})</option>{% endfor %}</select></label></div>
+      <div class="server-list">{% for group in groups %}<div class="server-card{% if not group.online %} offline{% endif %}"><div class="server-head"><span class="server-name">{{ group.hostname }}</span><span class="badge {{ 'success' if group.online else 'muted' }}">{{ group.status }}</span><span class="subtle server-host">{{ group.address }}</span><span class="server-gpu">{{ group.gpu }}</span><span class="server-meta">{{ group.slot_count }} slot{% if group.slot_count != 1 %}s{% endif %} · {{ group.ready }} ready · {{ group.busy }} busy</span><span class="server-seen">heartbeat {{ group.last_seen }}</span></div><div class="table-scroll"><table class="slot-table"><thead><tr><th>Slot</th><th>Status</th><th>Current task</th><th>Last heartbeat</th></tr></thead><tbody>{% for slot in group.slots %}<tr data-worker-status="{{ slot.status }}"><td class="mono">{{ slot.label }}</td><td><span class="badge {{ status_tones.get(slot.status, 'muted') }}">{{ slot.status }}</span></td><td class="mono task-id" title="{{ slot.current_task_id }}">{{ slot.current_task_id }}</td><td>{{ slot.last_seen }}</td></tr>{% endfor %}</tbody></table></div></div>{% else %}<p class="empty-state">No workers registered</p>{% endfor %}</div>
+    </section>
+  </main>
+  <script src="{{ url_for('static', path='dashboard.js') }}"></script>
+</body>
+</html>
