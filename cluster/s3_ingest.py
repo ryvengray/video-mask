@@ -20,6 +20,8 @@ class S3Ingestor:
     GET/PUT URLs when they claim a task, so URLs do not expire while queued.
     """
 
+    MULTIPART_PART_SIZE = 64 * 1024 * 1024
+
     def __init__(self, store: ClusterStore, source_bucket: str, source_prefix: str,
                  output_bucket: str, output_prefix: str, source_region: str,
                  output_region: str | None = None, profile: str | None = None,
@@ -175,3 +177,49 @@ class S3Ingestor:
             ),
             "output_object_key": output_key,
         }
+
+    def _output_key_for_task(self, task: dict[str, Any]) -> str:
+        parsed = urlparse(str(task.get("source_url") or ""))
+        if parsed.scheme != "s3" or parsed.netloc != self.source_bucket:
+            raise ValueError("task does not use the configured S3 source bucket")
+        return str(task.get("output_object_key") or self.output_key(parsed.path.lstrip("/")))
+
+    def initiate_multipart_upload(self, task: dict[str, Any]) -> dict[str, Any]:
+        output_key = self._output_key_for_task(task)
+        response = self.output_client.create_multipart_upload(Bucket=self.output_bucket, Key=output_key)
+        upload_id = str(response.get("UploadId") or "")
+        if not upload_id:
+            raise RuntimeError("S3 did not return an UploadId for multipart upload")
+        return {"upload_id": upload_id, "part_size": self.MULTIPART_PART_SIZE,
+                "output_object_key": output_key}
+
+    def multipart_part_url(self, task: dict[str, Any], upload_id: str, part_number: int) -> dict[str, str]:
+        if not 1 <= part_number <= 10_000:
+            raise ValueError("multipart part_number must be 1..10000")
+        return {"upload_part_url": self.output_client.generate_presigned_url(
+            "upload_part", Params={"Bucket": self.output_bucket, "Key": self._output_key_for_task(task),
+                                   "UploadId": upload_id, "PartNumber": part_number},
+            ExpiresIn=self.presign_seconds,
+        )}
+
+    def complete_multipart_upload(self, task: dict[str, Any], upload_id: str,
+                                  parts: list[dict[str, Any]]) -> dict[str, str]:
+        if not parts:
+            raise ValueError("multipart upload requires at least one part")
+        normalized = []
+        for expected, part in enumerate(parts, start=1):
+            number, etag = int(part.get("part_number") or 0), str(part.get("etag") or "")
+            if number != expected or not etag:
+                raise ValueError("multipart parts must be ordered, consecutive, and include ETags")
+            normalized.append({"PartNumber": number, "ETag": etag})
+        output_key = self._output_key_for_task(task)
+        self.output_client.complete_multipart_upload(
+            Bucket=self.output_bucket, Key=output_key, UploadId=upload_id,
+            MultipartUpload={"Parts": normalized},
+        )
+        return {"output_object_key": output_key}
+
+    def abort_multipart_upload(self, task: dict[str, Any], upload_id: str) -> None:
+        self.output_client.abort_multipart_upload(
+            Bucket=self.output_bucket, Key=self._output_key_for_task(task), UploadId=upload_id,
+        )

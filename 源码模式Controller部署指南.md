@@ -336,7 +336,7 @@ sudo -u ubuntu -H aws configure --profile s3-test
 sudo -u ubuntu -H aws sts get-caller-identity --profile s3-test
 ```
 
-所用 IAM 身份至少需要：源桶 `s3:ListBucket`、`s3:GetObject`；结果桶 `s3:ListBucket`、`s3:GetObject`（用于跳过已有结果）、`s3:PutObject`。AK/SK 只保存在 Controller 的 `/home/ubuntu/.aws/`，不要写入 Git、Ansible inventory 或 Vault 以外的明文文件。
+所用 IAM 身份至少需要：源桶 `s3:ListBucket`、`s3:GetObject`；结果桶 `s3:ListBucket`、`s3:GetObject`（用于跳过已有结果）、`s3:PutObject`、`s3:AbortMultipartUpload`。AK/SK 只保存在 Controller 的 `/home/ubuntu/.aws/`，不要写入 Git、Ansible inventory 或 Vault 以外的明文文件。
 
 编辑 `ansible/group_vars/all/settings.yml`：
 
@@ -368,7 +368,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 返回中的 `s3_ingested` 是本次新创建任务数。结果对象会上传至 `s3://processed-video-685538570851-us-east-2-an/outputs/`，保留源视频的子目录，并加上 `masked_` 前缀。数据库已记录的同一对象版本、或结果桶已存在的输出，会自动跳过。
 
-预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。当前上传方式是单次 S3 `PutObject`，单个结果文件应小于 5 GiB；更大的文件需要后续增加 multipart upload。
+预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。结果小于等于 5 GiB 使用单次 S3 `PutObject`；更大的结果会自动使用 Multipart Upload，按 64 MiB 分片上传。Controller 为每一片签发短期 URL 并完成合并，Worker 不持有 AWS 凭证；失败或取消时会 Abort 未完成上传。
 
 若修复 IAM 权限、网络或算法配置后需要重新执行一个已失败的任务，使用管理员 Token 将其重新放回队列（重置该任务的重试次数）：
 

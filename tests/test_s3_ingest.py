@@ -22,6 +22,8 @@ class FakePaginator:
 class FakeS3:
     def __init__(self, region="us-east-2"):
         self.region = region
+        self.completed_upload = None
+        self.aborted_upload = None
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -35,6 +37,16 @@ class FakeS3:
 
     def get_bucket_location(self, Bucket):
         return {"LocationConstraint": self.region}
+
+    def create_multipart_upload(self, **kwargs):
+        self.created_upload = kwargs
+        return {"UploadId": "upload-123"}
+
+    def complete_multipart_upload(self, **kwargs):
+        self.completed_upload = kwargs
+
+    def abort_multipart_upload(self, **kwargs):
+        self.aborted_upload = kwargs
 
 
 def test_s3_scan_is_idempotent_and_claim_urls_are_fresh(tmp_path: Path):
@@ -80,6 +92,36 @@ def test_s3_upload_url_can_be_refreshed_without_returning_the_source_url(tmp_pat
     assert refreshed["output_object_key"] == "masked/masked_a.mp4"
     assert refreshed["output_upload_url"].startswith("https://signed.us-east-2.example/put_object/")
     assert "source_url" not in refreshed
+    store.close()
+
+
+def test_s3_multipart_upload_is_presigned_and_completed_by_controller(tmp_path: Path):
+    store = ClusterStore(tmp_path / "controller.sqlite3")
+    output = FakeS3("us-east-2")
+    ingestor = S3Ingestor(store, "source-bucket", "incoming/", "output-bucket", "masked/",
+                          "us-east-2", presign_seconds=3600, client=FakeS3(), output_client=output)
+    assert ingestor.scan() == 1
+    task = store.list_tasks()[0]
+
+    started = ingestor.initiate_multipart_upload(task)
+    assert started == {"upload_id": "upload-123", "part_size": 64 * 1024 * 1024,
+                       "output_object_key": "masked/masked_a.mp4"}
+    signed = ingestor.multipart_part_url(task, "upload-123", 1)
+    assert signed["upload_part_url"].startswith("https://signed.us-east-2.example/upload_part/")
+    assert "upload-123" in signed["upload_part_url"] or "upload_part" in signed["upload_part_url"]
+
+    assert ingestor.complete_multipart_upload(task, "upload-123", [
+        {"part_number": 1, "etag": '"etag-1"'},
+        {"part_number": 2, "etag": '"etag-2"'},
+    ]) == {"output_object_key": "masked/masked_a.mp4"}
+    assert output.completed_upload == {
+        "Bucket": "output-bucket", "Key": "masked/masked_a.mp4", "UploadId": "upload-123",
+        "MultipartUpload": {"Parts": [
+            {"PartNumber": 1, "ETag": '"etag-1"'}, {"PartNumber": 2, "ETag": '"etag-2"'},
+        ]},
+    }
+    ingestor.abort_multipart_upload(task, "upload-456")
+    assert output.aborted_upload == {"Bucket": "output-bucket", "Key": "masked/masked_a.mp4", "UploadId": "upload-456"}
     store.close()
 
 

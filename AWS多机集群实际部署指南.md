@@ -70,7 +70,7 @@ ssh -i /absolute/path/to/terraform-host.pem \
     {
       "Sid": "ReadAndWriteOutput",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
       "Resource": "arn:aws:s3:::OUTPUT_BUCKET/outputs/*"
     },
     {
@@ -290,6 +290,8 @@ vault_video_mask_nginx_basic_auth_password: REPLACE_WITH_A_RANDOM_16_PLUS_CHARAC
 2. Controller 启动后立即扫描，之后在后台每 60 秒扫描一次；空闲 Worker 自动领取任务。
 3. 输出写入 `s3://OUTPUT_BUCKET/outputs/`，保存名为 `masked_<原文件名>.mp4`，并保留输入子目录结构。
 4. 查看状态使用 SSH 隧道后的 `http://127.0.0.1:8080/`：任务页每页展示 50 条，可翻页查看持续累积的历史任务；完成任务会显示输入/输出文件、大小、输出时长、处理耗时、算法和参数。也可通过 Bearer Token 调用 `/api/tasks?limit=50&offset=0`、`/api/workers`。若 S3 上传首次失败（例如预签名 PUT URL 过期），Worker 会向 Controller 获取一个新的上传 URL 并重试一次，不重新下载或处理视频。
+
+结果文件大于 5 GiB 时，Worker 会自动使用 S3 Multipart Upload：按 64 MiB 分片上传，Controller 仅签发分片 URL 并完成合并。输出桶权限须包含 `s3:AbortMultipartUpload`，以便 Worker 失败或取消时清理未完成分片。
 
 常用命令：
 

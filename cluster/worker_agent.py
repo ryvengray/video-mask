@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import signal
@@ -23,6 +24,7 @@ from typing import Any
 DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
                 "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8"]
 DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
+SINGLE_PUT_MAX_BYTES = 5 * 1024 * 1024 * 1024
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -143,6 +145,79 @@ class Worker:
             diagnostic = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
             raise RuntimeError("output upload failed: " + diagnostic[-3000:])
 
+    @staticmethod
+    def upload_part(url: str, source: Path, offset: int, size: int) -> str:
+        """Stream one byte range to a pre-signed S3 UploadPart URL."""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https":
+            raise RuntimeError("multipart upload URL must use HTTPS")
+        target = urllib.parse.urlunparse(("", "", parsed.path or "/", parsed.params, parsed.query, ""))
+        connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
+        try:
+            connection.putrequest("PUT", target, skip_host=True)
+            connection.putheader("Host", parsed.netloc)
+            connection.putheader("Content-Length", str(size))
+            connection.endheaders()
+            with source.open("rb") as handle:
+                handle.seek(offset)
+                remaining = size
+                while remaining:
+                    block = handle.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise RuntimeError("output file changed during multipart upload")
+                    connection.send(block)
+                    remaining -= len(block)
+            response = connection.getresponse()
+            body = response.read().decode("utf-8", errors="replace")
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"multipart part upload failed: HTTP {response.status} {body[-2000:]}")
+            etag = response.getheader("ETag")
+            if not etag:
+                raise RuntimeError("multipart part upload response did not include an ETag")
+            return etag
+        finally:
+            connection.close()
+
+    def upload_multipart(self, task: dict[str, Any], source: Path,
+                         cancel_requested: threading.Event) -> None:
+        task_id = str(task["task_id"])
+        started = self.api(f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/start", self.payload())
+        upload_id, part_size = str(started["upload_id"]), int(started["part_size"])
+        size = source.stat().st_size
+        parts: list[dict[str, Any]] = []
+        completed = False
+        try:
+            for part_number, offset in enumerate(range(0, size, part_size), start=1):
+                if cancel_requested.is_set():
+                    raise RuntimeError("cancelled by administrator")
+                length = min(part_size, size - offset)
+                for attempt in range(1, 4):
+                    try:
+                        signed = self.api(
+                            f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/part-url",
+                            self.payload(upload_id=upload_id, part_number=part_number),
+                        )
+                        etag = self.upload_part(str(signed["upload_part_url"]), source, offset, length)
+                        break
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        print(f"[{task_id}] multipart part {part_number} failed; retrying", file=sys.stderr, flush=True)
+                parts.append({"part_number": part_number, "etag": etag})
+                self.report(task_id, "uploading", phase="multipart_uploading",
+                            uploaded_bytes=min(offset + length, size), output_bytes=size,
+                            multipart_part=part_number)
+            self.api(f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/complete",
+                     self.payload(upload_id=upload_id, parts=parts))
+            completed = True
+        finally:
+            if not completed:
+                try:
+                    self.api(f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/abort",
+                             self.payload(upload_id=upload_id))
+                except Exception as exc:
+                    print(f"[{task_id}] failed to abort multipart upload: {exc}", file=sys.stderr, flush=True)
+
     def algorithm_command(self, source: Path, output_dir: Path, arguments: list[str]) -> list[str]:
         """Build an invocation for either a development script or a release binary.
 
@@ -238,36 +313,39 @@ class Worker:
             if output_url:
                 phase = "uploading"
                 self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
-                try:
-                    self.upload(output_url, output)
-                except RuntimeError as first_upload_error:
-                    # Long-running tasks may reach S3 after their original PUT
-                    # URL expires. Refresh only the output URL: the completed
-                    # video stays local, so no download or inference is repeated.
-                    print(f"[{task_id}] upload failed; requesting a fresh upload URL", flush=True)
+                if output.stat().st_size > SINGLE_PUT_MAX_BYTES:
+                    self.upload_multipart(task, output, cancel_requested)
+                else:
                     try:
-                        refreshed = self.api(
-                            f"/api/workers/{self.worker_id}/tasks/{task_id}/upload-url", self.payload()
-                        )
-                    except Exception as refresh_error:
-                        raise RuntimeError(
-                            "output upload failed and the refreshed URL request failed; "
-                            f"first error: {first_upload_error}; refresh error: {refresh_error}"
-                        ) from refresh_error
-                    refreshed_url = str(refreshed.get("output_upload_url") or "")
-                    if not refreshed_url:
-                        raise RuntimeError(
-                            "output upload failed and Controller did not provide a refreshed URL: "
-                            + str(first_upload_error)
-                        ) from first_upload_error
-                    self.report(task_id, "uploading", phase="uploading_retry", elapsed_seconds=elapsed,
-                                upload_retry_reason=str(first_upload_error)[-500:])
-                    try:
-                        self.upload(refreshed_url, output)
-                    except RuntimeError as retry_error:
-                        raise RuntimeError(
-                            "output upload failed after refreshed URL: " + str(retry_error)
-                        ) from retry_error
+                        self.upload(output_url, output)
+                    except RuntimeError as first_upload_error:
+                        # Long-running tasks may reach S3 after their original PUT
+                        # URL expires. Refresh only the output URL: the completed
+                        # video stays local, so no download or inference is repeated.
+                        print(f"[{task_id}] upload failed; requesting a fresh upload URL", flush=True)
+                        try:
+                            refreshed = self.api(
+                                f"/api/workers/{self.worker_id}/tasks/{task_id}/upload-url", self.payload()
+                            )
+                        except Exception as refresh_error:
+                            raise RuntimeError(
+                                "output upload failed and the refreshed URL request failed; "
+                                f"first error: {first_upload_error}; refresh error: {refresh_error}"
+                            ) from refresh_error
+                        refreshed_url = str(refreshed.get("output_upload_url") or "")
+                        if not refreshed_url:
+                            raise RuntimeError(
+                                "output upload failed and Controller did not provide a refreshed URL: "
+                                + str(first_upload_error)
+                            ) from first_upload_error
+                        self.report(task_id, "uploading", phase="uploading_retry", elapsed_seconds=elapsed,
+                                    upload_retry_reason=str(first_upload_error)[-500:])
+                        try:
+                            self.upload(refreshed_url, output)
+                        except RuntimeError as retry_error:
+                            raise RuntimeError(
+                                "output upload failed after refreshed URL: " + str(retry_error)
+                            ) from retry_error
                 completed_output = output
                 # Do not save a sensitive presigned URL in the Controller database.
                 output_location = task.get("output_object_key") or "uploaded"

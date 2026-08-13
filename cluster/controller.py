@@ -61,6 +61,23 @@ class FinishRequest(WorkerRequest):
     progress: dict[str, Any] = Field(default_factory=dict)
 
 
+class MultipartPart(BaseModel):
+    part_number: int = Field(ge=1, le=10_000)
+    etag: str = Field(min_length=1, max_length=512)
+
+
+class MultipartUploadRequest(WorkerRequest):
+    upload_id: str = Field(min_length=1, max_length=2048)
+
+
+class MultipartPartUrlRequest(MultipartUploadRequest):
+    part_number: int = Field(ge=1, le=10_000)
+
+
+class MultipartCompleteRequest(MultipartUploadRequest):
+    parts: list[MultipartPart] = Field(min_length=1, max_length=10_000)
+
+
 class TaskRequest(BaseModel):
     source_url: str
     output_upload_url: str | None = None
@@ -201,6 +218,44 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             return s3_ingestor.materialize_upload_url(task)
         return {"output_upload_url": str(task.get("output_upload_url") or ""),
                 "output_object_key": str(task.get("output_object_key") or "")}
+
+    @app.post("/api/workers/{worker_id}/tasks/{task_id}/multipart/start")
+    def start_multipart_upload(worker_id: str, task_id: str, request: WorkerRequest):
+        if request.worker_id != worker_id:
+            raise ValueError("worker id does not match path")
+        task = store.active_task_for_worker(worker_id, request.token, task_id)
+        if not s3_ingestor:
+            raise ValueError("multipart upload is available only for S3 tasks")
+        return s3_ingestor.initiate_multipart_upload(task)
+
+    @app.post("/api/workers/{worker_id}/tasks/{task_id}/multipart/part-url")
+    def multipart_part_url(worker_id: str, task_id: str, request: MultipartPartUrlRequest):
+        if request.worker_id != worker_id:
+            raise ValueError("worker id does not match path")
+        task = store.active_task_for_worker(worker_id, request.token, task_id)
+        if not s3_ingestor:
+            raise ValueError("multipart upload is available only for S3 tasks")
+        return s3_ingestor.multipart_part_url(task, request.upload_id, request.part_number)
+
+    @app.post("/api/workers/{worker_id}/tasks/{task_id}/multipart/complete")
+    def complete_multipart_upload(worker_id: str, task_id: str, request: MultipartCompleteRequest):
+        if request.worker_id != worker_id:
+            raise ValueError("worker id does not match path")
+        task = store.active_task_for_worker(worker_id, request.token, task_id)
+        if not s3_ingestor:
+            raise ValueError("multipart upload is available only for S3 tasks")
+        return s3_ingestor.complete_multipart_upload(task, request.upload_id,
+                                                      [model_data(part) for part in request.parts])
+
+    @app.post("/api/workers/{worker_id}/tasks/{task_id}/multipart/abort")
+    def abort_multipart_upload(worker_id: str, task_id: str, request: MultipartUploadRequest):
+        if request.worker_id != worker_id:
+            raise ValueError("worker id does not match path")
+        task = store.active_task_for_worker(worker_id, request.token, task_id)
+        if not s3_ingestor:
+            raise ValueError("multipart upload is available only for S3 tasks")
+        s3_ingestor.abort_multipart_upload(task, request.upload_id)
+        return {"status": "aborted"}
 
     @app.post("/api/tasks/{task_id}/progress")
     def progress(task_id: str, request: ProgressRequest):
