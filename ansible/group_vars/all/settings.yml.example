@@ -11,6 +11,13 @@ video_mask_controller_url: http://10.0.0.10:8080
 # Store these secrets with ansible-vault, never commit real values.
 video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
 video_mask_worker_token: "{{ vault_video_mask_worker_token }}"
+
+# Optional public HTTP dashboard proxy. Keep Controller port 8080 restricted
+# to Workers/VPN in its AWS security group; Nginx exposes port 80 instead.
+video_mask_nginx_enabled: false
+video_mask_nginx_server_name: _
+video_mask_nginx_basic_auth_user: admin
+video_mask_nginx_basic_auth_password: "{{ vault_video_mask_nginx_basic_auth_password }}"
 # Per physical Worker machine. Each slot is a separate Worker identity and
 # processes one task at a time. Start with 2; benchmark before increasing.
 video_mask_worker_slots: 1

@@ -265,6 +265,27 @@ curl -H "Authorization: Bearer ADMIN_TOKEN" \
 
 ## 6. 投入运行与运维
 
+### 可选：HTTP 登录入口
+
+默认应将 Controller 的 `8080` 入站限制为仅 Worker 安全组和受控运维网络。若需要暂时通过公网查看页面，可由 Nginx 在 TCP `80` 提供 Basic Auth 登录，并仅转发到 Controller 本机的 `127.0.0.1:8080`。HTTP 不加密密码，因此 **80 必须在安全组中限制为你的固定公网 IP，不能对 `0.0.0.0/0` 开放**。
+
+在 `ansible/group_vars/all/settings.yml` 中添加：
+
+```yaml
+video_mask_nginx_enabled: true
+video_mask_nginx_server_name: _
+video_mask_nginx_basic_auth_user: admin
+video_mask_nginx_basic_auth_password: "{{ vault_video_mask_nginx_basic_auth_password }}"
+```
+
+再将随机密码保存在 `group_vars/all/vault.yml`，不要写入 settings 或 Git：
+
+```yaml
+vault_video_mask_nginx_basic_auth_password: REPLACE_WITH_A_RANDOM_16_PLUS_CHARACTER_PASSWORD
+```
+
+部署 Controller 后，通过 `http://EC2_PUBLIC_DNS/` 访问；浏览器会要求输入该用户名和密码。Workers 继续通过私网 `http://CONTROLLER_PRIVATE_IP:8080` 工作，不经过 Nginx。
+
 1. 上传完成的视频到 `s3://INPUT_BUCKET/source/inbox/`。
 2. Controller 启动后立即扫描，之后在后台每 60 秒扫描一次；空闲 Worker 自动领取任务。
 3. 输出写入 `s3://OUTPUT_BUCKET/outputs/`，保存名为 `masked_<原文件名>.mp4`，并保留输入子目录结构。

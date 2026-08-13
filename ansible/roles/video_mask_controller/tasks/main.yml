@@ -10,6 +10,73 @@
     state: present
     update_cache: true
 
+- name: Validate Nginx dashboard authentication configuration
+  ansible.builtin.assert:
+    that:
+      - video_mask_nginx_basic_auth_user | default('') | length > 0
+      - video_mask_nginx_basic_auth_password | default('') | length >= 16
+    fail_msg: Nginx dashboard proxy requires a username and a Basic Auth password of at least 16 characters.
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Install Nginx for the public dashboard proxy
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Remove the default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Install dashboard Basic Auth credentials
+  ansible.builtin.copy:
+    dest: /etc/nginx/.htpasswd-video-mask
+    content: "{{ video_mask_nginx_basic_auth_user }}:{{ video_mask_nginx_basic_auth_password | password_hash('sha512', video_mask_nginx_basic_auth_user | hash('sha256') | truncate(16, true, '')) }}\n"
+    owner: root
+    group: www-data
+    mode: '0640'
+  no_log: true
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Install Nginx dashboard proxy site
+  ansible.builtin.template:
+    src: video-mask-dashboard-nginx.conf.j2
+    dest: /etc/nginx/sites-available/video-mask-dashboard
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Enable Nginx dashboard proxy site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/video-mask-dashboard
+    dest: /etc/nginx/sites-enabled/video-mask-dashboard
+    state: link
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Validate Nginx dashboard proxy configuration
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Remove Nginx dashboard proxy site when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/nginx/sites-enabled/video-mask-dashboard
+    - /etc/nginx/sites-available/video-mask-dashboard
+    - /etc/nginx/.htpasswd-video-mask
+  notify: Reload Nginx
+  when: not (video_mask_nginx_enabled | default(false) | bool)
+
 - name: Validate S3 configuration when S3 storage mode is selected
   ansible.builtin.assert:
     that:

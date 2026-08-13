@@ -12,3 +12,8 @@
   ansible.builtin.systemd:
     name: video-mask-autoscaler
     state: restarted
+
+- name: Reload Nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: reloaded
