@@ -81,11 +81,17 @@ def test_stale_worker_requeues_task(tmp_path: Path):
     store.register_worker("worker-01", TOKEN, {})
     created = store.create_task(task_payload())
     store.claim("worker-01", TOKEN)
+    store.progress("worker-01", TOKEN, created["task_id"], "processing", {"processing_started_at": 1})
     store.conn.execute("UPDATE workers SET last_seen_at=0 WHERE worker_id='worker-01'")
     store.conn.commit()
 
     assert store.requeue_stale(1) == 1
-    assert store.task(created["task_id"])["status"] == "pending"
+    recovered = store.task(created["task_id"])
+    assert recovered["status"] == "pending"
+    assert recovered["progress"] == {}
+    assert recovered["error_message"] is None
+    assert recovered["started_at"] is None
+    assert recovered["finished_at"] is None
     store.close()
 
 
@@ -138,7 +144,9 @@ def test_stale_orphaned_active_task_returns_to_queue(tmp_path: Path):
     recovered = store.task(created["task_id"])
     assert recovered["status"] == "pending"
     assert recovered["assigned_worker_id"] is None
-    assert recovered["error_message"] == "worker lease was orphaned"
+    assert recovered["error_message"] is None
+    assert recovered["progress"] == {}
+    assert recovered["started_at"] is None
     store.close()
 
 

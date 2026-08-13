@@ -428,11 +428,17 @@ class ClusterStore:
             cursor = self.conn.execute("""
                 UPDATE tasks SET status=CASE WHEN status='cancelling' THEN 'cancelled'
                   WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
-                  assigned_worker_id=NULL, error_message=CASE WHEN status='cancelling'
-                    THEN 'cancelled by administrator (worker heartbeat timed out)'
-                    ELSE 'worker heartbeat timeout' END, updated_at=?
+                  assigned_worker_id=NULL,
+                  progress_json=CASE WHEN status='cancelling' THEN progress_json ELSE '{}' END,
+                  output_sha256=CASE WHEN status='cancelling' THEN output_sha256 ELSE NULL END,
+                  output_duration_seconds=CASE WHEN status='cancelling' THEN output_duration_seconds ELSE NULL END,
+                  error_message=CASE WHEN status='cancelling' THEN 'cancelled by administrator (worker heartbeat timed out)'
+                    WHEN attempt_count < max_attempts THEN NULL ELSE 'worker heartbeat timeout' END,
+                  started_at=CASE WHEN status='cancelling' THEN started_at WHEN attempt_count < max_attempts THEN NULL ELSE started_at END,
+                  finished_at=CASE WHEN status='cancelling' THEN ? WHEN attempt_count < max_attempts THEN NULL ELSE ? END,
+                  updated_at=?
                 WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading','cancelling')
-            """, (stamp, row[1]))
+            """, (stamp, stamp, stamp, row[1]))
             recovered += cursor.rowcount
             self.conn.execute("UPDATE workers SET status='offline', current_task_id=NULL, updated_at=? WHERE worker_id=?", (stamp, row[0]))
 
@@ -451,11 +457,17 @@ class ClusterStore:
             cursor = self.conn.execute("""
                 UPDATE tasks SET status=CASE WHEN status='cancelling' THEN 'cancelled'
                   WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
-                  assigned_worker_id=NULL, error_message=CASE WHEN status='cancelling'
-                    THEN 'cancelled by administrator (orphaned worker slot)'
-                    ELSE 'worker lease was orphaned' END, updated_at=?
+                  assigned_worker_id=NULL,
+                  progress_json=CASE WHEN status='cancelling' THEN progress_json ELSE '{}' END,
+                  output_sha256=CASE WHEN status='cancelling' THEN output_sha256 ELSE NULL END,
+                  output_duration_seconds=CASE WHEN status='cancelling' THEN output_duration_seconds ELSE NULL END,
+                  error_message=CASE WHEN status='cancelling' THEN 'cancelled by administrator (orphaned worker slot)'
+                    WHEN attempt_count < max_attempts THEN NULL ELSE 'worker lease was orphaned' END,
+                  started_at=CASE WHEN status='cancelling' THEN started_at WHEN attempt_count < max_attempts THEN NULL ELSE started_at END,
+                  finished_at=CASE WHEN status='cancelling' THEN ? WHEN attempt_count < max_attempts THEN NULL ELSE ? END,
+                  updated_at=?
                 WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading','cancelling')
-            """, (stamp, row[0]))
+            """, (stamp, stamp, stamp, row[0]))
             recovered += cursor.rowcount
         # Idle Workers also need to become offline when their process or host
         # disappears.  Previously only Workers with a leased task changed
