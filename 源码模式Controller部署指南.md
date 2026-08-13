@@ -360,7 +360,7 @@ ansible-playbook -i inventory.yml site.yml \
   --limit controller -K --ask-vault-pass
 ```
 
-首次健康检查会扫描源桶；之后 Controller 每 60 秒扫描一次，或有 Worker 领取任务时按周期扫描一次：
+Controller 启动后会立即扫描源桶，并在后台每 60 秒扫描一次；Worker 领取任务和健康检查也会触发一次受周期限制的补充扫描：
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz

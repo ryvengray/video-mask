@@ -98,11 +98,19 @@ class S3Ingestor:
         with self._lock:
             if time.monotonic() - self._last_scan < self.poll_seconds:
                 return 0
-            created = self.scan()
+            created = self._scan()
             self._last_scan = time.monotonic()
             return created
 
     def scan(self) -> int:
+        """Scan immediately, serializing with scheduled and request-triggered scans."""
+        with self._lock:
+            created = self._scan()
+            self._last_scan = time.monotonic()
+            return created
+
+    def _scan(self) -> int:
+        """Scan while ``_lock`` is held by the caller."""
         created = 0
         paginator = self.source_client.get_paginator("list_objects_v2")
         prefix = f"{self.source_prefix}/" if self.source_prefix else ""

@@ -1,4 +1,7 @@
 from pathlib import Path
+import asyncio
+
+import pytest
 
 from cluster.s3_ingest import S3Ingestor
 from cluster.store import ClusterStore
@@ -78,3 +81,37 @@ def test_s3_upload_url_can_be_refreshed_without_returning_the_source_url(tmp_pat
     assert refreshed["output_upload_url"].startswith("https://signed.us-east-2.example/put_object/")
     assert "source_url" not in refreshed
     store.close()
+
+
+def test_controller_scans_s3_in_background_without_http_requests(tmp_path: Path):
+    try:
+        from cluster.controller import create_app
+    except TypeError as exc:
+        if "eval_type_backport" in str(exc):
+            pytest.skip("Controller's Pydantic v2 annotations require Python 3.10+ in this environment")
+        raise
+
+    class BackgroundIngestor:
+        poll_seconds = 0.01
+
+        def __init__(self):
+            self.validated = False
+            self.scans = 0
+
+        def validate_bucket_regions(self):
+            self.validated = True
+
+        def scan(self):
+            self.scans += 1
+            return 0
+
+    async def run() -> BackgroundIngestor:
+        ingestor = BackgroundIngestor()
+        app = create_app(tmp_path / "controller.sqlite3", "a" * 16, s3_ingestor=ingestor)  # type: ignore[arg-type]
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.03)
+        return ingestor
+
+    ingestor = asyncio.run(run())
+    assert ingestor.validated
+    assert ingestor.scans >= 1

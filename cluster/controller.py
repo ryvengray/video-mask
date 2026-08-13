@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import html
 import hmac
+import logging
 import os
 import sqlite3
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,9 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 from cluster.store import ClusterStore
 from cluster.local_ingest import LocalIngestor
 from cluster.s3_ingest import S3Ingestor
+
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerRequest(BaseModel):
@@ -87,10 +92,34 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        scan_task: asyncio.Task[None] | None = None
         if s3_ingestor:
             s3_ingestor.validate_bucket_regions()
-        yield
-        store.close()
+
+            async def scan_s3_forever() -> None:
+                """Continuously discover S3 uploads without depending on HTTP traffic."""
+                while True:
+                    try:
+                        # boto3 and SQLite work are synchronous; keep them off the API event loop.
+                        created = await asyncio.to_thread(s3_ingestor.scan)
+                        if created:
+                            logger.info("S3 scan created %d task(s)", created)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # A temporary IAM, DNS, or S3 problem must not permanently stop ingestion.
+                        logger.exception("S3 scan failed; will retry")
+                    await asyncio.sleep(s3_ingestor.poll_seconds)
+
+            scan_task = asyncio.create_task(scan_s3_forever(), name="video-mask-s3-ingest")
+        try:
+            yield
+        finally:
+            if scan_task:
+                scan_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await scan_task
+            store.close()
 
     app = FastAPI(title="Video Mask Cluster Controller", lifespan=lifespan)
 
