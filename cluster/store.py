@@ -423,8 +423,9 @@ class ClusterStore:
         threshold = now() - stale_after_seconds
         rows = self.conn.execute("SELECT worker_id, current_task_id FROM workers WHERE current_task_id IS NOT NULL AND last_seen_at < ?", (threshold,)).fetchall()
         stamp = now()
+        recovered = 0
         for row in rows:
-            self.conn.execute("""
+            cursor = self.conn.execute("""
                 UPDATE tasks SET status=CASE WHEN status='cancelling' THEN 'cancelled'
                   WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
                   assigned_worker_id=NULL, error_message=CASE WHEN status='cancelling'
@@ -432,7 +433,30 @@ class ClusterStore:
                     ELSE 'worker heartbeat timeout' END, updated_at=?
                 WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading','cancelling')
             """, (stamp, row[1]))
+            recovered += cursor.rowcount
             self.conn.execute("UPDATE workers SET status='offline', current_task_id=NULL, updated_at=? WHERE worker_id=?", (stamp, row[0]))
+
+        # A slot can disappear or lose its lease reference outside the normal
+        # finish path (for example after a host is removed).  Do not leave its
+        # active task stuck forever; wait one stale period to avoid recovering
+        # a transient inconsistency while an API request is in flight.
+        orphaned = self.conn.execute("""
+            SELECT t.task_id FROM tasks AS t
+            LEFT JOIN workers AS w ON w.worker_id=t.assigned_worker_id
+            WHERE t.status IN ('assigned','downloading','processing','uploading','cancelling')
+              AND t.updated_at < ?
+              AND (w.worker_id IS NULL OR w.current_task_id IS NULL OR w.current_task_id != t.task_id)
+        """, (threshold,)).fetchall()
+        for row in orphaned:
+            cursor = self.conn.execute("""
+                UPDATE tasks SET status=CASE WHEN status='cancelling' THEN 'cancelled'
+                  WHEN attempt_count < max_attempts THEN 'pending' ELSE 'failed' END,
+                  assigned_worker_id=NULL, error_message=CASE WHEN status='cancelling'
+                    THEN 'cancelled by administrator (orphaned worker slot)'
+                    ELSE 'worker lease was orphaned' END, updated_at=?
+                WHERE task_id=? AND status IN ('assigned','downloading','processing','uploading','cancelling')
+            """, (stamp, row[0]))
+            recovered += cursor.rowcount
         # Idle Workers also need to become offline when their process or host
         # disappears.  Previously only Workers with a leased task changed
         # state, leaving old ready records misleadingly visible forever.
@@ -441,4 +465,4 @@ class ClusterStore:
             WHERE current_task_id IS NULL AND last_seen_at < ? AND status != 'offline'
         """, (stamp, threshold))
         self.conn.commit()
-        return len(rows)
+        return recovered

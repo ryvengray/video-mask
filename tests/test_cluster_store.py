@@ -101,6 +101,47 @@ def test_stale_idle_worker_becomes_offline(tmp_path: Path):
     store.close()
 
 
+def test_stale_orphaned_cancelling_task_is_finalized(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01-slot-5", TOKEN)
+    store.register_worker("worker-01-slot-5", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01-slot-5", TOKEN)
+    store.cancel_task(created["task_id"])
+
+    # Simulate a removed slot whose lease reference was cleared before stale
+    # recovery had a chance to finalize its cancelling task.
+    store.conn.execute("UPDATE workers SET current_task_id=NULL WHERE worker_id='worker-01-slot-5'")
+    store.conn.execute("UPDATE tasks SET updated_at=0 WHERE task_id=?", (created["task_id"],))
+    store.conn.commit()
+
+    assert store.requeue_stale(1) == 1
+    recovered = store.task(created["task_id"])
+    assert recovered["status"] == "cancelled"
+    assert recovered["assigned_worker_id"] is None
+    assert recovered["error_message"] == "cancelled by administrator (orphaned worker slot)"
+    store.close()
+
+
+def test_stale_orphaned_active_task_returns_to_queue(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    store.conn.execute("DELETE FROM workers WHERE worker_id='worker-01'")
+    store.conn.execute("UPDATE tasks SET updated_at=0 WHERE task_id=?", (created["task_id"],))
+    store.conn.commit()
+
+    assert store.requeue_stale(1) == 1
+    recovered = store.task(created["task_id"])
+    assert recovered["status"] == "pending"
+    assert recovered["assigned_worker_id"] is None
+    assert recovered["error_message"] == "worker lease was orphaned"
+    store.close()
+
+
 def test_failed_task_retries_until_max_attempts(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)

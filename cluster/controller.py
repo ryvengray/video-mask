@@ -97,10 +97,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             s3_ingestor.validate_bucket_regions()
 
             async def scan_s3_forever() -> None:
-                """Continuously discover S3 uploads without depending on HTTP traffic."""
+                """Run S3 ingestion and lease recovery without HTTP traffic."""
                 while True:
                     try:
                         # boto3 and SQLite work are synchronous; keep them off the API event loop.
+                        requeued = await asyncio.to_thread(store.requeue_stale, stale_after_seconds)
+                        if requeued:
+                            logger.info("Recovered %d stale or orphaned task(s)", requeued)
                         created = await asyncio.to_thread(s3_ingestor.scan)
                         if created:
                             logger.info("S3 scan created %d task(s)", created)
