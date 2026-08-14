@@ -10,7 +10,8 @@ from cluster.store import ClusterStore
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts"}
 DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
-                "--face-int", "5", "--frame-skip", "2", "--face-model", "yolov8"]
+                "--face-conf", "0.35", "--face-int", "5", "--frame-skip", "2",
+                "--face-model", "yolov8"]
 DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
 
 
