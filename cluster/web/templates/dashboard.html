@@ -19,6 +19,11 @@
       <div class="metric"><div class="metric-label">Active workers</div><div class="metric-value">{{ active_workers }}</div><div class="metric-note">of {{ groups | length }} servers</div></div>
       <div class="metric"><div class="metric-label">Failed tasks</div><div class="metric-value">{{ task_status_counts.failed }}</div><div class="metric-note">Action may be required</div></div>
     </section>
+    <section id="s3-ingest-control" class="s3-ingest-control" data-configured="{{ 'true' if s3_ingest_configured else 'false' }}" data-enabled="{{ 'true' if s3_ingest_enabled else 'false' }}" aria-label="S3 task ingestion control">
+      <div class="s3-ingest-copy"><div class="metric-label">S3 task ingestion</div><div class="s3-ingest-title">Automatic source-bucket scanning</div><div id="s3-ingest-note" class="metric-note">{% if not s3_ingest_configured %}S3 is not configured on this Controller{% elif s3_ingest_enabled %}New source videos are discovered automatically{% else %}Scanning is paused; existing queued tasks continue normally{% endif %}</div></div>
+      <div class="s3-ingest-actions"><span id="s3-ingest-status" class="badge {% if s3_ingest_enabled %}success{% else %}muted{% endif %}">{% if not s3_ingest_configured %}Not configured{% elif s3_ingest_enabled %}Enabled{% else %}Paused{% endif %}</span><button id="s3-ingest-toggle" class="s3-ingest-button" type="button" {% if not s3_ingest_configured %}disabled{% endif %}>{% if s3_ingest_enabled %}Pause S3 ingestion{% else %}Resume S3 ingestion{% endif %}</button></div>
+      <p id="s3-ingest-message" class="s3-ingest-message" aria-live="polite"></p>
+    </section>
     <nav class="tabs" role="tablist">
       <button class="tab" data-tab="tasks" role="tab">Tasks</button>
       <button class="tab" data-tab="workers" role="tab">Workers</button>
