@@ -56,6 +56,14 @@ class S3Ingestor:
         self.output_client = output_client or client
 
     def output_key(self, source_key: str) -> str:
+        """Build an output key while preserving the source-relative directory.
+
+        For example, with ``source_prefix=source/inbox`` and
+        ``output_prefix=outputs``, ``source/inbox/s/s/m.mp4`` becomes
+        ``outputs/s/s/masked_m.mp4``.  Keeping the relative path prevents
+        identically named videos in different source folders from overwriting
+        one another in the output bucket.
+        """
         relative = source_key
         prefix = f"{self.source_prefix}/" if self.source_prefix else ""
         if prefix and source_key.startswith(prefix):

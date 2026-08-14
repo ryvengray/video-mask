@@ -68,6 +68,16 @@ def test_s3_scan_is_idempotent_and_claim_urls_are_fresh(tmp_path: Path):
     store.close()
 
 
+def test_s3_output_key_preserves_source_relative_directories(tmp_path: Path):
+    store = ClusterStore(tmp_path / "controller.sqlite3")
+    ingestor = S3Ingestor(store, "source-bucket", "source/inbox/", "output-bucket", "outputs/",
+                          "us-east-2", client=FakeS3())
+
+    assert ingestor.output_key("source/inbox/s/s/m.mp4") == "outputs/s/s/masked_m.mp4"
+    assert ingestor.output_key("source/inbox/other/m.mp4") == "outputs/other/masked_m.mp4"
+    store.close()
+
+
 def test_s3_separate_output_region_uses_its_own_client(tmp_path: Path):
     store = ClusterStore(tmp_path / "controller.sqlite3")
     ingestor = S3Ingestor(store, "source-bucket", "incoming/", "output-bucket", "masked/",
