@@ -80,12 +80,39 @@ class ClusterStore:
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_tasks_worker ON tasks(assigned_worker_id, status);
+        CREATE TABLE IF NOT EXISTS controller_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
         """)
         self.conn.commit()
 
     @synchronized
     def close(self) -> None:
         self.conn.close()
+
+    @synchronized
+    def boolean_setting(self, key: str, default: bool) -> bool:
+        """Return a persistent Controller feature switch, or its safe default."""
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings WHERE setting_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            return default
+        return str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
+
+    @synchronized
+    def set_boolean_setting(self, key: str, value: bool) -> bool:
+        """Persist a Controller feature switch across Controller restarts."""
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (key, "true" if value else "false", now()))
+        self.conn.commit()
+        return value
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -291,6 +318,38 @@ class ClusterStore:
             raise ValueError("task is already terminal")
         self.conn.commit()
         return self.task(task_id) or {}
+
+    @synchronized
+    def purge_tasks(self) -> dict[str, int]:
+        """Permanently remove all terminal and queued task records.
+
+        Active leases are deliberately protected: deleting an assigned or
+        processing task would leave its Worker unable to report progress or
+        completion.  Cancel those tasks and wait for them to finish first.
+        """
+        active_count = int(self.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status IN (?, ?, ?, ?, ?)",
+            tuple(sorted(ACTIVE)),
+        ).fetchone()[0])
+        if active_count:
+            raise ValueError(
+                f"cannot delete all tasks while {active_count} task(s) are active; "
+                "cancel them and wait for Workers to finish first"
+            )
+        count = int(self.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        self.conn.execute("DELETE FROM tasks")
+        # A Controller restarted during a completed lease can leave a stale
+        # Worker reference.  With no active task left, clear only such stale
+        # busy/cancelling state before production work begins.
+        self.conn.execute("""
+            UPDATE workers
+            SET current_task_id=NULL,
+                status=CASE WHEN status IN ('busy', 'cancelling') THEN 'ready' ELSE status END,
+                updated_at=?
+            WHERE current_task_id IS NOT NULL OR status IN ('busy', 'cancelling')
+        """, (now(),))
+        self.conn.commit()
+        return {"deleted_tasks": count}
 
     @synchronized
     def task(self, task_id: str) -> dict[str, Any] | None:

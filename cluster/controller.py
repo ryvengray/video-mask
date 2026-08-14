@@ -99,6 +99,10 @@ class WorkerProvisionRequest(BaseModel):
     token: str = Field(min_length=16)
 
 
+class S3IngestSwitchRequest(BaseModel):
+    enabled: bool
+
+
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                local_source_dir: Path | None = None, local_output_dir: Path | None = None,
                s3_ingestor: S3Ingestor | None = None,
@@ -110,6 +114,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         s3_ingestor = S3Ingestor(store, **s3_config)
     local_ingestor = (LocalIngestor(store, local_source_dir, local_output_dir)
                       if local_source_dir and local_output_dir else None)
+    # This switch only controls discovering *new* objects from S3.  Existing
+    # S3 tasks remain claimable and still receive fresh signed download/upload
+    # URLs, so pausing ingestion never strands work already in the queue.
+    s3_ingest_enabled = bool(s3_ingestor) and store.boolean_setting("s3_ingest_enabled", True)
+
+    def s3_ingest_is_enabled() -> bool:
+        return bool(s3_ingestor) and s3_ingest_enabled
 
     def model_data(model: BaseModel) -> dict[str, Any]:
         # FastAPI 0.110 uses Pydantic v2, while some supported deployments
@@ -120,19 +131,21 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     async def lifespan(_: FastAPI):
         scan_task: asyncio.Task[None] | None = None
         if s3_ingestor:
-            s3_ingestor.validate_bucket_regions()
+            if s3_ingest_is_enabled():
+                s3_ingestor.validate_bucket_regions()
 
             async def scan_s3_forever() -> None:
                 """Run S3 ingestion and lease recovery without HTTP traffic."""
                 while True:
                     try:
-                        # boto3 and SQLite work are synchronous; keep them off the API event loop.
-                        requeued = await asyncio.to_thread(store.requeue_stale, stale_after_seconds)
-                        if requeued:
-                            logger.info("Recovered %d stale or orphaned task(s)", requeued)
-                        created = await asyncio.to_thread(s3_ingestor.scan)
-                        if created:
-                            logger.info("S3 scan created %d task(s)", created)
+                        if s3_ingest_is_enabled():
+                            # boto3 and SQLite work are synchronous; keep them off the API event loop.
+                            requeued = await asyncio.to_thread(store.requeue_stale, stale_after_seconds)
+                            if requeued:
+                                logger.info("Recovered %d stale or orphaned task(s)", requeued)
+                            created = await asyncio.to_thread(s3_ingestor.scan)
+                            if created:
+                                logger.info("S3 scan created %d task(s)", created)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -178,9 +191,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def healthz() -> dict[str, str]:
         requeued = store.requeue_stale(stale_after_seconds)
         ingested = local_ingestor.scan() if local_ingestor else 0
-        s3_ingested = s3_ingestor.scan_if_due() if s3_ingestor else 0
+        s3_ingested = s3_ingestor.scan_if_due() if s3_ingest_is_enabled() else 0
         return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested),
-                "s3_ingested": str(s3_ingested)}
+                "s3_ingested": str(s3_ingested),
+                "s3_ingest_enabled": str(s3_ingest_is_enabled()).lower()}
 
     @app.post("/api/workers/register")
     def register_worker(request: WorkerRequest, http_request: Request):
@@ -204,7 +218,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         store.requeue_stale(stale_after_seconds)
         if local_ingestor:
             local_ingestor.scan()
-        if s3_ingestor:
+        if s3_ingest_is_enabled():
             s3_ingestor.scan_if_due()
         task = store.claim(worker_id, request.token)
         return {"task": s3_ingestor.materialize(task) if task and s3_ingestor else task}
@@ -309,6 +323,17 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.delete("/api/tasks")
+    def purge_tasks(confirm: str = "", authorization: str | None = Header(default=None)) -> dict[str, int]:
+        """Delete every task record after an explicit destructive-action confirmation."""
+        require_admin(authorization)
+        if confirm != "DELETE_ALL_TASKS":
+            raise HTTPException(status_code=400, detail="set confirm=DELETE_ALL_TASKS to delete all tasks")
+        try:
+            return store.purge_tasks()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/admin/workers")
     def provision_worker(request: WorkerProvisionRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -318,6 +343,26 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def retire_worker(worker_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return store.retire_worker(worker_id)
+
+    @app.get("/api/admin/s3-ingest")
+    def get_s3_ingest_switch(authorization: str | None = Header(default=None)) -> dict[str, bool]:
+        require_admin(authorization)
+        return {"configured": bool(s3_ingestor), "enabled": s3_ingest_is_enabled()}
+
+    @app.put("/api/admin/s3-ingest")
+    def set_s3_ingest_switch(request: S3IngestSwitchRequest,
+                             authorization: str | None = Header(default=None)) -> dict[str, bool]:
+        nonlocal s3_ingest_enabled
+        require_admin(authorization)
+        if not s3_ingestor:
+            raise HTTPException(status_code=409, detail="S3 ingestion is not configured on this Controller")
+        if request.enabled and not s3_ingest_enabled:
+            # Validate before persisting the enabled state, so a bad Bucket
+            # Region or missing permission cannot leave a misleading switch.
+            s3_ingestor.validate_bucket_regions()
+        s3_ingest_enabled = store.set_boolean_setting("s3_ingest_enabled", request.enabled)
+        logger.warning("S3 ingestion %s by administrator", "enabled" if s3_ingest_enabled else "disabled")
+        return {"configured": True, "enabled": s3_ingest_enabled}
 
     @app.get("/api/tasks")
     def list_tasks(limit: int = 100, offset: int = 0, status: str | None = None,

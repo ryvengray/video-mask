@@ -63,9 +63,18 @@ class ControllerClient:
     def restart(self, task_id: str) -> dict[str, Any]:
         return self.request("POST", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/restart")
 
+    def purge_tasks(self) -> dict[str, Any]:
+        return self.request("DELETE", "/api/tasks?confirm=DELETE_ALL_TASKS")
+
     def worker(self, worker_id: str) -> dict[str, Any] | None:
         response = self.request("GET", "/api/workers?limit=1000")
         return next((worker for worker in response["workers"] if worker["worker_id"] == worker_id), None)
+
+    def s3_ingest_status(self) -> dict[str, Any]:
+        return self.request("GET", "/api/admin/s3-ingest")
+
+    def set_s3_ingest(self, enabled: bool) -> dict[str, Any]:
+        return self.request("PUT", "/api/admin/s3-ingest", {"enabled": enabled})
 
 
 def read_token(value: str | None, token_file: Path) -> str:
@@ -140,6 +149,10 @@ def confirm(prompt: str) -> bool:
     return input(f"{prompt} [y/N]: ").strip().lower() in {"y", "yes"}
 
 
+def confirm_delete_all_tasks() -> bool:
+    return input("Type DELETE ALL TASKS to permanently remove every task record: ").strip() == "DELETE ALL TASKS"
+
+
 def parse_slots(specification: str) -> tuple[int, ...]:
     slots: set[int] = set()
     for part in specification.split(","):
@@ -195,7 +208,9 @@ Video Mask Cluster Manager
   4) Cancel a task
   5) Restart a completed, failed, or cancelled task
   6) Restart a Worker slot through Ansible
-  7) Exit""")
+  7) Enable, disable, or check S3 task ingestion
+  8) Permanently delete all task records
+  9) Exit""")
         choice = input("Choose: ").strip()
         try:
             if choice == "1":
@@ -223,9 +238,31 @@ Video Mask Cluster Manager
                 slot_specification = input("Slot number/range (for example 1 or 1-15): ").strip()
                 restart_slots(client, inventory, host, parse_slots(slot_specification), ask_vault_pass)
             elif choice == "7":
+                state = client.s3_ingest_status()
+                if not state["configured"]:
+                    print("S3 task ingestion is not configured on this Controller.")
+                    continue
+                current = "enabled" if state["enabled"] else "disabled"
+                value = input(f"S3 task ingestion is {current}. Choose [on/off/status]: ").strip().lower() or "status"
+                if value in {"on", "enable", "enabled"}:
+                    if confirm("Enable S3 task ingestion?"):
+                        print("Updated:", "enabled" if client.set_s3_ingest(True)["enabled"] else "disabled")
+                elif value in {"off", "disable", "disabled"}:
+                    if confirm("Disable S3 task ingestion? Existing queued tasks will continue."):
+                        print("Updated:", "enabled" if client.set_s3_ingest(False)["enabled"] else "disabled")
+                elif value == "status":
+                    print("S3 task ingestion:", current)
+                else:
+                    print("Choose on, off, or status.")
+            elif choice == "8":
+                page = client.task_page(None, 0, limit=1)
+                print(f"This will permanently delete {page['total']} task record(s).")
+                if confirm_delete_all_tasks():
+                    print("Deleted:", client.purge_tasks()["deleted_tasks"], "task record(s)")
+            elif choice == "9":
                 return
             else:
-                print("Choose 1-7.")
+                print("Choose 1-9.")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
 
@@ -233,7 +270,7 @@ Video Mask Cluster Manager
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage Video Mask Controller tasks")
     parser.add_argument("action", nargs="?", default="menu",
-                        choices=("menu", "list", "all", "detail", "cancel", "restart", "restart-slot"))
+                        choices=("menu", "list", "all", "detail", "cancel", "restart", "restart-slot", "s3-ingest", "purge"))
     parser.add_argument("task_id", nargs="?")
     parser.add_argument("--controller", default="http://127.0.0.1:8080")
     parser.add_argument("--token", help="Avoid when possible: --token is visible in shell history")
@@ -241,6 +278,8 @@ def main() -> None:
     parser.add_argument("--inventory", type=Path,
                         default=Path(__file__).resolve().parents[1] / "ansible" / "inventory.yml")
     parser.add_argument("--slot", help="Slot number/range for restart-slot, for example 1 or 1-15")
+    parser.add_argument("--confirm-delete-all", action="store_true",
+                        help="Required with purge; permanently deletes every non-active task record")
     parser.add_argument("--no-ask-vault-pass", action="store_true",
                         help="Do not pass --ask-vault-pass to Ansible")
     args = parser.parse_args()
@@ -254,6 +293,23 @@ def main() -> None:
             if not args.task_id or args.slot is None:
                 raise SystemExit("restart-slot requires an Ansible host and --slot N")
             restart_slots(client, args.inventory, args.task_id, parse_slots(args.slot), not args.no_ask_vault_pass)
+        elif args.action == "s3-ingest":
+            operation = (args.task_id or "status").lower()
+            if operation == "status":
+                result = client.s3_ingest_status()
+            elif operation in {"on", "enable", "enabled"}:
+                result = client.set_s3_ingest(True)
+            elif operation in {"off", "disable", "disabled"}:
+                result = client.set_s3_ingest(False)
+            else:
+                raise SystemExit("s3-ingest accepts status, on, or off")
+            show_task(result)
+        elif args.action == "purge":
+            if args.task_id:
+                raise SystemExit("purge does not accept a task ID")
+            if not args.confirm_delete_all:
+                raise SystemExit("purge requires --confirm-delete-all")
+            show_task(client.purge_tasks())
         else:
             if not args.task_id:
                 raise SystemExit(f"{args.action} requires TASK_ID")

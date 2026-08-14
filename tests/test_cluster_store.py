@@ -54,6 +54,18 @@ def test_task_without_upload_url_is_valid_for_worker_local_output(tmp_path: Path
     store.close()
 
 
+def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path):
+    database = tmp_path / "controller.sqlite3"
+    store = ClusterStore(database)
+    assert store.boolean_setting("s3_ingest_enabled", True) is True
+    assert store.set_boolean_setting("s3_ingest_enabled", False) is False
+    store.close()
+
+    reopened = ClusterStore(database)
+    assert reopened.boolean_setting("s3_ingest_enabled", True) is False
+    reopened.close()
+
+
 def test_task_list_pagination_returns_total_without_overlapping_pages(tmp_path: Path):
     store = new_store(tmp_path)
     task_ids = []
@@ -194,6 +206,37 @@ def test_pending_task_can_be_cancelled_and_restarted(tmp_path: Path):
     assert restarted["status"] == "pending"
     assert restarted["attempt_count"] == 0
     assert restarted["error_message"] is None
+    store.close()
+
+
+def test_purge_removes_all_non_active_tasks_and_clears_stale_worker_state(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-stale", TOKEN)
+    store.register_worker("worker-stale", TOKEN, {})
+    store.create_task(task_payload())
+    failed = task_payload()
+    failed["source_url"] = "https://storage.example/failed.mov"
+    store.create_task(failed)
+    store.conn.execute("UPDATE workers SET status='busy', current_task_id='obsolete-task' WHERE worker_id='worker-stale'")
+    store.conn.commit()
+
+    assert store.purge_tasks() == {"deleted_tasks": 2}
+    assert store.count_tasks() == 0
+    assert store.worker("worker-stale")["status"] == "ready"
+    assert store.worker("worker-stale")["current_task_id"] is None
+    store.close()
+
+
+def test_purge_rejects_active_tasks(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    with pytest.raises(ValueError, match=r"task\(s\) are active"):
+        store.purge_tasks()
+    assert store.task(created["task_id"])["status"] == "assigned"
     store.close()
 
 
