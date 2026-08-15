@@ -260,6 +260,7 @@ class Worker:
         phase = "initializing"
         output: Path | None = None
         elapsed: float | None = None
+        processing_started_at: float | None = None
         try:
             phase = "downloading"
             self.report(task_id, "downloading", phase="downloading")
@@ -267,8 +268,9 @@ class Worker:
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
             phase = "processing"
+            processing_started_at = time.time()
             self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size,
-                        processing_started_at=time.time())
+                        processing_started_at=processing_started_at)
             command = self.algorithm_command(
                 source, output_dir, task.get("arguments") or self.extra_args
             )
@@ -362,6 +364,7 @@ class Worker:
                     "input_bytes": source.stat().st_size,
                     "output_filename": completed_output.name,
                     "output_bytes": completed_output.stat().st_size,
+                    "processing_started_at": processing_started_at,
                     "processing_seconds": elapsed,
                     # Retain the existing field for older Controller databases/API consumers.
                     "elapsed_seconds": elapsed,
@@ -377,6 +380,8 @@ class Worker:
             }
             if elapsed is not None:
                 failure_progress.update({"processing_seconds": elapsed, "elapsed_seconds": elapsed})
+            if processing_started_at is not None:
+                failure_progress["processing_started_at"] = processing_started_at
             if output is not None and output.exists():
                 failure_progress.update({
                     "output_filename": output.name,

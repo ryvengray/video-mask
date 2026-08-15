@@ -39,6 +39,34 @@ STATUS_TONES = {
 }
 
 
+def statistics_window(start_value: str | None, end_value: str | None) -> tuple[float, float]:
+    """Parse dashboard date controls, defaulting to the most recent three days."""
+    local_timezone = dt.datetime.now().astimezone().tzinfo
+
+    def parse(value: str | None, fallback: float) -> float:
+        if not value:
+            return fallback
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("statistics dates must use ISO 8601 format") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=local_timezone)
+        return parsed.timestamp()
+
+    end_at = parse(end_value, time.time())
+    start_at = parse(start_value, end_at - 3 * 24 * 3600)
+    if end_at <= start_at:
+        raise ValueError("statistics end time must be after its start time")
+    if end_at - start_at > 90 * 24 * 3600:
+        raise ValueError("statistics range cannot exceed 90 days")
+    return start_at, end_at
+
+
+def datetime_local(timestamp: float) -> str:
+    return dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%dT%H:%M")
+
+
 class WorkerRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
     token: str = Field(min_length=16)
@@ -387,8 +415,14 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, page: int = 1):
+    def dashboard(request: Request, page: int = 1, statistics_start: str | None = None,
+                  statistics_end: str | None = None):
         store.requeue_stale(stale_after_seconds)
+        try:
+            stats_start, stats_end = statistics_window(statistics_start, statistics_end)
+            processing_statistics = store.processing_statistics(stats_start, stats_end)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         page_size = 50
         total_tasks = store.count_tasks()
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
@@ -534,6 +568,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "status_tones": STATUS_TONES,
                 "s3_ingest_configured": bool(s3_ingestor),
                 "s3_ingest_enabled": s3_ingest_is_enabled(),
+                "processing_statistics": processing_statistics,
+                "statistics_range_hours": round((stats_end - stats_start) / 3600),
+                "statistics_start_input": datetime_local(stats_start),
+                "statistics_end_input": datetime_local(stats_end),
                 "task_rows": task_rows,
                 "task_status_counts": task_status_counts,
                 "total_pages": total_pages,

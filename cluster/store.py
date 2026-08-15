@@ -80,6 +80,8 @@ class ClusterStore:
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_tasks_worker ON tasks(assigned_worker_id, status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_finished ON tasks(finished_at, status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_started ON tasks(started_at);
         CREATE TABLE IF NOT EXISTS controller_settings (
             setting_key TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL,
@@ -398,6 +400,193 @@ class ClusterStore:
             values,
         ).fetchall()
         return [self._row(row) or {} for row in rows]
+
+    @synchronized
+    def processing_statistics(self, start_at: float, end_at: float,
+                              bucket_seconds: int = 3600) -> dict[str, Any]:
+        """Aggregate completed output and Worker use over a selected time range.
+
+        ``completed_*`` metrics use a task's completion time.  Concurrency is
+        reconstructed from task start/end intervals, so it measures in-flight
+        Worker slots (download, inference and upload).  The separate algorithm
+        value uses the Worker-reported ``processing_seconds`` where available.
+        """
+        if end_at <= start_at:
+            raise ValueError("statistics end time must be after its start time")
+        if bucket_seconds < 60:
+            raise ValueError("statistics bucket must be at least 60 seconds")
+
+        bucket_start = int(start_at // bucket_seconds) * bucket_seconds
+        bucket_count = max(1, int((end_at - bucket_start + bucket_seconds - 1) // bucket_seconds))
+        hourly = [{
+            "start_at": bucket_start + index * bucket_seconds,
+            "completed_tasks": 0,
+            "failed_tasks": 0,
+            "completed_video_seconds": 0.0,
+            "in_flight_worker_seconds": 0.0,
+            "algorithm_worker_seconds": 0.0,
+            "peak_concurrency": 0,
+        } for index in range(bucket_count)]
+
+        finished_rows = self.conn.execute("""
+            SELECT * FROM tasks
+            WHERE finished_at >= ? AND finished_at < ?
+              AND status IN ('completed', 'failed', 'cancelled')
+            ORDER BY finished_at
+        """, (start_at, end_at)).fetchall()
+        finished_tasks = [self._row(row) or {} for row in finished_rows]
+
+        completed = [task for task in finished_tasks if task.get("status") == "completed"]
+        failed = [task for task in finished_tasks if task.get("status") == "failed"]
+        total_video_seconds = sum(
+            float(task.get("output_duration_seconds") or 0)
+            for task in completed if float(task.get("output_duration_seconds") or 0) > 0
+        )
+        total_processing_seconds = sum(
+            float((task.get("progress") or {}).get("processing_seconds") or 0)
+            for task in completed if float((task.get("progress") or {}).get("processing_seconds") or 0) > 0
+        )
+        total_end_to_end_seconds = sum(
+            max(0.0, float(task.get("finished_at") or 0) - float(task.get("started_at") or 0))
+            for task in completed
+            if task.get("started_at") is not None and task.get("finished_at") is not None
+        )
+        total_input_bytes = sum(
+            int((task.get("progress") or {}).get("input_bytes") or task.get("source_size_bytes") or 0)
+            for task in completed
+        )
+        total_output_bytes = sum(
+            int((task.get("progress") or {}).get("output_bytes") or 0)
+            for task in completed
+        )
+
+        def server_name(worker_id: Any) -> str:
+            value = str(worker_id or "unassigned")
+            prefix, marker, slot = value.rpartition("-slot-")
+            return prefix if marker and prefix and slot.isdigit() else value
+
+        worker_data: dict[str, dict[str, Any]] = {}
+        for task in finished_tasks:
+            worker = server_name(task.get("assigned_worker_id"))
+            row = worker_data.setdefault(worker, {
+                "worker": worker, "slots": set(), "completed_tasks": 0, "failed_tasks": 0,
+                "video_seconds": 0.0, "processing_seconds": 0.0, "end_to_end_seconds": 0.0,
+            })
+            worker_id = str(task.get("assigned_worker_id") or "")
+            if worker_id:
+                row["slots"].add(worker_id)
+            if task.get("status") == "failed":
+                row["failed_tasks"] += 1
+                continue
+            if task.get("status") != "completed":
+                continue
+            row["completed_tasks"] += 1
+            row["video_seconds"] += float(task.get("output_duration_seconds") or 0)
+            progress = task.get("progress") or {}
+            row["processing_seconds"] += float(progress.get("processing_seconds") or 0)
+            if task.get("started_at") is not None and task.get("finished_at") is not None:
+                row["end_to_end_seconds"] += max(0.0, float(task["finished_at"]) - float(task["started_at"]))
+
+        worker_rows = []
+        for row in worker_data.values():
+            video_seconds = row["video_seconds"]
+            processing_seconds = row["processing_seconds"]
+            end_to_end_seconds = row["end_to_end_seconds"]
+            worker_rows.append({
+                "worker": row["worker"],
+                "slot_count": len(row["slots"]),
+                "completed_tasks": row["completed_tasks"],
+                "failed_tasks": row["failed_tasks"],
+                "video_seconds": video_seconds,
+                "processing_seconds": processing_seconds,
+                "end_to_end_seconds": end_to_end_seconds,
+                "algorithm_realtime": video_seconds / processing_seconds if processing_seconds else None,
+                "worker_hours_per_video_hour": processing_seconds / video_seconds if video_seconds else None,
+                "end_to_end_realtime": video_seconds / end_to_end_seconds if end_to_end_seconds else None,
+            })
+        worker_rows.sort(key=lambda row: (-row["video_seconds"], row["worker"]))
+
+        # Completed media and failures are attributed to the hour in which the
+        # terminal state was recorded.  Task concurrency uses all overlapping
+        # work, including tasks that started before or end after this range.
+        for task in finished_tasks:
+            finished_at = float(task.get("finished_at") or 0)
+            bucket = int((finished_at - bucket_start) // bucket_seconds)
+            if not 0 <= bucket < bucket_count:
+                continue
+            if task.get("status") == "completed":
+                hourly[bucket]["completed_tasks"] += 1
+                hourly[bucket]["completed_video_seconds"] += float(task.get("output_duration_seconds") or 0)
+            elif task.get("status") == "failed":
+                hourly[bucket]["failed_tasks"] += 1
+
+        overlap_rows = self.conn.execute("""
+            SELECT * FROM tasks
+            WHERE started_at IS NOT NULL AND started_at < ?
+              AND (finished_at IS NULL OR finished_at > ?)
+        """, (end_at, start_at)).fetchall()
+        events: list[list[tuple[float, int]]] = [[] for _ in hourly]
+        for raw in overlap_rows:
+            task = self._row(raw) or {}
+            interval_start = max(start_at, float(task.get("started_at") or start_at))
+            interval_end = min(end_at, float(task.get("finished_at") or end_at))
+            if interval_end <= interval_start:
+                continue
+            first = max(0, int((interval_start - bucket_start) // bucket_seconds))
+            last = min(bucket_count - 1, int((interval_end - 0.000001 - bucket_start) // bucket_seconds))
+            for index in range(first, last + 1):
+                period_start = max(interval_start, hourly[index]["start_at"])
+                period_end = min(interval_end, hourly[index]["start_at"] + bucket_seconds)
+                if period_end <= period_start:
+                    continue
+                hourly[index]["in_flight_worker_seconds"] += period_end - period_start
+                events[index].append((period_start, 1))
+                events[index].append((period_end, -1))
+
+            progress = task.get("progress") or {}
+            processing_seconds = float(progress.get("processing_seconds") or 0)
+            process_start = progress.get("processing_started_at", task.get("started_at"))
+            if processing_seconds > 0 and isinstance(process_start, (int, float)):
+                algorithm_start = max(start_at, float(process_start))
+                algorithm_end = min(end_at, float(process_start) + processing_seconds)
+                if algorithm_end > algorithm_start:
+                    first = max(0, int((algorithm_start - bucket_start) // bucket_seconds))
+                    last = min(bucket_count - 1, int((algorithm_end - 0.000001 - bucket_start) // bucket_seconds))
+                    for index in range(first, last + 1):
+                        period_start = max(algorithm_start, hourly[index]["start_at"])
+                        period_end = min(algorithm_end, hourly[index]["start_at"] + bucket_seconds)
+                        if period_end > period_start:
+                            hourly[index]["algorithm_worker_seconds"] += period_end - period_start
+
+        for index, bucket_events in enumerate(events):
+            running = peak = 0
+            # End events first at a shared timestamp: intervals are [start, end).
+            for _, change in sorted(bucket_events, key=lambda item: (item[0], item[1])):
+                running += change
+                peak = max(peak, running)
+            hourly[index]["peak_concurrency"] = peak
+            hourly[index]["average_concurrency"] = hourly[index]["in_flight_worker_seconds"] / bucket_seconds
+
+        range_seconds = end_at - start_at
+        return {
+            "start_at": start_at,
+            "end_at": end_at,
+            "bucket_seconds": bucket_seconds,
+            "completed_tasks": len(completed),
+            "failed_tasks": len(failed),
+            "success_rate": len(completed) / (len(completed) + len(failed)) if completed or failed else None,
+            "retry_count": sum(max(0, int(task.get("attempt_count") or 0) - 1) for task in finished_tasks),
+            "video_seconds": total_video_seconds,
+            "input_bytes": total_input_bytes,
+            "output_bytes": total_output_bytes,
+            "processing_seconds": total_processing_seconds,
+            "end_to_end_seconds": total_end_to_end_seconds,
+            "calendar_realtime": total_video_seconds / range_seconds if range_seconds else None,
+            "algorithm_realtime": total_video_seconds / total_processing_seconds if total_processing_seconds else None,
+            "worker_hours_per_video_hour": total_processing_seconds / total_video_seconds if total_video_seconds else None,
+            "hourly": hourly,
+            "workers": worker_rows,
+        }
 
     @synchronized
     def claim(self, worker_id: str, token: str) -> dict[str, Any] | None:

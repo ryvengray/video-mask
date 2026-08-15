@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import pytest
 
@@ -84,6 +85,54 @@ def test_task_list_pagination_returns_total_without_overlapping_pages(tmp_path: 
         {task["task_id"] for task in second_page}
     )
     assert {task["task_id"] for task in first_page + second_page} == set(task_ids)
+    store.close()
+
+
+def test_processing_statistics_reports_hourly_concurrency_and_worker_efficiency(tmp_path: Path):
+    store = new_store(tmp_path)
+    start = 1_700_000_000.0
+
+    first = store.create_task(task_payload())
+    second_payload = task_payload()
+    second_payload["source_url"] = "https://storage.example/second.mov"
+    second = store.create_task(second_payload)
+    failed_payload = task_payload()
+    failed_payload["source_url"] = "https://storage.example/failed.mov"
+    failed = store.create_task(failed_payload)
+    store.conn.execute("""
+        UPDATE tasks SET status='completed', assigned_worker_id='worker-01-slot-1',
+          output_duration_seconds=7200, started_at=?, finished_at=?,
+          progress_json=? WHERE task_id=?
+    """, (start + 600, start + 1800, json.dumps({
+        "processing_started_at": start + 700, "processing_seconds": 900,
+        "input_bytes": 100, "output_bytes": 80,
+    }), first["task_id"]))
+    store.conn.execute("""
+        UPDATE tasks SET status='completed', assigned_worker_id='worker-02-slot-1',
+          output_duration_seconds=3600, started_at=?, finished_at=?,
+          progress_json=? WHERE task_id=?
+    """, (start + 1200, start + 4500, json.dumps({
+        "processing_started_at": start + 1500, "processing_seconds": 900,
+    }), second["task_id"]))
+    store.conn.execute("""
+        UPDATE tasks SET status='failed', assigned_worker_id='worker-01-slot-1',
+          started_at=?, finished_at=?, progress_json=? WHERE task_id=?
+    """, (start + 2000, start + 2500, json.dumps({"processing_seconds": 300}), failed["task_id"]))
+    store.conn.commit()
+
+    statistics = store.processing_statistics(start, start + 7200)
+
+    assert statistics["completed_tasks"] == 2
+    assert statistics["failed_tasks"] == 1
+    assert statistics["video_seconds"] == 10_800
+    assert statistics["processing_seconds"] == 1_800
+    assert statistics["algorithm_realtime"] == 6
+    assert statistics["worker_hours_per_video_hour"] == pytest.approx(1 / 6)
+    assert statistics["hourly"][0]["completed_tasks"] == 1
+    assert statistics["hourly"][1]["completed_tasks"] == 1
+    assert statistics["hourly"][0]["peak_concurrency"] == 2
+    assert statistics["hourly"][1]["peak_concurrency"] == 1
+    assert [row["worker"] for row in statistics["workers"]] == ["worker-01", "worker-02"]
     store.close()
 
 
