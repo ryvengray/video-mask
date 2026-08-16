@@ -37,6 +37,10 @@ STATUS_TONES = {
     "pending": "pending", "cancelling": "warning", "cancelled": "warning",
     "offline": "muted", "failed": "danger",
 }
+TASK_FILTER_STATUSES = (
+    "pending", "assigned", "downloading", "processing", "uploading",
+    "cancelling", "completed", "failed", "cancelled",
+)
 
 
 def statistics_window(start_value: str | None, end_value: str | None) -> tuple[float, float]:
@@ -415,19 +419,23 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, page: int = 1, statistics_start: str | None = None,
-                  statistics_end: str | None = None):
+    def dashboard(request: Request, page: int = 1, task_status: str | None = None,
+                  statistics_start: str | None = None, statistics_end: str | None = None):
         store.requeue_stale(stale_after_seconds)
         try:
             stats_start, stats_end = statistics_window(statistics_start, statistics_end)
             processing_statistics = store.processing_statistics(stats_start, stats_end)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        selected_task_status = task_status.strip() if task_status else ""
+        if selected_task_status and selected_task_status not in TASK_FILTER_STATUSES:
+            raise HTTPException(status_code=400, detail="unknown task status filter")
+        selected_statuses = (selected_task_status,) if selected_task_status else None
         page_size = 50
-        total_tasks = store.count_tasks()
+        total_tasks = store.count_tasks(selected_statuses)
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
-        rows = store.list_tasks(page_size, (page - 1) * page_size)
+        rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses)
 
         def byte_size(value: Any) -> str:
             try:
@@ -459,7 +467,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         workers = store.list_workers(1000)
         task_status_counts = {
             status: store.count_tasks((status,))
-            for status in ("pending", "assigned", "downloading", "processing", "uploading", "cancelling", "completed", "failed", "cancelled")
+            for status in TASK_FILTER_STATUSES
         }
 
         def task_view(task: dict[str, Any]) -> dict[str, Any]:
@@ -573,7 +581,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "statistics_start_input": datetime_local(stats_start),
                 "statistics_end_input": datetime_local(stats_end),
                 "task_rows": task_rows,
+                "task_filter_options": [(status, task_status_counts[status]) for status in TASK_FILTER_STATUSES],
                 "task_status_counts": task_status_counts,
+                "selected_task_status": selected_task_status,
+                "task_total_all": sum(task_status_counts.values()),
                 "total_pages": total_pages,
                 "total_tasks": total_tasks,
                 "updated_at": dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),

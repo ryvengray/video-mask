@@ -11,6 +11,10 @@ function activate(name) {
 }
 tabs.forEach(tab => tab.addEventListener('click', () => activate(tab.dataset.tab)));
 activate(['tasks', 'workers', 'statistics'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'tasks');
+const taskStatusFilter = document.getElementById('task-status-filter');
+document.getElementById('task-status-filter-select')?.addEventListener('change', () => {
+  taskStatusFilter?.requestSubmit();
+});
 const workerFilter = document.getElementById('worker-status-filter');
 workerFilter?.addEventListener('change', () => {
   const selected = workerFilter.value;

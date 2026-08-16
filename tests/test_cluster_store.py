@@ -88,6 +88,22 @@ def test_task_list_pagination_returns_total_without_overlapping_pages(tmp_path: 
     store.close()
 
 
+def test_task_list_can_filter_by_status(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    assigned = store.create_task(task_payload())
+    pending_payload = task_payload()
+    pending_payload["source_url"] = "https://storage.example/pending.mov"
+    pending = store.create_task(pending_payload)
+    store.claim("worker-01", TOKEN)
+
+    assert store.count_tasks(("assigned",)) == 1
+    assert [task["task_id"] for task in store.list_tasks(statuses=("assigned",))] == [assigned["task_id"]]
+    assert [task["task_id"] for task in store.list_tasks(statuses=("pending",))] == [pending["task_id"]]
+    store.close()
+
+
 def test_processing_statistics_reports_hourly_concurrency_and_worker_efficiency(tmp_path: Path):
     store = new_store(tmp_path)
     start = 1_700_000_000.0
