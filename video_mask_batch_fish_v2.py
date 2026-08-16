@@ -2,21 +2,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-video_mask_batch_fish_v2.py — 视频批量打码（人脸 + 信用卡），精简版
 
 人脸:
   YuNet(默认, 仅 OpenCV 依赖) / YOLOv8-nano(极速, 需 ultralytics)
   → LK 光流跟踪
   检测间隔+光流跟踪(每5帧检测1次, 中间帧LK跟踪)
 信用卡/银行卡:
-  OWLv2 深度学习零样本检测(高准确率, 任意颜色/遮挡) + LK 光流跟踪
-  关键帧检测间隔(--card-key-int, 默认10帧) + 降分辨率输入(--owl-size, 默认1280)
+  YOLOv8n 自训练检测(需先跑 train_card_yolov8.py 训练, 最准最快) + LK 光流跟踪
+  关键帧检测间隔(--card-key-int, 默认10帧) + 输入尺寸(--card-size, 默认640)
+宠物(猫/狗/鸟):
+  YOLOv8n COCO 预训练(15=cat, 16=dog, 14=bird) + LK 光流跟踪
+  检测间隔(--pet-int, 默认5帧) + 复用 ultralytics 依赖
 
 加速:
   管道模式(ffmpeg rawvideo → Python → ffmpeg, 无磁盘I/O)
   硬件编码(macOS VideoToolbox / NVENC / QSV, 自动检测)
-  MPS GPU 加速(Apple Silicon OWLv2)
-  关键帧检测 + 光流跟踪(人脸+卡)
+  MPS GPU 加速(Apple Silicon YOLOv8)
+  关键帧检测 + 光流跟踪(人脸+卡+宠物)
   抽帧跳帧(--frame-skip, 提速2-3倍)
 
 用法:
@@ -27,10 +29,13 @@ video_mask_batch_fish_v2.py — 视频批量打码（人脸 + 信用卡），精
   python video_mask_batch_fish_v2.py video.mp4 --out-dir ./out
   python video_mask_batch_fish_v2.py video.mp4 --no-face            # 关闭人脸打码
   python video_mask_batch_fish_v2.py video.mp4 --no-card            # 关闭信用卡打码
+  python video_mask_batch_fish_v2.py video.mp4 --no-pet             # 关闭宠物打码
+  python video_mask_batch_fish_v2.py video.mp4 --pet-conf 0.4       # 宠物置信度阈值
+  python video_mask_batch_fish_v2.py video.mp4 --pet-int 10         # 宠物检测间隔
   python video_mask_batch_fish_v2.py video.mp4 --face-conf 0.25
-  python video_mask_batch_fish_v2.py video.mp4 --card-conf 0.3      # OWLv2置信度阈值
-  python video_mask_batch_fish_v2.py video.mp4 --card-key-int 20     # OWLv2检测间隔
-  python video_mask_batch_fish_v2.py video.mp4 --owl-size 0          # OWLv2用原图(最准最慢)
+  python video_mask_batch_fish_v2.py video.mp4 --card-conf 0.3      # 信用卡置信度阈值
+  python video_mask_batch_fish_v2.py video.mp4 --card-key-int 20     # 信用卡检测间隔
+  python video_mask_batch_fish_v2.py video.mp4 --card-size 0           # 信用卡用原图(最准最慢)
   python video_mask_batch_fish_v2.py video.mp4 --fisheye
   python video_mask_batch_fish_v2.py video.mp4 --fisheye --fisheye-device pico4
   python video_mask_batch_fish_v2.py video.mp4 --frame-skip 2
@@ -38,12 +43,13 @@ video_mask_batch_fish_v2.py — 视频批量打码（人脸 + 信用卡），精
 依赖:
   pip install opencv-python numpy
   # YOLOv8 人脸检测可选: pip install ultralytics
-  # OWLv2 卡检测需: pip install torch transformers pillow
+  # 信用卡检测: 需先跑 train_card_yolov8.py 产出 yolov8n-card.pt(约6MB), 复用 ultralytics
+  # 宠物检测: yolov8n.pt 首次自动下载(约6MB), 复用 ultralytics
   # 系统需 ffmpeg(保留音轨)
 
 代码调用:
   from video_mask_batch_fish_v2 import process_video
-  process_video("in.mp4", "out.mp4", face_model="yunet", card_on=True)
+  process_video("in.mp4", "out.mp4", face_model="yunet", card_on=True, pet_on=True)
 """
 import argparse
 import glob
@@ -69,11 +75,20 @@ FACE_DETECT_INT = 5           # 人脸检测间隔: 每5帧检测1次, 中间帧
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
 FACE_GRACE = 4               # 人脸漏检沿用旧框帧数(运动时收紧, 防打码框滞后)
 CARD_CELLS, CARD_SIGMA = 6, 35.0
-CARD_KEY_INT = 10            # OWLv2 每10帧检测一次
-CARD_OWL_CONF = 0.25          # OWLv2 置信度阈值
-CARD_OWL_SIZE = 1280          # OWLv2 输入最长边像素(0=原图; 1280≈提速3-8倍)
-OWL_MODEL = "google/owlv2-base-patch16-ensemble"
-CARD_TEXTS = ["a credit card", "a bank card", "a debit card"]
+CARD_KEY_INT = 10            # 信用卡每10帧检测一次
+CARD_CONF = 0.25          # 信用卡置信度阈值
+CARD_SIZE = 640          # 信用卡检测输入尺寸(32的倍数)
+CARD_MODEL_FILE = "yolov8n-card.pt"  # 自训练单类别模型, 由 train_card_yolov8.py 产出, 约6MB
+
+# 宠物检测 (YOLOv8n COCO: cat/dog/bird)
+PET_MODEL_FILE = "yolov8n.pt"          # COCO 预训练, ultralytics 首次自动下载约6MB
+PET_CLASSES = (15, 16, 14)             # COCO 类别: 15=cat, 16=dog, 14=bird
+PET_CONF = 0.3                         # 宠物置信度阈值
+PET_INT = 5                            # 宠物检测间隔帧数(每5帧检测1次, 中间帧光流跟踪)
+PET_GRACE = 4                          # 宠物漏检沿用旧框帧数
+PET_EXPAND = 0.12                      # 宠物打码框外扩比例
+PET_CELLS, PET_SIGMA = 6, 35.0         # 宠物马赛克参数
+PET_INPUT_SIZE = 640                   # 宠物检测输入尺寸(32的倍数)
 
 VIDEO_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v",
                  ".mpg", ".mpeg", ".ts", ".m2ts", ".wmv", ".3gp", ".rmvb",
@@ -477,94 +492,300 @@ class FaceProcessor:
         return self.last_faces
 
 
-# ================= 信用卡检测 =================
-# OWLv2 深度学习(高准确率)
+# ================= 宠物检测 =================
+# YOLOv8n COCO 预训练模型 (cat/dog/bird)
 
-class OwlCardDetector:
-    """OWLv2 零样本检测, 懒加载(首次自动下载模型约600MB)。
-    支持 CUDA/MPS(GPU) 加速 + 降分辨率输入提速, 检测框自动映射回原图坐标。"""
+class PetDetector:
+    """YOLOv8n COCO 宠物检测器 — 检测 cat(15)/dog(16)/bird(14)。
+
+    与 YOLOFaceDetector 保持相同接口: detect(img, conf) -> [(x1,y1,x2,y2),...]
+    使用 ultralytics 包，首次运行自动下载 yolov8n.pt 到 ~/.cache/ultralytics/。
+    """
+
+    def __init__(self, model_dir=None, yolo_size=PET_INPUT_SIZE, use_gpu=True):
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 ultralytics。请安装：pip install ultralytics"
+            ) from exc
+        self.yolo_size = self._normalize_size(yolo_size)
+        self.device = self._select_device(use_gpu)
+
+        # 查找模型: model_dir > CWD > 脚本目录 > ultralytics 自动下载
+        model_path = self._find_model(model_dir, PET_MODEL_FILE)
+        self._model = YOLO(model_path if model_path else PET_MODEL_FILE)
+
+        # fuse(): 融合 Conv+BN 层, 数学等价但推理快 5-15%
+        try:
+            self._model.fuse()
+        except Exception:
+            pass
+
+        # 预热: 跑一次空推理，避免首帧卡顿
+        import numpy as np
+        dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
+        self._model(dummy, imgsz=self.yolo_size, device=self.device,
+                    conf=0.5, verbose=False)
+
+    @staticmethod
+    def _find_model(model_dir, filename):
+        """按优先级搜索模型文件。返回路径或 None(触发 ultralytics 自动下载)。"""
+        candidates = []
+        if model_dir:
+            candidates.append(os.path.join(model_dir, filename))
+        candidates.append(os.path.join(os.getcwd(), filename))
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       filename))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    @staticmethod
+    def _normalize_size(size):
+        """调整为 32 的倍数 (YOLO 要求)。"""
+        return max(32, round(size / 32) * 32)
+
+    @staticmethod
+    def _select_device(use_gpu):
+        """自动选择最优设备: CUDA > MPS > CPU。"""
+        if not use_gpu:
+            return "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+            if torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
+        return "cpu"
+
+    def detect(self, img, conf=PET_CONF):
+        """返回 bbox 列表, 仅保留 cat/dog/bird 三类。"""
+        if img is None or img.size == 0:
+            return []
+
+        # stream=True: 生成器模式, 减少结果对象包装开销
+        results = self._model(img, imgsz=self.yolo_size, conf=conf,
+                              device=self.device, verbose=False, stream=True)
+        bboxes = []
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                cls_id = int(box.cls[0]) if box.cls is not None else -1
+                if cls_id not in PET_CLASSES:  # 仅保留 cat(15)/dog(16)/bird(14)
+                    continue
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                h, w = img.shape[:2]
+                x1, y1 = max(0, int(x1)), max(0, int(y1))
+                x2, y2 = min(w, int(x2)), min(h, int(y2))
+                if x2 > x1 and y2 > y1:
+                    bboxes.append((x1, y1, x2, y2))
+        return bboxes
+
+
+class PetProcessor:
+    """宠物检测+光流跟踪：关键帧检测，中间帧LK光流跟踪。支持多目标。"""
+    def __init__(self, detector, detect_int=PET_INT, grace=PET_GRACE, conf=PET_CONF):
+        self.detector = detector
+        self.detect_int = max(1, detect_int)
+        self.conf = conf
+        self.grace = grace          # 检测失败时沿用旧框的帧数
+        self.miss_count = 0         # 连续检测失败的周期数
+        self.last_pets = []
+        self.prev_gray = None
+        self.pet_pts = {}
+        # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
+        self.lk = dict(winSize=(21, 21), maxLevel=3,
+                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
+        # 网格采样点数: 3×3=9 点, 替代 goodFeaturesToTrack 的 corner detection 开销
+        # 9 点 median 估计位移仍稳健, 比 5×5=25 点 LK 提速约 2x
+        self._grid_rows, self._grid_cols = 3, 3
+
+    def _init_pts(self, gray, box):
+        """用均匀网格采样替代 goodFeaturesToTrack 的角点检测。
+        grid 采样 O(1) vs corner detection O(N), 对 1080P 帧约节省 2-5ms。"""
+        x1, y1, x2, y2 = box
+        h_img, w_img = gray.shape
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_img, x2), min(h_img, y2)
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 12 or bh < 12:
+            return None
+        # 在 bbox 内部均匀采样 3x3 网格点
+        margin = 0.12
+        xs = np.linspace(x1 + bw * margin, x2 - bw * margin, self._grid_cols, dtype=np.float32)
+        ys = np.linspace(y1 + bh * margin, y2 - bh * margin, self._grid_rows, dtype=np.float32)
+        xv, yv = np.meshgrid(xs, ys)
+        pts = np.column_stack((xv.ravel(), yv.ravel())).reshape(-1, 1, 2)
+        return pts.astype(np.float32)
+
+    def process(self, img, frame_idx):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_pets
+        if need_detect:
+            dets = self.detector.detect(img, conf=self.conf)
+            # 多目标场景: 保留全部检测结果
+            if dets:
+                pets = dets
+                self.miss_count = 0
+            elif self.last_pets and self.miss_count < self.grace:
+                # 检测失败: 宽容期内沿用上一帧框(LK跟踪会继续修正)
+                pets = self.last_pets
+                self.miss_count += 1
+            else:
+                pets = []
+                self.miss_count = 0
+            self.pet_pts = {}
+            for i, box in enumerate(pets):
+                pts = self._init_pts(gray, box)
+                if pts is not None:
+                    self.pet_pts[i] = pts
+            self.last_pets = pets
+        elif self.prev_gray is not None and self.last_pets and self.pet_pts:
+            tracked, new_pts = [], {}
+            for i, (x1, y1, x2, y2) in enumerate(self.last_pets):
+                if i not in self.pet_pts or len(self.pet_pts[i]) < 4:
+                    tracked.append((x1, y1, x2, y2))
+                    continue
+                pts = self.pet_pts[i]
+                npts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    self.prev_gray, gray, pts, None, **self.lk)
+                good_mask = status.flatten() == 1
+                if good_mask.sum() >= 4:
+                    good = npts[good_mask].reshape(-1, 2)
+                    old_flat = pts[good_mask].reshape(-1, 2)
+                    dx = float(np.median(good[:, 0] - old_flat[:, 0]))
+                    dy = float(np.median(good[:, 1] - old_flat[:, 1]))
+                    tracked.append((int(x1 + dx), int(y1 + dy),
+                                    int(x2 + dx), int(y2 + dy)))
+                    new_pts[i] = good.reshape(-1, 1, 2)
+                else:
+                    tracked.append((x1, y1, x2, y2))
+            self.pet_pts = new_pts
+            self.last_pets = tracked
+        self.prev_gray = gray
+        return self.last_pets
+
+
+# ================= 信用卡检测 =================
+# 自训练 YOLOv8n 单类别检测(需先跑 train_card_yolov8.py 产出 yolov8n-card.pt)
+
+class YoloCardDetector:
+    """YOLOv8n 自训练信用卡检测器 — 加载 yolov8n-card.pt 单类别模型(class 0=card)。
+    模型由 train_card_yolov8.py 训练产出, 需放在 model_dir/CWD/脚本目录。
+    detect() 返回 [(x1,y1,x2,y2,score), ...], 含 score 供 CardTracker 选最佳框。"""
     _inst = None
     _inst_size = None
     _inst_gpu = None
 
-    def __init__(self, owl_size=CARD_OWL_SIZE, use_gpu=True):
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        import torch
-        from PIL import Image
-        from transformers import Owlv2Processor, Owlv2ForObjectDetection
-        self.torch = torch
-        self.Image = Image
-        self.owl_size = owl_size
-        self.processor = Owlv2Processor.from_pretrained(OWL_MODEL)
-        self.model = Owlv2ForObjectDetection.from_pretrained(OWL_MODEL)
-        # GPU 检测: CUDA(优先) > MPS(Apple Silicon) > CPU(兜底)
-        if use_gpu:
-            if torch.cuda.is_available():
-                self.device = "cuda"
-                self.model.to("cuda")
-                gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "NVIDIA"
-                print(f"[信用卡] OWLv2 模型已加载 (CUDA GPU: {gpu_name})")
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-                self.model.to("mps")
-                print("[信用卡] OWLv2 模型已加载 (MPS GPU 加速)")
-            else:
-                self.device = "cpu"
-                print("[信用卡] OWLv2 模型已加载 (CPU, 未检测到 GPU)")
-        else:
-            self.device = "cpu"
-            print("[信用卡] OWLv2 模型已加载 (CPU, GPU 已关闭)")
+    def __init__(self, model_dir=None, yolo_size=CARD_SIZE, use_gpu=True):
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 ultralytics。请安装：pip install ultralytics"
+            ) from exc
+        self.yolo_size = self._normalize_size(yolo_size)
+        self.device = self._select_device(use_gpu)
+        # 查找模型: model_dir > CWD > 脚本目录; 未找到则抛 FileNotFoundError(不自动下载)
+        model_path = self._find_model(model_dir, CARD_MODEL_FILE)
+        if model_path is None:
+            raise FileNotFoundError("未找到 yolov8n-card.pt")
+        self._model = YOLO(model_path)
+        # fuse(): 融合 Conv+BN 层, 数学等价但推理快 5-15%
+        try:
+            self._model.fuse()
+        except Exception:
+            pass
+        # 预热: 跑一次空推理，避免首帧卡顿
+        dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
+        self._model(dummy, imgsz=self.yolo_size, device=self.device,
+                    conf=0.5, verbose=False)
 
     @classmethod
-    def get(cls, owl_size=CARD_OWL_SIZE, use_gpu=True):
-        if cls._inst is None or cls._inst_size != owl_size or cls._inst_gpu != use_gpu:
-            cls._inst = cls(owl_size, use_gpu)
-            cls._inst_size = owl_size
+    def get(cls, yolo_size=CARD_SIZE, use_gpu=True, model_dir=None):
+        if cls._inst is None or cls._inst_size != yolo_size or cls._inst_gpu != use_gpu:
+            cls._inst = cls(model_dir=model_dir, yolo_size=yolo_size, use_gpu=use_gpu)
+            cls._inst_size = yolo_size
             cls._inst_gpu = use_gpu
         return cls._inst
 
-    def detect(self, img, thr=CARD_OWL_CONF):
+    @staticmethod
+    def _find_model(model_dir, filename):
+        """按优先级搜索模型文件。返回路径或 None(由上层抛 FileNotFoundError)。"""
+        candidates = []
+        if model_dir:
+            candidates.append(os.path.join(model_dir, filename))
+        candidates.append(os.path.join(os.getcwd(), filename))
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       filename))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    @staticmethod
+    def _normalize_size(size):
+        """调整为 32 的倍数 (YOLO 要求)。"""
+        return max(32, round(size / 32) * 32)
+
+    @staticmethod
+    def _select_device(use_gpu):
+        """自动选择最优设备: CUDA > MPS > CPU。"""
+        if not use_gpu:
+            return "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+            if torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
+        return "cpu"
+
+    def detect(self, img, thr=CARD_CONF):
+        """返回 [(x1,y1,x2,y2,score), ...], 含 score 供 CardTracker 选最佳框。
+        单类别模型(class 0=card) 无需 cls_id 过滤。"""
+        if img is None or img.size == 0:
+            return []
         h0, w0 = img.shape[:2]
-        image = self.Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        # 降分辨率提速: 最长边缩到 owl_size, 框坐标映射回原图
-        if self.owl_size and max(w0, h0) > self.owl_size:
-            scale = self.owl_size / max(w0, h0)
-            image = image.resize((int(w0 * scale), int(h0 * scale)))
-            sw, sh = image.size
-        else:
-            sw, sh, scale = w0, h0, 1.0
-        inputs = self.processor(text=CARD_TEXTS, images=image, return_tensors="pt")
-        if self.device in ("cuda", "mps"):
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with self.torch.no_grad():
-            outputs = self.model(**inputs)
-        ts = self.torch.tensor([[sh, sw]])
-        res = self.processor.post_process_grounded_object_detection(
-            outputs=outputs, threshold=thr, target_sizes=ts,
-            text_labels=[CARD_TEXTS])[0]
+        # stream=True: 生成器模式, 减少结果对象包装开销
+        results = self._model(img, imgsz=self.yolo_size, conf=thr,
+                              device=self.device, verbose=False, stream=True)
         out = []
-        for s, l, b in zip(res["scores"], res["labels"], res["boxes"]):
-            x1, y1, x2, y2 = [int(v) for v in b.tolist()]
-            if scale != 1.0:    # 映射回原图坐标
-                x1, y1 = int(x1 / scale), int(y1 / scale)
-                x2, y2 = int(x2 / scale), int(y2 / scale)
-            out.append((x1, y1, x2, y2, float(s)))
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                s = float(box.conf[0])
+                # clip 到图像边界
+                x1 = max(0, min(int(x1), w0 - 1))
+                y1 = max(0, min(int(y1), h0 - 1))
+                x2 = max(0, min(int(x2), w0 - 1))
+                y2 = max(0, min(int(y2), h0 - 1))
+                if x2 > x1 and y2 > y1:
+                    out.append((x1, y1, x2, y2, s))
         return out
 
 
-# ================= 卡的 LK 跟踪器(OWLv2 关键帧 + 光流) =================
+# ================= 卡的 LK 跟踪器(自训练 YOLOv8n 关键帧 + 光流) =================
 
 class CardTracker:
-    def __init__(self, detector, key_int=CARD_KEY_INT, conf=CARD_OWL_CONF):
-        self.detector = detector          # OwlCardDetector 或 None(几何法)
+    def __init__(self, detector, key_int=CARD_KEY_INT, conf=CARD_CONF):
+        self.detector = detector          # YoloCardDetector 或 None
         self.color_hint = None
         self.key_int = key_int
         self.conf = conf
         self.box = None
         self.pts = None
         self.prev_gray = None
-        self.next_detect = 1          # 下一帧需要 OWLv2 重检的帧号
+        self.next_detect = 0          # 首帧即检测; 后续按 key_int 调度
         self.lk = dict(winSize=(31, 31), maxLevel=4,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
 
@@ -579,7 +800,7 @@ class CardTracker:
     def update(self, img, frame_idx):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         if self.detector is not None:
-            need = (self.box is None) or (frame_idx >= self.next_detect)
+            need = (frame_idx >= self.next_detect)
             if need:
                 dets = self.detector.detect(img, self.conf)
                 if dets:
@@ -588,7 +809,8 @@ class CardTracker:
                     self.pts = self._init_pts(gray, self.box)
                     self.next_detect = frame_idx + self.key_int
                 else:
-                    self.next_detect = frame_idx + 1   # 未检出, 下帧重试
+                    self.box = None
+                    self.next_detect = frame_idx + self.key_int  # 未检出, 等key_int帧后重检(避免每帧都跑YOLOv8n)
             elif self.box is not None and self.pts is not None and len(self.pts) >= 8 \
                     and self.prev_gray is not None:
                 npts, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -815,7 +1037,8 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
     return target
 
 
-def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, owl_size,
+def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, card_size,
+                  pet_on, pet_conf, pet_int,
                   model_dir, face_size, face_int, face_conf, face_model,
                   keep_tmp, force_h264, use_gpu, frame_skip,
                   fisheye, fisheye_strength, fisheye_device, fisheye_downscale, log):
@@ -844,17 +1067,28 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, owl_size,
         log(f"  [人脸] YuNet (输入{face_size})")
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
 
-    owl = None
     card_tr = None
     if card_on:
         try:
-            owl = OwlCardDetector.get(owl_size=owl_size, use_gpu=use_gpu)
-            card_tr = CardTracker(owl, key_int=card_key_int, conf=card_conf)
-            log(f"  [信用卡] OWLv2 (每{card_key_int}帧检测, 输入{owl_size if owl_size else '原图'})")
-        except Exception as e:
-            log(f"  [警告] OWLv2 加载失败({e}), 禁用信用卡打码")
-            owl = None
+            yc = YoloCardDetector.get(yolo_size=card_size, use_gpu=use_gpu, model_dir=model_dir)
+            card_tr = CardTracker(yc, key_int=card_key_int, conf=card_conf)
+            log(f"  [信用卡] YOLOv8n 自训练 (输入{card_size})")
+        except FileNotFoundError:
+            log(f"  [警告] 未找到 yolov8n-card.pt, 请先运行 train_card_yolov8.py 训练模型, 禁用信用卡打码")
             card_tr = None
+        except Exception as e:
+            log(f"  [警告] 信用卡检测器加载失败({e}), 禁用信用卡打码")
+            card_tr = None
+
+    pet_proc = None
+    if pet_on:
+        try:
+            pd = PetDetector(model_dir=model_dir, yolo_size=PET_INPUT_SIZE, use_gpu=use_gpu)
+            pet_proc = PetProcessor(pd, detect_int=pet_int, conf=pet_conf)
+            log(f"  [宠物] YOLOv8n COCO (cat/dog/bird, 输入{PET_INPUT_SIZE})")
+        except Exception as e:
+            log(f"  [警告] 宠物检测器加载失败({e}), 禁用宠物打码")
+            pet_proc = None
 
     # 启动抽帧进程(raw BGR → stdout pipe)
     # NVDEC 硬件解码(可用时): -hwaccel cuda 让 ffmpeg 用 GPU 解码
@@ -986,6 +1220,7 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, owl_size,
     frame_idx = 0
     total_face = 0
     total_card = 0
+    total_pet = 0
     try:
         while True:
             raw = read_q.get()
@@ -1021,12 +1256,22 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, owl_size,
                                  CARD_CELLS, CARD_SIGMA)
                 total_card += len(cards)
 
+            pets = []
+            if pet_proc is not None:
+                pets = pet_proc.process(img, frame_idx)
+                for (x1, y1, x2, y2) in pets:
+                    bw, bh = x2 - x1, y2 - y1
+                    heavy_mosaic(img, int(x1 - PET_EXPAND * bw), int(y1 - PET_EXPAND * bh),
+                                 int(x2 + PET_EXPAND * bw), int(y2 + PET_EXPAND * bh),
+                                 PET_CELLS, PET_SIGMA)
+                total_pet += len(pets)
+
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
             # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
             write_q.put(memoryview(img))
 
             if frame_idx % 50 == 0:
-                log(f"    [{frame_idx}] 人脸={len(faces)} 卡={len(cards)} "
+                log(f"    [{frame_idx}] 人脸={len(faces)} 卡={len(cards)} 宠={len(pets)} "
                     f"elapsed={time.time()-t0:.0f}s")
     except BrokenPipeError:
         log("  [警告] 管道中断")
@@ -1058,11 +1303,12 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, owl_size,
             # 流式管道提前结束(<30%帧处理完成), 自动回退文件模式
             raise RuntimeError(
                 f"管道提前结束(仅处理{frame_idx}/{total_expected}帧, {actual_ratio:.0%}), 回退文件模式")
-    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face} 卡帧次={total_card}")
+    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face} 卡帧次={total_card} 宠帧次={total_pet}")
     return encode.returncode == 0
 
 
-def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, owl_size,
+def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, card_size,
+                   pet_on, pet_conf, pet_int,
                    model_dir, face_size, face_int, face_conf, face_model,
                    keep_tmp, force_h264, use_gpu, frame_skip,
                    fisheye, fisheye_strength, fisheye_device, fisheye_downscale, log):
@@ -1092,17 +1338,28 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, owl_size
     frames = sorted(f for f in os.listdir(fin) if f.endswith(".jpg"))
     log(f"  共 {len(frames)} 帧")
 
-    owl = None
     card_tr = None
     if card_on:
         try:
-            owl = OwlCardDetector.get(owl_size=owl_size, use_gpu=use_gpu)
-            card_tr = CardTracker(owl, key_int=card_key_int, conf=card_conf)
-            log(f"  [信用卡] OWLv2 (每{card_key_int}帧检测, 输入{owl_size if owl_size else '原图'})")
-        except Exception as e:
-            log(f"  [警告] OWLv2 加载失败({e}), 禁用信用卡打码")
-            owl = None
+            yc = YoloCardDetector.get(yolo_size=card_size, use_gpu=use_gpu, model_dir=model_dir)
+            card_tr = CardTracker(yc, key_int=card_key_int, conf=card_conf)
+            log(f"  [信用卡] YOLOv8n 自训练 (输入{card_size})")
+        except FileNotFoundError:
+            log(f"  [警告] 未找到 yolov8n-card.pt, 请先运行 train_card_yolov8.py 训练模型, 禁用信用卡打码")
             card_tr = None
+        except Exception as e:
+            log(f"  [警告] 信用卡检测器加载失败({e}), 禁用信用卡打码")
+            card_tr = None
+
+    pet_proc = None
+    if pet_on:
+        try:
+            pd = PetDetector(model_dir=model_dir, yolo_size=PET_INPUT_SIZE, use_gpu=use_gpu)
+            pet_proc = PetProcessor(pd, detect_int=pet_int, conf=pet_conf)
+            log(f"  [宠物] YOLOv8n COCO (cat/dog/bird, 输入{PET_INPUT_SIZE})")
+        except Exception as e:
+            log(f"  [警告] 宠物检测器加载失败({e}), 禁用宠物打码")
+            pet_proc = None
 
     if face_model == "yolov8":
         fd = YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
@@ -1113,6 +1370,7 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, owl_size
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
     total_face = 0
     total_card = 0
+    total_pet = 0
 
     for i, fn in enumerate(frames, 1):
         img = cv2.imread(os.path.join(fin, fn))
@@ -1140,9 +1398,18 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, owl_size
                              int(x2 + 0.1 * bw), int(y2 + 0.1 * bh),
                              CARD_CELLS, CARD_SIGMA)
             total_card += len(cards)
+        pets = []
+        if pet_proc is not None:
+            pets = pet_proc.process(img, i)
+            for (x1, y1, x2, y2) in pets:
+                bw, bh = x2 - x1, y2 - y1
+                heavy_mosaic(img, int(x1 - PET_EXPAND * bw), int(y1 - PET_EXPAND * bh),
+                             int(x2 + PET_EXPAND * bw), int(y2 + PET_EXPAND * bh),
+                             PET_CELLS, PET_SIGMA)
+            total_pet += len(pets)
         cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
-            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} 卡帧={len(cards)} elapsed={time.time()-t0:.0f}s")
+            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} 卡帧={len(cards)} 宠帧={len(pets)} elapsed={time.time()-t0:.0f}s")
 
     log("  合成视频...")
     hw = find_hw_encoder(family="h264" if force_h264 else "hevc")
@@ -1168,23 +1435,26 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, owl_size
         return False
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
-    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face} 卡帧次={total_card}")
+    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face} 卡帧次={total_card} 宠帧次={total_pet}")
     return True
 
 
-def process_video(src, dst, face_on=True, card_on=True, card_conf=CARD_OWL_CONF,
-                  card_key_int=CARD_KEY_INT, owl_size=CARD_OWL_SIZE, model_dir=None,
+def process_video(src, dst, face_on=True, card_on=True, card_conf=CARD_CONF,
+                  card_key_int=CARD_KEY_INT, card_size=CARD_SIZE,
+                  pet_on=True, pet_conf=PET_CONF, pet_int=PET_INT, model_dir=None,
                   face_size=FACE_YUNET_SIZE, face_int=FACE_DETECT_INT,
                   face_conf=FACE_CONF, face_model="yunet",
                   use_pipe=True, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
                   fisheye_downscale=1, log=print):
-    """处理单个视频: 人脸+信用卡打码, 保留音轨。返回是否成功。"""
+    """处理单个视频: 人脸+信用卡+宠物打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
             return _process_pipe(src, dst, face_on, card_on, card_conf,
-                                 card_key_int, owl_size, model_dir, face_size,
+                                 card_key_int, card_size,
+                                 pet_on, pet_conf, pet_int,
+                                 model_dir, face_size,
                                  face_int, face_conf, face_model,
                                  keep_tmp, force_h264, use_gpu,
                                  frame_skip, fisheye, fisheye_strength,
@@ -1192,7 +1462,9 @@ def process_video(src, dst, face_on=True, card_on=True, card_conf=CARD_OWL_CONF,
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, card_on, card_conf,
-                          card_key_int, owl_size, model_dir, face_size,
+                          card_key_int, card_size,
+                          pet_on, pet_conf, pet_int,
+                          model_dir, face_size,
                           face_int, face_conf, face_model,
                           keep_tmp, force_h264, use_gpu,
                           frame_skip, fisheye, fisheye_strength,
@@ -1212,14 +1484,14 @@ def expand_inputs(inputs):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="视频批量打码(人脸+信用卡, YOLOv8/YuNet + OWLv2)")
+    ap = argparse.ArgumentParser(description="视频批量打码(人脸+信用卡+宠物, YOLOv8/YuNet + YOLOv8n 自训练卡 + YOLOv8n 宠物)")
     ap.add_argument("inputs", nargs="+", help="视频文件/目录/通配符")
     ap.add_argument("--out-dir", default="masked_out", help="输出目录(默认 masked_out)")
-    ap.add_argument("--card-conf", type=float, default=CARD_OWL_CONF, help="OWLv2置信度阈值(默认0.25)")
+    ap.add_argument("--card-conf", type=float, default=CARD_CONF, help="信用卡置信度阈值(默认0.25)")
     ap.add_argument("--card-key-int", type=int, default=CARD_KEY_INT,
-                    help="OWLv2检测间隔帧数(默认10; 调大提速但快速移动可能漏)")
-    ap.add_argument("--owl-size", type=int, default=CARD_OWL_SIZE,
-                    help="OWLv2输入最长边像素(默认1280; 0=原图最准最慢, 1280快3-8倍)")
+                    help="信用卡检测间隔帧数(默认10; 调大提速但快速移动可能漏)")
+    ap.add_argument("--card-size", type=int, default=CARD_SIZE,
+                    help="信用卡检测输入尺寸(32的倍数,默认640; 0=原图)")
     ap.add_argument("--face-size", type=int, default=FACE_YUNET_SIZE,
                     help="人脸检测输入尺寸(默认640; YuNet/YOLOv8 均调整为32的倍数)")
     ap.add_argument("--face-model", default="yunet", choices=["yunet", "yolov8"],
@@ -1245,6 +1517,10 @@ def main():
                     help="强制H.264输出(兼容性无敌: 微信/Android/旧播放器都能播; 画质仍近无损高码率)")
     ap.add_argument("--no-face", action="store_true", help="关闭人脸打码")
     ap.add_argument("--no-card", action="store_true", help="关闭信用卡打码")
+    ap.add_argument("--pet-conf", type=float, default=PET_CONF, help="宠物置信度阈值(默认0.3)")
+    ap.add_argument("--pet-int", type=int, default=PET_INT,
+                    help="宠物检测间隔帧数(默认5: 每5帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
+    ap.add_argument("--no-pet", action="store_true", help="关闭宠物打码")
     ap.add_argument("--no-gpu", action="store_true",
                     help="关闭 GPU 加速(CUDA/MPS 均禁用, 强制 CPU)")
     ap.add_argument("--model-dir", default=None, help="人脸模型目录")
@@ -1264,7 +1540,8 @@ def main():
         print(f"\n>>> {src}")
         if process_video(src, dst, face_on=not args.no_face,
                          card_on=not args.no_card, card_conf=args.card_conf,
-                         card_key_int=args.card_key_int, owl_size=args.owl_size,
+                         card_key_int=args.card_key_int, card_size=args.card_size,
+                         pet_on=not args.no_pet, pet_conf=args.pet_conf, pet_int=args.pet_int,
                          model_dir=args.model_dir,
                          face_size=args.face_size, face_int=args.face_int,
                          face_conf=args.face_conf, face_model=args.face_model,

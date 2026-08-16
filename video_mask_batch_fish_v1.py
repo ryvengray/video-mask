@@ -781,6 +781,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     write_q = queue.Queue(maxsize=3)
     frame_size = w * h * 3
     pipeline_error = []  # 跨线程传递异常
+    writer_done = threading.Event()  # writer 退出信号(检测编码器提前结束)
 
     def _reader():
         """生产者: 从 ffmpeg stdout 读 raw 帧, 入队。"""
@@ -808,6 +809,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         except Exception as e:
             pipeline_error.append(("writer", e))
         finally:
+            writer_done.set()  # 通知主循环: writer 已退出(含编码器提前结束场景)
             try:
                 encode.stdin.close()
             except BrokenPipeError:
@@ -819,11 +821,24 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     writer_thread.start()
 
     # 主循环: 取帧 → 处理 → 入写队列
+    # 队列操作带超时, 防止编码器提前退出(-shortest, 音频短于视频)导致死锁:
+    # 超时后检查 writer_done, 若 writer 已退出则视为"编码器提前结束",
+    # 记警告并正常 break, 走后续完整性检查(输出文件已生成)。
     frame_idx = 0
     total_face = 0
+    encoder_finished_early = False
+    _PIPE_TIMEOUT = 5  # 秒, 队列超时阈值
     try:
         while True:
-            raw = read_q.get()
+            try:
+                raw = read_q.get(timeout=_PIPE_TIMEOUT)
+            except queue.Empty:
+                if writer_done.is_set():
+                    log("  [警告] 编码器提前结束(音频短于视频, -shortest 触发), "
+                        "输出已生成, 走完整性检查")
+                    encoder_finished_early = True
+                    break
+                continue
             if raw is None:
                 break
             frame_idx += 1
@@ -848,7 +863,15 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
             # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
-            write_q.put(memoryview(img))
+            try:
+                write_q.put(memoryview(img), timeout=_PIPE_TIMEOUT)
+            except queue.Full:
+                if writer_done.is_set():
+                    log("  [警告] 编码器提前结束(音频短于视频, -shortest 触发), "
+                        "输出已生成, 走完整性检查")
+                    encoder_finished_early = True
+                    break
+                raise  # 队列阻塞且 writer 未退出, 疑似死锁, 抛出便于诊断
 
             if frame_idx % 50 == 0:
                 log(f"    [{frame_idx}] 人脸={len(faces)} "
@@ -857,10 +880,30 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         log("  [警告] 管道中断")
     finally:
         # 通知 writer 结束, 等待两个线程退出
-        write_q.put(None)
+        if not writer_done.is_set():
+            # writer 仍在运行, 投递哨兵触发退出
+            try:
+                write_q.put(None, timeout=_PIPE_TIMEOUT)
+            except queue.Full:
+                pass  # writer 可能已提前退出
         writer_thread.join(timeout=30)
+        # 提前结束时 reader 可能阻塞在 read_q.put(队列满), 终止解码器并排空队列,
+        # 使 reader 读到 EOF 自行退出, 避免 join 长时间空等
+        if encoder_finished_early:
+            try:
+                extract.terminate()
+            except Exception:
+                pass
+            try:
+                while True:
+                    read_q.get_nowait()
+            except queue.Empty:
+                pass
         reader_thread.join(timeout=10)
-        extract.stdout.close()
+        try:
+            extract.stdout.close()
+        except Exception:
+            pass
         extract.wait()
         encode.wait()
 
@@ -875,8 +918,9 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 
     elapsed = time.time() - t0
     # 完整性检查: 超高帧率视频管道可能跟不上下游, 若实际处理帧远低于预期则自动回退文件模式
+    # 编码器提前结束时输出已完整生成, 跳过帧数比例检查(避免误判回退文件模式)
     duration = get_duration(src)
-    if duration and duration > 5:
+    if not encoder_finished_early and duration and duration > 5:
         total_expected = int(fps * duration)  # 视频总帧数(含跳帧前)
         actual_ratio = frame_idx / max(1, total_expected)
         if actual_ratio < 0.3:
