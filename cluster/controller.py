@@ -450,7 +450,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"workers": store.list_workers(max(1, min(limit, 1000)))}
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, page: int = 1, task_status: str | None = None,
+    def dashboard(request: Request, page: int = 1, task_status: str | None = None, q: str = "",
                   statistics_start: str | None = None, statistics_end: str | None = None):
         store.requeue_stale(stale_after_seconds)
         try:
@@ -462,11 +462,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if selected_task_status and selected_task_status not in TASK_FILTER_STATUSES:
             raise HTTPException(status_code=400, detail="unknown task status filter")
         selected_statuses = (selected_task_status,) if selected_task_status else None
+        selected_search = q.strip()[:200] or None
         page_size = 50
-        total_tasks = store.count_tasks(selected_statuses)
+        total_tasks = store.count_tasks(selected_statuses, selected_search)
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
-        rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses)
+        rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses, selected_search)
 
         def byte_size(value: Any) -> str:
             try:
@@ -615,6 +616,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "task_filter_options": [(status, task_status_counts[status]) for status in TASK_FILTER_STATUSES],
                 "task_status_counts": task_status_counts,
                 "selected_task_status": selected_task_status,
+                "selected_search": selected_search or "",
                 "task_total_all": sum(task_status_counts.values()),
                 "total_pages": total_pages,
                 "total_tasks": total_tasks,

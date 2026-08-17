@@ -366,14 +366,29 @@ class ClusterStore:
             raise ValueError("task is not actively assigned to this worker")
         return task
 
+    @staticmethod
+    def _task_filter_conditions(statuses: tuple[str, ...] | None,
+                                search: str | None) -> tuple[str, list[Any]]:
+        """Build a WHERE clause from optional status values and a fuzzy search."""
+        conditions: list[str] = []
+        values: list[Any] = []
+        if statuses:
+            conditions.append("status IN (" + ", ".join("?" for _ in statuses) + ")")
+            values.extend(statuses)
+        if search:
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            columns = ("task_id", "source_object_key", "source_url", "output_object_key", "progress_json")
+            conditions.append(
+                "(" + " OR ".join(f"IFNULL({column}, '') LIKE ? ESCAPE '\\'" for column in columns) + ")")
+            values.extend([like] * len(columns))
+        return (" WHERE " + " AND ".join(conditions)) if conditions else "", values
+
     @synchronized
-    def count_tasks(self, statuses: tuple[str, ...] | None = None) -> int:
-        if not statuses:
-            return int(self.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
-        placeholders = ", ".join("?" for _ in statuses)
-        return int(self.conn.execute(
-            f"SELECT COUNT(*) FROM tasks WHERE status IN ({placeholders})", statuses
-        ).fetchone()[0])
+    def count_tasks(self, statuses: tuple[str, ...] | None = None,
+                    search: str | None = None) -> int:
+        where, values = self._task_filter_conditions(statuses, search)
+        return int(self.conn.execute("SELECT COUNT(*) FROM tasks" + where, values).fetchone()[0])
 
     @synchronized
     def oldest_task_created_at(self, statuses: tuple[str, ...]) -> float | None:
@@ -388,12 +403,9 @@ class ClusterStore:
 
     @synchronized
     def list_tasks(self, limit: int = 100, offset: int = 0,
-                   statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
-        where = ""
-        values: list[Any] = []
-        if statuses:
-            where = " WHERE status IN (" + ", ".join("?" for _ in statuses) + ")"
-            values.extend(statuses)
+                   statuses: tuple[str, ...] | None = None,
+                   search: str | None = None) -> list[dict[str, Any]]:
+        where, values = self._task_filter_conditions(statuses, search)
         values.extend((limit, max(0, offset)))
         rows = self.conn.execute(
             "SELECT * FROM tasks" + where + " ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?",
