@@ -19,6 +19,7 @@ from typing import Any
 
 UNFINISHED = ("pending", "assigned", "downloading", "processing", "uploading", "cancelling")
 RESTARTABLE = ("completed", "failed", "cancelled")
+RESTART_ALL_COMPLETED_PHRASE = "RESTART ALL COMPLETED TASKS"
 
 
 class ControllerClient:
@@ -62,6 +63,9 @@ class ControllerClient:
 
     def restart(self, task_id: str) -> dict[str, Any]:
         return self.request("POST", f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/restart")
+
+    def restart_all_completed(self) -> dict[str, Any]:
+        return self.request("POST", "/api/tasks/restart-completed")
 
     def purge_tasks(self) -> dict[str, Any]:
         return self.request("DELETE", "/api/tasks?confirm=DELETE_ALL_TASKS")
@@ -153,6 +157,25 @@ def confirm_delete_all_tasks() -> bool:
     return input("Type DELETE ALL TASKS to permanently remove every task record: ").strip() == "DELETE ALL TASKS"
 
 
+def restart_all_completed_tasks(client: ControllerClient) -> None:
+    page = client.task_page(("completed",), 0, limit=1)
+    completed = int(page["total"])
+    if not completed:
+        print("There are no completed tasks to restart.")
+        return
+    print(f"This will queue all {completed} completed task(s) to run again from the beginning.")
+    if not confirm("Restart every completed task?"):
+        return
+    phrase = input(f"Type {RESTART_ALL_COMPLETED_PHRASE} to continue: ").strip()
+    if phrase != RESTART_ALL_COMPLETED_PHRASE:
+        print("Confirmation phrase did not match; no tasks were restarted.")
+        return
+    if not confirm(f"Final confirmation: queue all {completed} completed task(s) now?"):
+        return
+    result = client.restart_all_completed()
+    print(f"Queued {result['restarted_tasks']} completed task(s) at {stamp(result['restarted_at'])}.")
+
+
 def parse_slots(specification: str) -> tuple[int, ...]:
     slots: set[int] = set()
     for part in specification.split(","):
@@ -209,8 +232,9 @@ Video Mask Cluster Manager
   5) Restart a completed, failed, or cancelled task
   6) Restart a Worker slot through Ansible
   7) Enable, disable, or check S3 task ingestion
-  8) Permanently delete all task records
-  9) Exit""")
+  8) Restart all completed tasks (three confirmations)
+  9) Permanently delete all task records
+  10) Exit""")
         choice = input("Choose: ").strip()
         try:
             if choice == "1":
@@ -255,14 +279,16 @@ Video Mask Cluster Manager
                 else:
                     print("Choose on, off, or status.")
             elif choice == "8":
+                restart_all_completed_tasks(client)
+            elif choice == "9":
                 page = client.task_page(None, 0, limit=1)
                 print(f"This will permanently delete {page['total']} task record(s).")
                 if confirm_delete_all_tasks():
                     print("Deleted:", client.purge_tasks()["deleted_tasks"], "task record(s)")
-            elif choice == "9":
+            elif choice == "10":
                 return
             else:
-                print("Choose 1-9.")
+                print("Choose 1-10.")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
 
@@ -270,7 +296,8 @@ Video Mask Cluster Manager
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage Video Mask Controller tasks")
     parser.add_argument("action", nargs="?", default="menu",
-                        choices=("menu", "list", "all", "detail", "cancel", "restart", "restart-slot", "s3-ingest", "purge"))
+                        choices=("menu", "list", "all", "detail", "cancel", "restart", "restart-all-completed",
+                                 "restart-slot", "s3-ingest", "purge"))
     parser.add_argument("task_id", nargs="?")
     parser.add_argument("--controller", default="http://127.0.0.1:8080")
     parser.add_argument("--token", help="Avoid when possible: --token is visible in shell history")
@@ -293,6 +320,10 @@ def main() -> None:
             if not args.task_id or args.slot is None:
                 raise SystemExit("restart-slot requires an Ansible host and --slot N")
             restart_slots(client, args.inventory, args.task_id, parse_slots(args.slot), not args.no_ask_vault_pass)
+        elif args.action == "restart-all-completed":
+            if args.task_id:
+                raise SystemExit("restart-all-completed does not accept a task ID")
+            restart_all_completed_tasks(client)
         elif args.action == "s3-ingest":
             operation = (args.task_id or "status").lower()
             if operation == "status":

@@ -430,6 +430,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/restart-completed")
+    def restart_completed_tasks(authorization: str | None = Header(default=None)) -> dict[str, int | float]:
+        require_admin(authorization)
+        return store.restart_completed_tasks()
+
     @app.post("/api/tasks/{task_id}/cancel")
     def cancel_task(task_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -568,7 +573,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             if not (marker and worker_name and worker_slot.isdigit()):
                 worker_name, worker_slot = worker_id or "-", ""
             processing = progress.get("processing_seconds", progress.get("elapsed_seconds"))
-            started, finished = task.get("started_at"), task.get("finished_at")
+            started, restarted, finished = task.get("started_at"), task.get("restarted_at"), task.get("finished_at")
             if isinstance(processing, (int, float)):
                 process_label = f"Process: {seconds(processing)}"
             elif task.get("status") in {"processing", "uploading", "cancelling"}:
@@ -588,7 +593,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "output_meta": f"{byte_size(progress.get('output_bytes'))} · {seconds(task.get('output_duration_seconds', progress.get('output_duration_seconds')))}",
                 "output_hash": str(task.get("output_sha256") or ""), "process_label": process_label,
                 "lifetime": lifetime, "attempt_count": task["attempt_count"],
-                "created_at": last_seen(task.get("created_at")), "finished_at": last_seen(task.get("finished_at")),
+                "created_at": last_seen(task.get("created_at")),
+                "execution_started_label": "Restarted" if isinstance(restarted, (int, float)) else "Started",
+                "execution_started_at": last_seen(
+                    restarted if isinstance(restarted, (int, float))
+                    else progress.get("processing_started_at", started)
+                ),
+                "execution_finished_at": last_seen(finished),
                 "error_message": str(task.get("error_message") or "-"),
             }
 

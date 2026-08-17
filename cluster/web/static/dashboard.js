@@ -1,4 +1,4 @@
-console.info('[video-mask] dashboard.js loaded (video-preview build 2026-08-17c, no token prompt)');
+console.info('[video-mask] dashboard.js loaded (video-preview build 2026-08-17e, no token prompt)');
 const tabs = document.querySelectorAll('.tab');
 const panels = {
   tasks: document.getElementById('panel-tasks'),
@@ -78,7 +78,16 @@ const playVideo = document.getElementById('play-modal-video');
 const playKindBadge = document.getElementById('play-modal-kind');
 const playFileName = document.getElementById('play-modal-name');
 const playOpenLink = document.getElementById('play-modal-open');
-const autoRefreshMeta = document.querySelector('meta[http-equiv="refresh"]');
+let autoRefreshTimer;
+
+function scheduleAutoRefresh() {
+  window.clearTimeout(autoRefreshTimer);
+  autoRefreshTimer = window.setTimeout(() => window.location.reload(), 60_000);
+}
+
+function pauseAutoRefresh() {
+  window.clearTimeout(autoRefreshTimer);
+}
 
 function openPlayModal(url, kind, name) {
   playKindBadge.textContent = kind === 'output' ? 'Output' : 'Input';
@@ -88,8 +97,7 @@ function openPlayModal(url, kind, name) {
   playVideo.src = url;
   playOpenLink.href = url;
   playModal.hidden = false;
-  // Cancel the 60s auto-refresh while playback is on screen, then restore on close.
-  autoRefreshMeta?.remove();
+  pauseAutoRefresh();
   playVideo.focus();
 }
 
@@ -99,7 +107,7 @@ function closePlayModal() {
   playVideo.removeAttribute('src');
   playVideo.load();
   playModal.hidden = true;
-  if (autoRefreshMeta && !autoRefreshMeta.isConnected) document.head.append(autoRefreshMeta);
+  scheduleAutoRefresh();
 }
 
 playModal?.querySelectorAll('[data-play-close]').forEach(element =>
@@ -107,6 +115,7 @@ playModal?.querySelectorAll('[data-play-close]').forEach(element =>
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') closePlayModal();
 });
+scheduleAutoRefresh();
 const taskTable = document.querySelector('.task-table');
 console.info('[video-mask] task-table found:', Boolean(taskTable),
   '| play buttons:', document.querySelectorAll('.file-play').length,

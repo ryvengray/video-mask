@@ -271,6 +271,35 @@ def test_pending_task_can_be_cancelled_and_restarted(tmp_path: Path):
     assert restarted["status"] == "pending"
     assert restarted["attempt_count"] == 0
     assert restarted["error_message"] is None
+    assert restarted["restarted_at"] is not None
+    store.close()
+
+
+def test_all_completed_tasks_can_be_restarted_with_a_shared_timestamp(tmp_path: Path, monkeypatch):
+    store = new_store(tmp_path)
+    completed = store.create_task(task_payload())
+    second_completed = store.create_task({**task_payload(), "source_url": "https://storage.example/second.mov"})
+    failed = store.create_task({**task_payload(), "source_url": "https://storage.example/failed.mov"})
+    store.conn.execute("""
+        UPDATE tasks SET status='completed', attempt_count=2, started_at=10, finished_at=20,
+          output_sha256='done', output_duration_seconds=12 WHERE task_id IN (?, ?)
+    """, (completed["task_id"], second_completed["task_id"]))
+    store.conn.execute("UPDATE tasks SET status='failed', finished_at=20 WHERE task_id=?", (failed["task_id"],))
+    store.conn.commit()
+    monkeypatch.setattr("cluster.store.now", lambda: 1234.5)
+
+    result = store.restart_completed_tasks()
+
+    assert result == {"restarted_tasks": 2, "restarted_at": 1234.5}
+    for task_id in (completed["task_id"], second_completed["task_id"]):
+        restarted = store.task(task_id)
+        assert restarted["status"] == "pending"
+        assert restarted["attempt_count"] == 0
+        assert restarted["started_at"] is None
+        assert restarted["restarted_at"] == 1234.5
+        assert restarted["finished_at"] is None
+        assert restarted["output_sha256"] is None
+    assert store.task(failed["task_id"])["status"] == "failed"
     store.close()
 
 

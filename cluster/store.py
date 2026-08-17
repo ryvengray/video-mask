@@ -75,6 +75,7 @@ class ClusterStore:
             error_message TEXT,
             created_at REAL NOT NULL,
             started_at REAL,
+            restarted_at REAL,
             finished_at REAL,
             updated_at REAL NOT NULL
         );
@@ -88,6 +89,9 @@ class ClusterStore:
             updated_at REAL NOT NULL
         );
         """)
+        task_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(tasks)")}
+        if "restarted_at" not in task_columns:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN restarted_at REAL")
         self.conn.commit()
 
     @synchronized
@@ -268,7 +272,8 @@ class ClusterStore:
         stamp = now()
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
-              progress_json='{}', error_message=NULL, started_at=NULL, finished_at=NULL, updated_at=?
+              progress_json='{}', error_message=NULL, started_at=NULL, restarted_at=NULL,
+              finished_at=NULL, updated_at=?
             WHERE task_id=?
         """, (stamp, task_id))
         self.conn.commit()
@@ -286,11 +291,24 @@ class ClusterStore:
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
-              error_message=NULL, started_at=NULL, finished_at=NULL, updated_at=?
+              error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL, updated_at=?
             WHERE task_id=?
-        """, (stamp, task_id))
+        """, (stamp, stamp, task_id))
         self.conn.commit()
         return self.task(task_id) or {}
+
+    @synchronized
+    def restart_completed_tasks(self) -> dict[str, Any]:
+        """Queue every completed task again and retain the bulk restart time."""
+        stamp = now()
+        cursor = self.conn.execute("""
+            UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
+              progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
+              error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL, updated_at=?
+            WHERE status='completed'
+        """, (stamp, stamp))
+        self.conn.commit()
+        return {"restarted_tasks": cursor.rowcount, "restarted_at": stamp}
 
     @synchronized
     def cancel_task(self, task_id: str) -> dict[str, Any]:
