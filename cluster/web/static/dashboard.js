@@ -82,7 +82,14 @@ document.querySelector('.task-table')?.addEventListener('click', async (event) =
   if (!taskId) return;
   const token = window.prompt('Enter the Controller admin token to play the file:');
   if (!token) return;
-  const newTab = window.open('', '_blank', 'noopener,noreferrer');
+  // NOTE: 'noopener' must NOT go in the features string - the spec makes
+  // window.open() return null in that case, losing our handle.  Sever the
+  // opener link manually instead, after the synchronous user gesture.
+  const newTab = window.open('about:blank', '_blank');
+  if (newTab) {
+    newTab.opener = null;
+    newTab.document.write('<p style="font-family:sans-serif">Loading video…</p>');
+  }
   try {
     const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -137,9 +144,10 @@ function chartFrame(svg, values, title, draw) {
     const point = y(value);
     return `<line x1="${left}" y1="${point}" x2="${width - right}" y2="${point}" class="chart-grid"/><text x="${left - 7}" y="${point + 4}" text-anchor="end" class="chart-axis">${value.toFixed(value < 2 ? 1 : 0)}</text>`;
   }).join('');
-  const labels = values.length ? [0, Math.floor((values.length - 1) / 2), values.length - 1].map(index => {
-    const date = new Date(draw.hours[index].start_at * 1000);
-    return `<text x="${left + (values.length === 1 ? plotWidth / 2 : index * plotWidth / (values.length - 1))}" y="${height - 10}" text-anchor="middle" class="chart-axis">${svgEscaped(date.toLocaleString([], {month: 'numeric', day: 'numeric', hour: '2-digit'}))}</text>`;
+  const pointCount = draw.hours?.length || values.length;
+  const labels = pointCount ? [0, Math.floor((pointCount - 1) / 2), pointCount - 1].map(index => {
+    const date = new Date((draw.hours?.[index]?.start_at || 0) * 1000);
+    return `<text x="${left + (pointCount === 1 ? plotWidth / 2 : index * plotWidth / (pointCount - 1))}" y="${height - 10}" text-anchor="middle" class="chart-axis">${svgEscaped(date.toLocaleString([], {month: 'numeric', day: 'numeric', hour: '2-digit'}))}</text>`;
   }).join('') : '';
   svg.innerHTML = `<title>${svgEscaped(title)}</title>${grid}<line x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}" class="chart-axis-line"/>${draw.content({left, top, plotWidth, plotHeight, y, maximum})}${labels}`;
 }
