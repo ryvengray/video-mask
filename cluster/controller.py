@@ -10,13 +10,16 @@ import logging
 import os
 import sqlite3
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 try:
     from fastapi import FastAPI, Header, HTTPException, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
     from pydantic import BaseModel, Field
@@ -324,10 +327,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=404, detail="task does not exist")
         return task
 
-    @app.get("/api/tasks/{task_id}/play-url")
-    def get_task_play_url(task_id: str, file: str = "input"):
-        # No admin-token check: this endpoint sits behind the nginx-level
-        # authentication that already gates the whole dashboard.
+    def task_playback_url(task_id: str, file: str) -> str:
+        """Create a short-lived S3 URL without exposing it to the browser."""
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
@@ -353,7 +354,57 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             )
         else:
             raise HTTPException(status_code=400, detail="file must be 'input' or 'output'")
-        return {"url": url}
+        return url
+
+    @app.get("/api/tasks/{task_id}/play-url")
+    def get_task_play_url(task_id: str, file: str = "input") -> dict[str, str]:
+        # Keep the signed S3 URL on the Controller. The browser requests this
+        # relative URL through Nginx, so S3 sees the Controller as the client.
+        if file not in {"input", "output"}:
+            raise HTTPException(status_code=400, detail="file must be 'input' or 'output'")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if not s3_ingestor:
+            raise HTTPException(status_code=409, detail="playback URLs are only available for S3 tasks")
+        return {"url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/play?file={file}"}
+
+    @app.get("/api/tasks/{task_id}/play", name="proxy_task_playback")
+    def proxy_task_playback(request: Request, task_id: str, file: str = "input"):
+        """Stream an S3 video through the Controller while preserving seek support."""
+        url = task_playback_url(task_id, file)
+        upstream_headers = {"User-Agent": "video-mask-controller-playback/1.0"}
+        for header in ("range", "if-range"):
+            value = request.headers.get(header)
+            if value:
+                upstream_headers[header.title()] = value
+        try:
+            upstream = urllib.request.urlopen(urllib.request.Request(url, headers=upstream_headers), timeout=30)
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(status_code=exc.code, detail="S3 playback request failed") from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(status_code=502, detail="unable to reach S3 for playback") from exc
+
+        response_headers: dict[str, str] = {}
+        for header in ("Accept-Ranges", "Content-Length", "Content-Range", "Content-Type", "ETag", "Last-Modified"):
+            value = upstream.headers.get(header)
+            if value:
+                response_headers[header] = value
+
+        def stream_video():
+            try:
+                while chunk := upstream.read(1024 * 1024):
+                    yield chunk
+            finally:
+                upstream.close()
+
+        media_type = response_headers.pop("Content-Type", None)
+        return StreamingResponse(
+            stream_video(),
+            status_code=upstream.getcode(),
+            headers=response_headers,
+            media_type=media_type,
+        )
 
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):
