@@ -1,4 +1,4 @@
-console.info('[video-mask] dashboard.js loaded (play-link build 2026-08-17b, no token prompt)');
+console.info('[video-mask] dashboard.js loaded (video-preview build 2026-08-17c, no token prompt)');
 const tabs = document.querySelectorAll('.tab');
 const panels = {
   tasks: document.getElementById('panel-tasks'),
@@ -77,11 +77,10 @@ if (s3IngestControl) {
 }
 
 const playModal = document.getElementById('play-link-modal');
-const playUrlInput = document.getElementById('play-modal-url');
+const playVideo = document.getElementById('play-modal-video');
 const playKindBadge = document.getElementById('play-modal-kind');
 const playFileName = document.getElementById('play-modal-name');
 const playOpenLink = document.getElementById('play-modal-open');
-const playCopyButton = document.getElementById('play-modal-copy');
 const autoRefreshMeta = document.querySelector('meta[http-equiv="refresh"]');
 
 function openPlayModal(url, kind, name) {
@@ -89,17 +88,19 @@ function openPlayModal(url, kind, name) {
   playKindBadge.className = `badge ${kind === 'output' ? 'success' : 'active'}`;
   playFileName.textContent = name;
   playFileName.title = name;
-  playUrlInput.value = url;
+  playVideo.src = url;
   playOpenLink.href = url;
   playModal.hidden = false;
-  // Cancel the 60s auto-refresh while the link is on screen, then restore on close.
+  // Cancel the 60s auto-refresh while playback is on screen, then restore on close.
   autoRefreshMeta?.remove();
-  playUrlInput.focus();
-  playUrlInput.select();
+  playVideo.focus();
 }
 
 function closePlayModal() {
   if (!playModal || playModal.hidden) return;
+  playVideo.pause();
+  playVideo.removeAttribute('src');
+  playVideo.load();
   playModal.hidden = true;
   if (autoRefreshMeta && !autoRefreshMeta.isConnected) document.head.append(autoRefreshMeta);
 }
@@ -109,25 +110,6 @@ playModal?.querySelectorAll('[data-play-close]').forEach(element =>
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') closePlayModal();
 });
-playUrlInput?.addEventListener('click', () => playUrlInput.select());
-
-playCopyButton?.addEventListener('click', async () => {
-  const url = playUrlInput.value;
-  if (!url) return;
-  try {
-    await navigator.clipboard.writeText(url);
-  } catch {
-    playUrlInput.select();
-    document.execCommand('copy');
-  }
-  playCopyButton.textContent = 'Copied ✓';
-  playCopyButton.classList.add('copied');
-  setTimeout(() => {
-    playCopyButton.textContent = 'Copy link';
-    playCopyButton.classList.remove('copied');
-  }, 1800);
-});
-
 const taskTable = document.querySelector('.task-table');
 console.info('[video-mask] task-table found:', Boolean(taskTable),
   '| play buttons:', document.querySelectorAll('.file-play').length,
