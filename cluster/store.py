@@ -512,8 +512,9 @@ class ClusterStore:
 
     @staticmethod
     def _task_filter_conditions(statuses: tuple[str, ...] | None,
-                                search: str | None) -> tuple[str, list[Any]]:
-        """Build a WHERE clause from optional status values and a fuzzy search."""
+                                search: str | None,
+                                face_annotations: tuple[str, ...] | None = None) -> tuple[str, list[Any]]:
+        """Build a WHERE clause from optional task, label, and text filters."""
         conditions: list[str] = []
         values: list[Any] = []
         if statuses:
@@ -526,12 +527,23 @@ class ClusterStore:
             conditions.append(
                 "(" + " OR ".join(f"IFNULL({column}, '') LIKE ? ESCAPE '\\'" for column in columns) + ")")
             values.extend([like] * len(columns))
+        if face_annotations:
+            annotation_conditions: list[str] = []
+            if "has_face" in face_annotations:
+                annotation_conditions.append("face_annotation=1")
+            if "no_face" in face_annotations:
+                annotation_conditions.append("face_annotation=0")
+            if "unlabelled" in face_annotations:
+                annotation_conditions.append("face_annotation IS NULL")
+            if annotation_conditions:
+                conditions.append("(" + " OR ".join(annotation_conditions) + ")")
         return (" WHERE " + " AND ".join(conditions)) if conditions else "", values
 
     @synchronized
     def count_tasks(self, statuses: tuple[str, ...] | None = None,
-                    search: str | None = None) -> int:
-        where, values = self._task_filter_conditions(statuses, search)
+                    search: str | None = None,
+                    face_annotations: tuple[str, ...] | None = None) -> int:
+        where, values = self._task_filter_conditions(statuses, search, face_annotations)
         return int(self.conn.execute("SELECT COUNT(*) FROM tasks" + where, values).fetchone()[0])
 
     @synchronized
@@ -548,8 +560,9 @@ class ClusterStore:
     @synchronized
     def list_tasks(self, limit: int = 100, offset: int = 0,
                    statuses: tuple[str, ...] | None = None,
-                   search: str | None = None) -> list[dict[str, Any]]:
-        where, values = self._task_filter_conditions(statuses, search)
+                   search: str | None = None,
+                   face_annotations: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        where, values = self._task_filter_conditions(statuses, search, face_annotations)
         values.extend((limit, max(0, offset)))
         rows = self.conn.execute(
             "SELECT * FROM tasks" + where + " ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?",

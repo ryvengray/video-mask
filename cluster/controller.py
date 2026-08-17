@@ -45,6 +45,7 @@ TASK_FILTER_STATUSES = (
     "cancelling", "completed", "failed", "cancelled",
 )
 FACE_REVIEW_LEASE_SECONDS = 300
+FACE_ANNOTATION_FILTERS = ("has_face", "no_face", "unlabelled")
 
 
 def statistics_window(start_value: str | None, end_value: str | None) -> tuple[float, float]:
@@ -575,12 +576,24 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if selected_task_status and selected_task_status not in TASK_FILTER_STATUSES:
             raise HTTPException(status_code=400, detail="unknown task status filter")
         selected_statuses = (selected_task_status,) if selected_task_status else None
+        selected_face_annotations = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("face_annotation") if value.strip()
+        ))
+        unknown_face_annotations = set(selected_face_annotations) - set(FACE_ANNOTATION_FILTERS)
+        if unknown_face_annotations:
+            raise HTTPException(status_code=400, detail="unknown face annotation filter")
         selected_search = q.strip()[:200] or None
+        task_filter_query = urllib.parse.urlencode([
+            *([("task_status", selected_task_status)] if selected_task_status else []),
+            *(("face_annotation", value) for value in selected_face_annotations),
+            *([("q", selected_search)] if selected_search else []),
+        ])
         page_size = 50
-        total_tasks = store.count_tasks(selected_statuses, selected_search)
+        total_tasks = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None)
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
-        rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses, selected_search)
+        rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses, selected_search,
+                                selected_face_annotations or None)
 
         def byte_size(value: Any) -> str:
             try:
@@ -742,7 +755,14 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "task_filter_options": [(status, task_status_counts[status]) for status in TASK_FILTER_STATUSES],
                 "task_status_counts": task_status_counts,
                 "selected_task_status": selected_task_status,
+                "face_annotation_filter_options": (
+                    ("has_face", "👍 Has face"),
+                    ("no_face", "👎 No face"),
+                    ("unlabelled", "Unlabelled"),
+                ),
+                "selected_face_annotations": selected_face_annotations,
                 "selected_search": selected_search or "",
+                "task_filter_query": task_filter_query,
                 "task_total_all": sum(task_status_counts.values()),
                 "total_pages": total_pages,
                 "total_tasks": total_tasks,

@@ -155,6 +155,25 @@ def test_task_list_can_filter_by_status(tmp_path: Path):
     store.close()
 
 
+def test_task_list_can_filter_by_multiple_face_annotations(tmp_path: Path):
+    store = new_store(tmp_path)
+    has_face = store.create_task(task_payload())
+    no_face_payload = task_payload()
+    no_face_payload["source_url"] = "https://storage.example/no-face.mov"
+    no_face = store.create_task(no_face_payload)
+    unlabelled_payload = task_payload()
+    unlabelled_payload["source_url"] = "https://storage.example/unlabelled.mov"
+    unlabelled = store.create_task(unlabelled_payload)
+    store.conn.execute("UPDATE tasks SET face_annotation=1 WHERE task_id=?", (has_face["task_id"],))
+    store.conn.execute("UPDATE tasks SET face_annotation=0 WHERE task_id=?", (no_face["task_id"],))
+    store.conn.commit()
+
+    selected = store.list_tasks(face_annotations=("has_face", "unlabelled"))
+    assert {task["task_id"] for task in selected} == {has_face["task_id"], unlabelled["task_id"]}
+    assert store.count_tasks(face_annotations=("no_face",)) == 1
+    store.close()
+
+
 def test_processing_statistics_reports_hourly_concurrency_and_worker_efficiency(tmp_path: Path):
     store = new_store(tmp_path)
     start = 1_700_000_000.0
