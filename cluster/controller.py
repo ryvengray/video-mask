@@ -324,6 +324,37 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=404, detail="task does not exist")
         return task
 
+    @app.get("/api/tasks/{task_id}/play-url")
+    def get_task_play_url(task_id: str, file: str = "input",
+                          authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if not s3_ingestor:
+            raise HTTPException(status_code=409, detail="playback URLs are only available for S3 tasks")
+        if file == "input":
+            source_key = str(task.get("source_object_key") or "")
+            if not source_key:
+                raise HTTPException(status_code=404, detail="task has no source object key")
+            url = s3_ingestor.source_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": s3_ingestor.source_bucket, "Key": source_key},
+                ExpiresIn=s3_ingestor.presign_seconds,
+            )
+        elif file == "output":
+            output_key = str(task.get("output_object_key") or "")
+            if not output_key:
+                raise HTTPException(status_code=404, detail="task has no output object key")
+            url = s3_ingestor.output_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": s3_ingestor.output_bucket, "Key": output_key},
+                ExpiresIn=s3_ingestor.presign_seconds,
+            )
+        else:
+            raise HTTPException(status_code=400, detail="file must be 'input' or 'output'")
+        return {"url": url}
+
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)

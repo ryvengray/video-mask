@@ -75,6 +75,25 @@ if (s3IngestControl) {
   }
 }
 
+document.querySelector('.task-table')?.addEventListener('click', async (event) => {
+  const button = event.target.closest('.file-play');
+  if (!button) return;
+  const { taskId, file } = button.dataset;
+  if (!taskId) return;
+  const token = window.prompt('Enter the Controller admin token to play the file:');
+  if (!token) return;
+  try {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    window.open(payload.url, '_blank', 'noopener,noreferrer');
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : 'Unable to get playback URL.');
+  }
+});
+
 const statisticsPayload = document.getElementById('processing-statistics');
 const statisticsFilter = document.getElementById('statistics-filter');
 
