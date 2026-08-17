@@ -277,11 +277,11 @@ if (faceReviewControl) {
       const filename = payload.playback_file === 'output'
         ? (payload.task.output_object_key || 'output video')
         : (payload.task.source_object_key || 'input video');
-      setReviewMessage(`Reserved for this browser. Frame preview uses the ${payload.playback_file} video: ${filename}`);
+      setReviewMessage(`Reserved for this browser. Playing ${payload.playback_file} video: ${filename}`);
       setReviewControls();
       pauseAutoRefresh();
       heartbeatTimer = window.setInterval(heartbeatFaceReview, 30_000);
-      showFaceReviewTab('frames');
+      showFaceReviewTab('video');
       refreshFaceReviewStatuses();
     } catch (error) {
       setReviewMessage(error instanceof Error ? error.message : 'Unable to claim a video.');
