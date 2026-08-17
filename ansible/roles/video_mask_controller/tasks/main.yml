@@ -6,6 +6,7 @@
       - python3-venv
       - python3-pip
       - curl
+      - ffmpeg
       - unzip
     state: present
     update_cache: true

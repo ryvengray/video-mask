@@ -5,10 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import hashlib
 import hmac
+import json
 import logging
 import os
+import random
+import shutil
 import sqlite3
+import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -19,7 +25,7 @@ from typing import Any
 
 try:
     from fastapi import FastAPI, Header, HTTPException, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
     from pydantic import BaseModel, Field
@@ -46,6 +52,26 @@ TASK_FILTER_STATUSES = (
 )
 FACE_REVIEW_LEASE_SECONDS = 300
 FACE_ANNOTATION_FILTERS = ("has_face", "no_face", "unlabelled")
+FRAME_PREVIEW_HEIGHT = 240
+FRAME_PREVIEW_PER_MINUTE = 2
+FRAME_PREVIEW_MAX_IMAGES = 24
+
+
+def frame_preview_timestamps(task_id: str, duration_seconds: float) -> list[float]:
+    """Return stable, spread-out low-resolution frame sample times."""
+    if duration_seconds <= 0:
+        return []
+    minute_count = max(1, int((duration_seconds + 59) // 60))
+    bucket_count = min(minute_count, FRAME_PREVIEW_MAX_IMAGES // FRAME_PREVIEW_PER_MINUTE)
+    randomizer = random.Random(task_id)
+    samples: list[float] = []
+    for bucket in range(bucket_count):
+        start = duration_seconds * bucket / bucket_count
+        end = duration_seconds * (bucket + 1) / bucket_count
+        padding = min(2.0, max(0.0, (end - start) / 8))
+        for _ in range(FRAME_PREVIEW_PER_MINUTE):
+            samples.append(randomizer.uniform(start + padding, max(start + padding, end - padding)))
+    return sorted(min(duration_seconds - 0.1, max(0.0, value)) for value in samples)
 
 
 def statistics_window(start_value: str | None, end_value: str | None) -> tuple[float, float]:
@@ -365,6 +391,132 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         else:
             raise HTTPException(status_code=400, detail="file must be 'input' or 'output'")
         return url
+
+    frame_preview_root = database.parent / "frame-previews"
+    frame_preview_jobs: set[tuple[str, str, str]] = set()
+    frame_preview_lock = threading.Lock()
+
+    def frame_preview_dir(task_id: str, file: str) -> Path:
+        # Task IDs originate from an API, so keep cache paths independent of
+        # their spelling and never allow a path component to be user-controlled.
+        return frame_preview_root / hashlib.sha256(task_id.encode("utf-8")).hexdigest() / file
+
+    def frame_preview_manifest(directory: Path) -> dict[str, Any]:
+        try:
+            return json.loads((directory / "manifest.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def write_frame_preview_manifest(directory: Path, payload: dict[str, Any]) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / "manifest.json.partial"
+        temporary.write_text(json.dumps(payload, separators=(",", ":")))
+        temporary.replace(directory / "manifest.json")
+
+    def frame_preview_response(task_id: str, file: str, manifest: dict[str, Any]) -> dict[str, Any]:
+        frames = manifest.get("frames") or []
+        return {
+            "state": str(manifest.get("state") or "running"),
+            "file": file,
+            "frames": [{
+                "timestamp_seconds": frame.get("timestamp_seconds"),
+                "url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/frame-previews/files/"
+                       f"{urllib.parse.quote(str(frame.get('filename') or ''), safe='')}?file={file}",
+            } for frame in frames if frame.get("filename")],
+            "error": str(manifest.get("error") or ""),
+        }
+
+    def generate_frame_previews(task_id: str, file: str, source_url: str, fingerprint: str,
+                                duration_hint: float | None) -> None:
+        directory = frame_preview_dir(task_id, file)
+        job_key = (task_id, file, fingerprint)
+        manifest: dict[str, Any] = {"state": "running", "fingerprint": fingerprint, "frames": []}
+        try:
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True, exist_ok=True)
+            duration_seconds = duration_hint
+            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", source_url],
+                    text=True, capture_output=True, check=False, timeout=60,
+                )
+                try:
+                    duration_seconds = float(probe.stdout.strip())
+                except ValueError as exc:
+                    raise RuntimeError("unable to determine video duration for frame preview") from exc
+            timestamps = frame_preview_timestamps(task_id, float(duration_seconds))
+            if not timestamps:
+                raise RuntimeError("video duration is empty")
+            manifest["duration_seconds"] = duration_seconds
+            write_frame_preview_manifest(directory, manifest)
+            for index, timestamp in enumerate(timestamps, start=1):
+                filename = f"frame-{index:02d}.jpg"
+                image = directory / filename
+                command = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.3f}",
+                    "-i", source_url, "-map", "0:v:0", "-frames:v", "1",
+                    "-vf", f"scale=-2:{FRAME_PREVIEW_HEIGHT}", "-q:v", "7", "-y", str(image),
+                ]
+                completed = subprocess.run(command, text=True, capture_output=True, check=False, timeout=90)
+                if completed.returncode:
+                    logger.warning("Frame preview %s/%s at %.1fs failed: %s", task_id, file, timestamp,
+                                   completed.stderr[-500:].strip())
+                    continue
+                manifest["frames"].append({"filename": filename, "timestamp_seconds": round(timestamp, 1)})
+                write_frame_preview_manifest(directory, manifest)
+            if not manifest["frames"]:
+                raise RuntimeError("ffmpeg could not extract any video frames")
+            manifest["state"] = "ready"
+            write_frame_preview_manifest(directory, manifest)
+        except Exception as exc:
+            logger.warning("Frame preview generation failed for %s: %s", task_id, exc)
+            manifest.update({"state": "error", "error": str(exc)[:500]})
+            write_frame_preview_manifest(directory, manifest)
+        finally:
+            with frame_preview_lock:
+                frame_preview_jobs.discard(job_key)
+
+    @app.get("/api/tasks/{task_id}/frame-previews")
+    def get_frame_previews(task_id: str) -> dict[str, Any]:
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if task.get("status") != "completed":
+            raise HTTPException(status_code=409, detail="frame previews are available after task completion")
+        if not s3_ingestor:
+            raise HTTPException(status_code=409, detail="frame previews are only available for S3 tasks")
+        file = "output" if task.get("output_object_key") else "input"
+        fingerprint = "|".join(str(value or "") for value in (
+            file, task.get("output_object_key") if file == "output" else task.get("source_object_key"),
+            task.get("output_sha256") if file == "output" else task.get("source_sha256"),
+            task.get("finished_at") if file == "output" else task.get("created_at"),
+        ))
+        directory = frame_preview_dir(task_id, file)
+        manifest = frame_preview_manifest(directory)
+        if manifest.get("fingerprint") == fingerprint and manifest.get("state") in {"running", "ready", "error"}:
+            return frame_preview_response(task_id, file, manifest)
+        job_key = (task_id, file, fingerprint)
+        with frame_preview_lock:
+            if job_key not in frame_preview_jobs:
+                frame_preview_jobs.add(job_key)
+                duration_hint = (task.get("output_duration_seconds") if file == "output"
+                                 else task.get("source_duration_seconds"))
+                threading.Thread(
+                    target=generate_frame_previews,
+                    args=(task_id, file, task_playback_url(task_id, file), fingerprint, duration_hint),
+                    name=f"frame-preview-{task_id[:8]}", daemon=True,
+                ).start()
+        return frame_preview_response(task_id, file, {"state": "running", "frames": []})
+
+    @app.get("/api/tasks/{task_id}/frame-previews/files/{filename}")
+    def get_frame_preview_file(task_id: str, filename: str, file: str = "output"):
+        if file not in {"input", "output"} or filename != Path(filename).name or not filename.endswith(".jpg"):
+            raise HTTPException(status_code=404, detail="frame preview does not exist")
+        image = frame_preview_dir(task_id, file) / filename
+        if not image.is_file():
+            raise HTTPException(status_code=404, detail="frame preview does not exist")
+        return FileResponse(image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
     @app.get("/api/tasks/{task_id}/play-url")
     def get_task_play_url(task_id: str, file: str = "input") -> dict[str, str]:

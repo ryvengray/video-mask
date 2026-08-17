@@ -135,10 +135,16 @@ if (faceReviewControl) {
   const message = document.getElementById('face-review-message');
   const player = document.getElementById('face-review-player');
   const video = document.getElementById('face-review-video');
+  const reviewTabs = document.querySelectorAll('[data-face-review-tab]');
+  const framesPanel = document.getElementById('face-review-frames-panel');
+  const videoPanel = document.getElementById('face-review-video-panel');
+  const framesMessage = document.getElementById('face-review-frames-message');
+  const frames = document.getElementById('face-review-frames');
   const faceButton = document.getElementById('face-review-face');
   const noFaceButton = document.getElementById('face-review-no-face');
   const releaseButton = document.getElementById('face-review-release');
   let heartbeatTimer;
+  let framePreviewTimer;
 
   async function reviewRequest(path, options = {}) {
     const response = await fetch(path, {
@@ -163,10 +169,14 @@ if (faceReviewControl) {
 
   function stopActiveReview({keepMessage = false} = {}) {
     window.clearInterval(heartbeatTimer);
+    window.clearTimeout(framePreviewTimer);
     heartbeatTimer = undefined;
+    framePreviewTimer = undefined;
     video.pause();
     video.removeAttribute('src');
     video.load();
+    frames.replaceChildren();
+    framesMessage.textContent = 'Preparing low-resolution frame previews…';
     player.hidden = true;
     activeFaceReview = null;
     activeBadge.className = 'badge muted';
@@ -174,6 +184,65 @@ if (faceReviewControl) {
     setReviewControls();
     if (!keepMessage) setReviewMessage('Video released. You can claim another unlabelled completed video.');
     scheduleAutoRefresh();
+  }
+
+  function renderFramePreviews(previews) {
+    frames.replaceChildren();
+    previews.forEach(preview => {
+      const item = document.createElement('figure');
+      const image = document.createElement('img');
+      image.src = preview.url;
+      image.loading = 'lazy';
+      image.alt = `Frame at ${Number(preview.timestamp_seconds || 0).toFixed(0)} seconds`;
+      const caption = document.createElement('figcaption');
+      const seconds = Number(preview.timestamp_seconds || 0);
+      caption.textContent = `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+      item.append(image, caption);
+      frames.append(item);
+    });
+  }
+
+  async function loadFramePreviews() {
+    if (!activeFaceReview) return;
+    const taskId = activeFaceReview.task_id;
+    try {
+      const payload = await reviewRequest(
+        `/api/tasks/${encodeURIComponent(taskId)}/frame-previews`
+      );
+      if (!activeFaceReview || activeFaceReview.task_id !== taskId) return;
+      renderFramePreviews(payload.frames || []);
+      if (payload.state === 'ready') {
+        framesMessage.textContent = `${(payload.frames || []).length} low-resolution frames ready. Open Video only when you need more detail.`;
+      } else if (payload.state === 'error') {
+        framesMessage.textContent = payload.error || 'Unable to generate frame previews. You can still use the Video tab.';
+      } else {
+        framesMessage.textContent = payload.frames?.length
+          ? `Preparing frames… ${payload.frames.length} available so far.`
+          : 'Preparing low-resolution frame previews from S3…';
+        framePreviewTimer = window.setTimeout(loadFramePreviews, 2_000);
+      }
+    } catch (error) {
+      framesMessage.textContent = error instanceof Error
+        ? `${error.message}. You can still use the Video tab.`
+        : 'Unable to generate frame previews. You can still use the Video tab.';
+    }
+  }
+
+  function showFaceReviewTab(name) {
+    const showFrames = name === 'frames';
+    reviewTabs.forEach(tab => {
+      const active = tab.dataset.faceReviewTab === name;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+    });
+    framesPanel.hidden = !showFrames;
+    videoPanel.hidden = showFrames;
+    if (showFrames) {
+      window.clearTimeout(framePreviewTimer);
+      loadFramePreviews();
+    } else if (activeFaceReview && !video.src) {
+      video.src = activeFaceReview.playback_url;
+    }
   }
 
   async function heartbeatFaceReview() {
@@ -201,18 +270,18 @@ if (faceReviewControl) {
         setReviewControls();
         return;
       }
-      activeFaceReview = payload.task;
-      video.src = payload.playback_url;
+      activeFaceReview = {...payload.task, playback_url: payload.playback_url};
       player.hidden = false;
       activeBadge.className = 'badge active';
       activeBadge.textContent = 'Review in progress';
       const filename = payload.playback_file === 'output'
         ? (payload.task.output_object_key || 'output video')
         : (payload.task.source_object_key || 'input video');
-      setReviewMessage(`Reserved for this browser. Playing ${payload.playback_file} video: ${filename}`);
+      setReviewMessage(`Reserved for this browser. Frame preview uses the ${payload.playback_file} video: ${filename}`);
       setReviewControls();
       pauseAutoRefresh();
       heartbeatTimer = window.setInterval(heartbeatFaceReview, 30_000);
+      showFaceReviewTab('frames');
       refreshFaceReviewStatuses();
     } catch (error) {
       setReviewMessage(error instanceof Error ? error.message : 'Unable to claim a video.');
@@ -315,6 +384,7 @@ if (faceReviewControl) {
   }
 
   claimButton.addEventListener('click', claimFaceReview);
+  reviewTabs.forEach(tab => tab.addEventListener('click', () => showFaceReviewTab(tab.dataset.faceReviewTab)));
   faceButton.addEventListener('click', () => annotateFaceReview(true));
   noFaceButton.addEventListener('click', () => annotateFaceReview(false));
   releaseButton.addEventListener('click', releaseFaceReview);
