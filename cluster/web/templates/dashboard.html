@@ -45,6 +45,25 @@
       <p class="statistics-footnote">“Worker hours / video hour” uses Worker-reported algorithm processing time. It excludes idle cloud-instance time, downloads and uploads. “In-flight concurrency” includes download, processing and upload while a task is assigned.</p>
     </section>
   </main>
+  <div id="play-link-modal" class="play-modal" hidden>
+    <div class="play-modal-backdrop" data-play-close></div>
+    <div class="play-modal-card" role="dialog" aria-modal="true" aria-labelledby="play-modal-title">
+      <div class="play-modal-head">
+        <div>
+          <h3 id="play-modal-title">S3 file link</h3>
+          <p class="play-modal-sub"><span id="play-modal-kind" class="badge active">Input</span><span id="play-modal-name" class="mono"></span></p>
+        </div>
+        <button class="play-modal-close" type="button" data-play-close aria-label="Close">&times;</button>
+      </div>
+      <input id="play-modal-url" class="play-url-input" readonly aria-label="Presigned S3 URL">
+      <p class="play-modal-note">Presigned link is temporary. Copy it, or open it in a new tab (works in any player or downloader).</p>
+      <div class="play-modal-actions">
+        <button id="play-modal-copy" class="play-btn play-btn-primary" type="button">Copy link</button>
+        <a id="play-modal-open" class="play-btn play-btn-open" href="#" target="_blank" rel="noopener noreferrer">Open in new tab</a>
+        <button class="play-btn" type="button" data-play-close>Close</button>
+      </div>
+    </div>
+  </div>
   <script id="processing-statistics" type="application/json">{{ processing_statistics | tojson }}</script>
   <script src="{{ url_for('static', path='dashboard.js') }}"></script>
 </body>

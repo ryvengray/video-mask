@@ -75,35 +75,82 @@ if (s3IngestControl) {
   }
 }
 
+let adminToken = '';
+const playModal = document.getElementById('play-link-modal');
+const playUrlInput = document.getElementById('play-modal-url');
+const playKindBadge = document.getElementById('play-modal-kind');
+const playFileName = document.getElementById('play-modal-name');
+const playOpenLink = document.getElementById('play-modal-open');
+const playCopyButton = document.getElementById('play-modal-copy');
+const autoRefreshMeta = document.querySelector('meta[http-equiv="refresh"]');
+
+function openPlayModal(url, kind, name) {
+  playKindBadge.textContent = kind === 'output' ? 'Output' : 'Input';
+  playKindBadge.className = `badge ${kind === 'output' ? 'success' : 'active'}`;
+  playFileName.textContent = name;
+  playFileName.title = name;
+  playUrlInput.value = url;
+  playOpenLink.href = url;
+  playModal.hidden = false;
+  // Cancel the 60s auto-refresh while the link is on screen, then restore on close.
+  autoRefreshMeta?.remove();
+  playUrlInput.focus();
+  playUrlInput.select();
+}
+
+function closePlayModal() {
+  if (!playModal || playModal.hidden) return;
+  playModal.hidden = true;
+  if (autoRefreshMeta && !autoRefreshMeta.isConnected) document.head.append(autoRefreshMeta);
+}
+
+playModal?.querySelectorAll('[data-play-close]').forEach(element =>
+  element.addEventListener('click', closePlayModal));
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closePlayModal();
+});
+playUrlInput?.addEventListener('click', () => playUrlInput.select());
+
+playCopyButton?.addEventListener('click', async () => {
+  const url = playUrlInput.value;
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    playUrlInput.select();
+    document.execCommand('copy');
+  }
+  playCopyButton.textContent = 'Copied ✓';
+  playCopyButton.classList.add('copied');
+  setTimeout(() => {
+    playCopyButton.textContent = 'Copy link';
+    playCopyButton.classList.remove('copied');
+  }, 1800);
+});
+
 document.querySelector('.task-table')?.addEventListener('click', async (event) => {
   const button = event.target.closest('.file-play');
   if (!button) return;
   const { taskId, file } = button.dataset;
   if (!taskId) return;
-  const token = window.prompt('Enter the Controller admin token to play the file:');
+  const token = adminToken || window.prompt('Enter the Controller admin token to get the S3 link:');
   if (!token) return;
-  // NOTE: 'noopener' must NOT go in the features string - the spec makes
-  // window.open() return null in that case, losing our handle.  Sever the
-  // opener link manually instead, after the synchronous user gesture.
-  const newTab = window.open('about:blank', '_blank');
-  if (newTab) {
-    newTab.opener = null;
-    newTab.document.write('<p style="font-family:sans-serif">Loading video…</p>');
-  }
+  button.disabled = true;
   try {
     const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
-    if (newTab) {
-      newTab.location.href = payload.url;
-    } else {
-      window.open(payload.url, '_blank', 'noopener,noreferrer');
+    if (!response.ok) {
+      if (response.status === 401) adminToken = '';
+      throw new Error(payload.detail || `Request failed (${response.status})`);
     }
+    adminToken = token;
+    openPlayModal(payload.url, file, button.textContent.trim());
   } catch (error) {
-    newTab?.close();
-    window.alert(error instanceof Error ? error.message : 'Unable to get playback URL.');
+    window.alert(error instanceof Error ? error.message : 'Unable to get the S3 link.');
+  } finally {
+    button.disabled = false;
   }
 });
 
