@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import sqlite3
 
 import pytest
 
@@ -96,6 +97,25 @@ def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path
     reopened = ClusterStore(database)
     assert reopened.boolean_setting("s3_ingest_enabled", True) is False
     reopened.close()
+
+
+def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tmp_path: Path):
+    database = tmp_path / "controller.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript("""
+        CREATE TABLE tasks (
+          task_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at REAL NOT NULL,
+          assigned_worker_id TEXT, finished_at REAL, started_at REAL, updated_at REAL NOT NULL
+        );
+    """)
+    connection.close()
+
+    store = ClusterStore(database)
+    columns = {row[1] for row in store.conn.execute("PRAGMA table_info(tasks)")}
+    indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(tasks)")}
+    assert {"face_annotation", "face_annotated_at", "face_review_owner", "face_review_lease_until"} <= columns
+    assert "idx_tasks_face_review" in indexes
+    store.close()
 
 
 def test_task_list_pagination_returns_total_without_overlapping_pages(tmp_path: Path):

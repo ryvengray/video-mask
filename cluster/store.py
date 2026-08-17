@@ -87,8 +87,6 @@ class ClusterStore:
         CREATE INDEX IF NOT EXISTS idx_tasks_worker ON tasks(assigned_worker_id, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_finished ON tasks(finished_at, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_started ON tasks(started_at);
-        CREATE INDEX IF NOT EXISTS idx_tasks_face_review
-          ON tasks(status, face_annotation, face_review_owner, finished_at);
         CREATE TABLE IF NOT EXISTS controller_settings (
             setting_key TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL,
@@ -106,6 +104,12 @@ class ClusterStore:
         ):
             if column not in task_columns:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        # This must run after the ALTER TABLE migration above: existing
+        # Controller databases do not have the annotation columns yet.
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_face_review
+              ON tasks(status, face_annotation, face_review_owner, finished_at)
+        """)
         self.conn.commit()
 
     @synchronized
