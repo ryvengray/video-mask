@@ -6,6 +6,7 @@
   <title>Video Mask · Operations</title>
   <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}?v=20260817e">
   <style>.face-review-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:10px}.face-review-tab{border:0;border-bottom:2px solid transparent;background:transparent;padding:7px 11px;color:var(--muted);font:500 13px Arial;cursor:pointer}.face-review-tab.active{color:var(--blue);border-bottom-color:var(--blue)}.face-review-frames{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}.face-review-frames figure{margin:0;border:1px solid var(--line);border-radius:5px;overflow:hidden;background:#f8f9fa}.face-review-frames img{display:block;width:100%;height:135px;object-fit:cover;background:#111}.face-review-frames figcaption{padding:4px 7px;color:var(--muted);font-size:11px}</style>
+  <style>.play-modal-annotation{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px}.play-modal-annotation[hidden]{display:none}.play-modal-annotation-status{margin-right:auto}</style>
 </head>
 <body>
   <header class="topbar">
@@ -64,6 +65,7 @@
         Your browser does not support HTML5 video playback.
       </video>
       <p class="play-modal-note">This preview uses a temporary signed S3 link.</p>
+      <div id="play-modal-annotation" class="play-modal-annotation" hidden><span id="play-modal-annotation-status" class="subtle">Opening manual label…</span><button id="play-modal-has-face" class="face-label-button face-label-yes" type="button">👍 Has face</button><button id="play-modal-no-face" class="face-label-button face-label-no" type="button">👎 No face</button></div>
       <div class="play-modal-actions">
         <a id="play-modal-open" class="play-btn play-btn-open" href="#" target="_blank" rel="noopener noreferrer">Open in new tab</a>
         <button class="play-btn" type="button" data-play-close>Close</button>
@@ -71,6 +73,6 @@
     </div>
   </div>
   <script id="processing-statistics" type="application/json">{{ processing_statistics | tojson }}</script>
-  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260817h"></script>
+  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260817i"></script>
 </body>
 </html>

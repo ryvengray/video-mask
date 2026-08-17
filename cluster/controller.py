@@ -621,6 +621,15 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "playback_file": playback_file,
         }
 
+    @app.post("/api/face-reviews/{task_id}/open")
+    def open_face_review(task_id: str, request: FaceReviewRequest) -> dict[str, Any]:
+        """Reserve a particular completed video so its label can be viewed or edited."""
+        try:
+            task = store.claim_face_review(task_id, request.reviewer_id, FACE_REVIEW_LEASE_SECONDS)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"task": task, "lease_seconds": FACE_REVIEW_LEASE_SECONDS}
+
     @app.post("/api/face-reviews/{task_id}/heartbeat")
     def renew_face_review(task_id: str, request: FaceReviewRequest) -> dict[str, Any]:
         try:

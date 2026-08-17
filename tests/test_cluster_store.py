@@ -81,6 +81,11 @@ def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypat
     assert by_task_id[claimed_first["task_id"]]["has_face"] is True
     assert by_task_id[claimed_second["task_id"]]["reviewing"] is True
 
+    reopened = store.claim_face_review(claimed_first["task_id"], "browser-a-unique-id", 300)
+    assert reopened["face_annotation"] == 1
+    changed = store.annotate_face(claimed_first["task_id"], "browser-a-unique-id", False)
+    assert changed["face_annotation"] == 0
+
     clock[0] += 301
     reclaimed = store.claim_next_face_review("browser-c-unique-id", 300)
     assert reclaimed and reclaimed["task_id"] == claimed_second["task_id"]

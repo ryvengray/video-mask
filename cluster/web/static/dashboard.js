@@ -80,6 +80,8 @@ const playFileName = document.getElementById('play-modal-name');
 const playOpenLink = document.getElementById('play-modal-open');
 let autoRefreshTimer;
 let activeFaceReview = null;
+let beginModalAnnotation = () => {};
+let endModalAnnotation = () => {};
 
 function scheduleAutoRefresh() {
   window.clearTimeout(autoRefreshTimer);
@@ -91,7 +93,7 @@ function pauseAutoRefresh() {
   window.clearTimeout(autoRefreshTimer);
 }
 
-function openPlayModal(url, kind, name) {
+function openPlayModal(url, kind, name, taskId) {
   playKindBadge.textContent = kind === 'output' ? 'Output' : 'Input';
   playKindBadge.className = `badge ${kind === 'output' ? 'success' : 'active'}`;
   playFileName.textContent = name;
@@ -100,6 +102,7 @@ function openPlayModal(url, kind, name) {
   playOpenLink.href = url;
   playModal.hidden = false;
   pauseAutoRefresh();
+  beginModalAnnotation(taskId);
   playVideo.focus();
 }
 
@@ -108,6 +111,7 @@ function closePlayModal() {
   playVideo.pause();
   playVideo.removeAttribute('src');
   playVideo.load();
+  endModalAnnotation();
   playModal.hidden = true;
   scheduleAutoRefresh();
 }
@@ -143,8 +147,15 @@ if (faceReviewControl) {
   const faceButton = document.getElementById('face-review-face');
   const noFaceButton = document.getElementById('face-review-no-face');
   const releaseButton = document.getElementById('face-review-release');
+  const modalAnnotation = document.getElementById('play-modal-annotation');
+  const modalAnnotationStatus = document.getElementById('play-modal-annotation-status');
+  const modalHasFaceButton = document.getElementById('play-modal-has-face');
+  const modalNoFaceButton = document.getElementById('play-modal-no-face');
   let heartbeatTimer;
   let framePreviewTimer;
+  let modalHeartbeatTimer;
+  let activeModalReview = null;
+  let modalReviewToken = 0;
 
   async function reviewRequest(path, options = {}) {
     const response = await fetch(path, {
@@ -166,6 +177,97 @@ if (faceReviewControl) {
     noFaceButton.disabled = busy;
     releaseButton.disabled = busy;
   }
+
+  function modalAnnotationText(faceAnnotation) {
+    if (faceAnnotation === 1) return 'Current label: 👍 Has face';
+    if (faceAnnotation === 0) return 'Current label: 👎 No face';
+    return 'Current label: unlabelled';
+  }
+
+  function setModalAnnotationControls(enabled) {
+    modalHasFaceButton.disabled = !enabled;
+    modalNoFaceButton.disabled = !enabled;
+  }
+
+  async function heartbeatModalReview() {
+    if (!activeModalReview) return;
+    try {
+      await reviewRequest(`/api/face-reviews/${encodeURIComponent(activeModalReview.task_id)}/heartbeat`, {
+        method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
+      });
+    } catch (error) {
+      window.clearInterval(modalHeartbeatTimer);
+      activeModalReview = null;
+      setModalAnnotationControls(false);
+      modalAnnotationStatus.textContent = error instanceof Error ? error.message : 'Manual label lease ended.';
+    }
+  }
+
+  async function saveModalAnnotation(hasFace) {
+    if (!activeModalReview) return;
+    setModalAnnotationControls(false);
+    try {
+      const task = await reviewRequest(
+        `/api/face-reviews/${encodeURIComponent(activeModalReview.task_id)}/annotation`,
+        {method: 'PUT', body: JSON.stringify({reviewer_id: reviewerId, has_face: hasFace})},
+      );
+      const reopened = await reviewRequest(
+        `/api/face-reviews/${encodeURIComponent(activeModalReview.task_id)}/open`,
+        {method: 'POST', body: JSON.stringify({reviewer_id: reviewerId})},
+      );
+      modalAnnotationStatus.textContent = modalAnnotationText(task.face_annotation);
+      activeModalReview = {task_id: reopened.task.task_id};
+      refreshFaceReviewStatuses();
+    } catch (error) {
+      modalAnnotationStatus.textContent = error instanceof Error ? error.message : 'Unable to save manual label.';
+    } finally {
+      setModalAnnotationControls(Boolean(activeModalReview));
+    }
+  }
+
+  beginModalAnnotation = async taskId => {
+    const token = ++modalReviewToken;
+    window.clearInterval(modalHeartbeatTimer);
+    activeModalReview = null;
+    modalAnnotation.hidden = false;
+    modalAnnotationStatus.textContent = 'Opening manual label…';
+    setModalAnnotationControls(false);
+    try {
+      const payload = await reviewRequest(`/api/face-reviews/${encodeURIComponent(taskId)}/open`, {
+        method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
+      });
+      if (token !== modalReviewToken || playModal.hidden) {
+        fetch(`/api/face-reviews/${encodeURIComponent(taskId)}/release`, {
+          method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reviewer_id: reviewerId}),
+        });
+        return;
+      }
+      activeModalReview = {task_id: taskId};
+      modalAnnotationStatus.textContent = modalAnnotationText(payload.task.face_annotation);
+      setModalAnnotationControls(true);
+      modalHeartbeatTimer = window.setInterval(heartbeatModalReview, 30_000);
+    } catch (error) {
+      modalAnnotationStatus.textContent = error instanceof Error
+        ? `${error.message}.`
+        : 'Manual labels are available for completed videos only.';
+    }
+  };
+
+  endModalAnnotation = () => {
+    modalReviewToken += 1;
+    window.clearInterval(modalHeartbeatTimer);
+    modalHeartbeatTimer = undefined;
+    const review = activeModalReview;
+    activeModalReview = null;
+    modalAnnotation.hidden = true;
+    setModalAnnotationControls(false);
+    if (!review) return;
+    fetch(`/api/face-reviews/${encodeURIComponent(review.task_id)}/release`, {
+      method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reviewer_id: reviewerId}),
+    });
+  };
 
   function stopActiveReview({keepMessage = false} = {}) {
     window.clearInterval(heartbeatTimer);
@@ -388,6 +490,8 @@ if (faceReviewControl) {
   faceButton.addEventListener('click', () => annotateFaceReview(true));
   noFaceButton.addEventListener('click', () => annotateFaceReview(false));
   releaseButton.addEventListener('click', releaseFaceReview);
+  modalHasFaceButton.addEventListener('click', () => saveModalAnnotation(true));
+  modalNoFaceButton.addEventListener('click', () => saveModalAnnotation(false));
   window.addEventListener('pagehide', () => {
     if (!activeFaceReview) return;
     fetch(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/release`, {
@@ -420,7 +524,7 @@ taskTable?.addEventListener('click', async (event) => {
     if (!response.ok) {
       throw new Error(payload.detail || `Request failed (${response.status})`);
     }
-    openPlayModal(payload.url, file, button.textContent.trim());
+    openPlayModal(payload.url, file, button.textContent.trim(), taskId);
   } catch (error) {
     console.error('[video-mask] play-link failed:', error);
     window.alert(error instanceof Error ? error.message : 'Unable to get the S3 link.');

@@ -335,7 +335,7 @@ class ClusterStore:
     def _expire_face_review_leases(self, stamp: float) -> None:
         self.conn.execute("""
             UPDATE tasks SET face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
-            WHERE face_annotation IS NULL AND face_review_lease_until IS NOT NULL AND face_review_lease_until <= ?
+            WHERE face_review_lease_until IS NOT NULL AND face_review_lease_until <= ?
         """, (stamp, stamp))
 
     @synchronized
@@ -368,12 +368,36 @@ class ClusterStore:
             raise
 
     @synchronized
+    def claim_face_review(self, task_id: str, reviewer_id: str, lease_seconds: int) -> dict[str, Any]:
+        """Reserve one completed S3 task for editing its current face label."""
+        stamp = now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._expire_face_review_leases(stamp)
+            task = self.task(task_id)
+            if task is None:
+                raise ValueError("task does not exist")
+            if task["status"] != "completed" or not task.get("source_object_key"):
+                raise ValueError("only completed S3 tasks can be manually labelled")
+            owner = task.get("face_review_owner")
+            if owner not in {None, reviewer_id}:
+                raise ValueError("this video is currently being labelled by another browser")
+            self.conn.execute("""
+                UPDATE tasks SET face_review_owner=?, face_review_lease_until=?, updated_at=? WHERE task_id=?
+            """, (reviewer_id, stamp + lease_seconds, stamp, task_id))
+            self.conn.execute("COMMIT")
+            return self.task(task_id) or {}
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @synchronized
     def renew_face_review(self, task_id: str, reviewer_id: str, lease_seconds: int) -> dict[str, Any]:
         stamp = now()
         self._expire_face_review_leases(stamp)
         cursor = self.conn.execute("""
             UPDATE tasks SET face_review_lease_until=?, updated_at=?
-            WHERE task_id=? AND face_annotation IS NULL AND face_review_owner=?
+            WHERE task_id=? AND face_review_owner=?
         """, (stamp + lease_seconds, stamp, task_id, reviewer_id))
         if cursor.rowcount != 1:
             self.conn.commit()
@@ -386,7 +410,7 @@ class ClusterStore:
         stamp = now()
         cursor = self.conn.execute("""
             UPDATE tasks SET face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
-            WHERE task_id=? AND face_annotation IS NULL AND face_review_owner=?
+            WHERE task_id=? AND face_review_owner=?
         """, (stamp, task_id, reviewer_id))
         self.conn.commit()
         return cursor.rowcount == 1
@@ -398,11 +422,11 @@ class ClusterStore:
         cursor = self.conn.execute("""
             UPDATE tasks SET face_annotation=?, face_annotated_at=?, face_review_owner=NULL,
               face_review_lease_until=NULL, updated_at=?
-            WHERE task_id=? AND status='completed' AND face_annotation IS NULL AND face_review_owner=?
+            WHERE task_id=? AND status='completed' AND face_review_owner=?
         """, (1 if has_face else 0, stamp, stamp, task_id, reviewer_id))
         if cursor.rowcount != 1:
             self.conn.commit()
-            raise ValueError("face-review lease expired or this task was already labelled")
+            raise ValueError("face-review lease expired or this task is no longer available")
         self.conn.commit()
         return self.task(task_id) or {}
 
