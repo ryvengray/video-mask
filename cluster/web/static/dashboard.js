@@ -1,3 +1,4 @@
+console.info('[video-mask] dashboard.js loaded (play-link build 2026-08-17)');
 const tabs = document.querySelectorAll('.tab');
 const panels = {
   tasks: document.getElementById('panel-tasks'),
@@ -128,19 +129,32 @@ playCopyButton?.addEventListener('click', async () => {
   }, 1800);
 });
 
-document.querySelector('.task-table')?.addEventListener('click', async (event) => {
+const taskTable = document.querySelector('.task-table');
+console.info('[video-mask] task-table found:', Boolean(taskTable),
+  '| play buttons:', document.querySelectorAll('.file-play').length,
+  '| modal:', Boolean(document.getElementById('play-link-modal')));
+taskTable?.addEventListener('click', async (event) => {
+  console.info('[video-mask] click on task table:', event.target);
   const button = event.target.closest('.file-play');
-  if (!button) return;
+  if (!button) {
+    console.info('[video-mask] click target is not a .file-play button - ignored');
+    return;
+  }
   const { taskId, file } = button.dataset;
+  console.info('[video-mask] play-link requested:', { taskId, file });
   if (!taskId) return;
   const token = adminToken || window.prompt('Enter the Controller admin token to get the S3 link:');
-  if (!token) return;
+  if (!token) {
+    console.info('[video-mask] no admin token provided - aborted');
+    return;
+  }
   button.disabled = true;
   try {
     const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     const payload = await response.json();
+    console.info('[video-mask] play-url response:', response.status, payload);
     if (!response.ok) {
       if (response.status === 401) adminToken = '';
       throw new Error(payload.detail || `Request failed (${response.status})`);
@@ -148,6 +162,7 @@ document.querySelector('.task-table')?.addEventListener('click', async (event) =
     adminToken = token;
     openPlayModal(payload.url, file, button.textContent.trim());
   } catch (error) {
+    console.error('[video-mask] play-link failed:', error);
     window.alert(error instanceof Error ? error.message : 'Unable to get the S3 link.');
   } finally {
     button.disabled = false;

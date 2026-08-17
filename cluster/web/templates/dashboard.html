@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="60">
   <title>Video Mask · Operations</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}?v=20260817">
 </head>
 <body>
   <header class="topbar">
@@ -65,6 +65,6 @@
     </div>
   </div>
   <script id="processing-statistics" type="application/json">{{ processing_statistics | tojson }}</script>
-  <script src="{{ url_for('static', path='dashboard.js') }}"></script>
+  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260817"></script>
 </body>
 </html>
