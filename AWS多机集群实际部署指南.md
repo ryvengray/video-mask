@@ -314,8 +314,12 @@ sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
 sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
   restart-slot worker-01 --slot 1-15
 
-# 部署更新后的 Worker 代码；先在 settings.yml 更新 video_mask_ref。
-bash scripts/deploy_worker.sh worker-01
+# 部署更新后的 Worker 代码并重启其所有 slot；先在 settings.yml 更新 video_mask_ref。
+bash scripts/deploy_worker.sh worker-01 --restart-slot
+
+# 若目标 EC2 已停止，先启动、等待 SSH 恢复，再部署最新代码。
+# inventory 中的 ansible_host 必须是该实例的私网 IP。
+bash scripts/deploy_worker.sh worker-01 --start-stopped
 
 # 部署 Controller 配置/代码；--restart 可强制重启服务。
 bash scripts/deploy_controller.sh --restart

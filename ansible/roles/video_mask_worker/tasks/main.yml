@@ -133,3 +133,10 @@
     state: started
     daemon_reload: true
   loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
+
+- name: Restart Worker slots after a requested source update
+  ansible.builtin.systemd:
+    name: "video-mask-worker@slot-{{ item }}"
+    state: restarted
+  loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
+  when: video_mask_restart_worker | default(false) | bool

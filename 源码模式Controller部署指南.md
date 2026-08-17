@@ -414,8 +414,9 @@ video_mask_ref: main
 # 更新 Controller
 ansible-playbook -i inventory.yml site.yml --limit controller -K --ask-vault-pass
 
-# 更新所有 Worker
-ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pass
+# 更新所有 Worker；代码变更后显式重启各 slot，使新的算法脚本生效
+ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pass \
+  --extra-vars video_mask_restart_worker=true
 ```
 
 更新 Worker 后，可确认新服务参数已生效：
