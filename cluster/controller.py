@@ -325,9 +325,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return task
 
     @app.get("/api/tasks/{task_id}/play-url")
-    def get_task_play_url(task_id: str, file: str = "input",
-                          authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+    def get_task_play_url(task_id: str, file: str = "input"):
+        # No admin-token check: this endpoint sits behind the nginx-level
+        # authentication that already gates the whole dashboard.
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")

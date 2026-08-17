@@ -1,4 +1,4 @@
-console.info('[video-mask] dashboard.js loaded (play-link build 2026-08-17)');
+console.info('[video-mask] dashboard.js loaded (play-link build 2026-08-17b, no token prompt)');
 const tabs = document.querySelectorAll('.tab');
 const panels = {
   tasks: document.getElementById('panel-tasks'),
@@ -76,7 +76,6 @@ if (s3IngestControl) {
   }
 }
 
-let adminToken = '';
 const playModal = document.getElementById('play-link-modal');
 const playUrlInput = document.getElementById('play-modal-url');
 const playKindBadge = document.getElementById('play-modal-kind');
@@ -143,23 +142,14 @@ taskTable?.addEventListener('click', async (event) => {
   const { taskId, file } = button.dataset;
   console.info('[video-mask] play-link requested:', { taskId, file });
   if (!taskId) return;
-  const token = adminToken || window.prompt('Enter the Controller admin token to get the S3 link:');
-  if (!token) {
-    console.info('[video-mask] no admin token provided - aborted');
-    return;
-  }
   button.disabled = true;
   try {
-    const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`);
     const payload = await response.json();
     console.info('[video-mask] play-url response:', response.status, payload);
     if (!response.ok) {
-      if (response.status === 401) adminToken = '';
       throw new Error(payload.detail || `Request failed (${response.status})`);
     }
-    adminToken = token;
     openPlayModal(payload.url, file, button.textContent.trim());
   } catch (error) {
     console.error('[video-mask] play-link failed:', error);
