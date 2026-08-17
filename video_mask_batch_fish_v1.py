@@ -241,15 +241,35 @@ class YuNetFaceDetector:
                 f"--model-dir 指定目录或脚本当前目录。"
             ) from e
 
-        # GPU 加速: YuNet 通过 OpenCV DNN 后端, 可尝试 CUDA; 失败则默认 CPU
+        # GPU 加速: YuNet 通过 OpenCV DNN 后端, 按优先级 CUDA > OpenCL > CPU
+        # setPreferableBackend 在后端不可用时通常抛 cv2.error; 不可靠时用 warmup 耗时判断
+        import time
+        backend_label = "CPU"
         if use_gpu:
-            try:
-                self._detector.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                self._detector.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-            except Exception:
-                pass
+            for label, backend, target in [
+                ("CUDA", cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA),
+                ("OPENCL", cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_OPENCL),
+            ]:
+                try:
+                    self._detector.setPreferableBackend(backend)
+                    self._detector.setPreferableTarget(target)
+                    backend_label = label
+                    break
+                except Exception:
+                    continue
 
-        print(f"[人脸] YuNet (输入{self.det_size})")
+        # warmup 推理: 用户可通过耗时对比判断 GPU 是否真生效
+        # (CPU 通常 >80ms, CUDA 通常 <20ms; 若声明 CUDA 但 warmup 仍 >80ms 说明静默回退)
+        _dummy = np.zeros((self.det_size, self.det_size, 3), dtype=np.uint8)
+        try:
+            self._detector.setInputSize((self.det_size, self.det_size))
+            t0 = time.time()
+            self._detector.detect(_dummy)
+            warmup_ms = (time.time() - t0) * 1000
+        except Exception:
+            warmup_ms = -1
+
+        print(f"[人脸] YuNet (输入{self.det_size}, 后端={backend_label}, warmup={warmup_ms:.0f}ms)")
 
     @staticmethod
     def _find_model(model_dir):
@@ -754,10 +774,21 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         enc_cmd += ["-i", src]  # 第二输入: 内联读取音频, 省去临时抽取
     # 输出选项(必须在所有 -i 之后)
     if nvenc_available():
-        # NVENC 调优参数(face_gpu.py 移植): p4 速度优先, hq 画质微调, vbr+cq20 近无损
-        enc_cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
-                    "-rc", "vbr", "-cq", "20", "-b:v", "0"]
-        log("  [编码] NVENC GPU 硬件编码 (h264_nvenc, preset=p4)")
+        # NVENC 调优: 优先 hevc_nvenc(与源 HEVC 同格式, 省 ~40% 码率, 避免输出膨胀);
+        # force_h264 或 hevc_nvenc 不可用时回退 h264_nvenc(兼容性无敌).
+        # -cq 20 + -maxrate 双重限速: -b:v 0 单独使用无码率上限, 复杂场景码率会失控膨胀;
+        #   加 maxrate 按 hw_bitrate 算(不超过源片码率), 防止输出比源片大.
+        # preset p6: 比 p4 画质更好, NVENC 吞吐影响小(硬件编码 preset 间差异远小于 CPU).
+        use_hevc = (not force_h264) and _hw_encoder_is_usable("hevc_nvenc")
+        nvenc_enc = "hevc_nvenc" if use_hevc else "h264_nvenc"
+        bitrate = hw_bitrate(w, h, fps, nvenc_enc, get_bitrate(src))
+        enc_cmd += ["-c:v", nvenc_enc, "-preset", "p6", "-tune", "hq",
+                    "-rc", "vbr", "-cq", "20", "-b:v", "0",
+                    "-maxrate", f"{bitrate // 1000}k",
+                    "-bufsize", f"{bitrate // 2000}k"]
+        if use_hevc:
+            enc_cmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
+        log(f"  [编码] NVENC GPU 硬件编码 ({nvenc_enc}, preset=p6, maxrate={bitrate // 1000}kbps)")
     elif hw:
         bitrate = hw_bitrate(w, h, fps, hw, get_bitrate(src))
         enc_cmd += ["-c:v", hw, "-b:v", str(bitrate)]
@@ -1054,7 +1085,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   use_pipe=True, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
-                  fisheye_downscale=1, fisheye_dual="auto", log=print):
+                  fisheye_downscale=2, fisheye_dual="auto", log=print):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1104,7 +1135,8 @@ def main():
                     choices=["generic", "pico4"],
                     help="鱼眼设备预置: generic(通用强鱼眼,默认) / pico4(Pico 4 RGB摄像头, 130°FOV)")
     ap.add_argument("--fisheye-downscale", type=int, default=1, metavar="N",
-                    help="鱼眼remap降采样倍数(默认1=关闭; 2=在1/2分辨率remap再上采样提速但会降低人脸检出率,不推荐)")
+                    help="鱼眼remap降采样倍数(默认1=原分辨率remap, 画质最好且误检最少(实测downscale=2大框误检+30%, 且提速仅+5%因瓶颈在检测); "
+                         "2=1/2分辨率remap提速但bilinear上采样让YuNet更易误检; 3=1/3分辨率更快但可能影响小脸检出)")
     ap.add_argument("--fisheye-dual", default="auto",
                     choices=["auto", "true", "false"],
                     help="双鱼眼拼接模式(默认auto=按宽高比自动检测,w>=2h视为双鱼眼); "
