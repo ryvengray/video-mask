@@ -26,6 +26,8 @@ EOF
 ASK_VAULT=1
 RESTART_SLOT=0
 START_STOPPED=0
+VAULT_ARGUMENTS=()
+VAULT_PASSWORD_FILE=""
 HOSTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,6 +50,17 @@ fi
 LIMIT="$(IFS=,; echo "${HOSTS[*]}")"
 cd "$ROOT_DIR"
 
+if [[ "$ASK_VAULT" -eq 1 ]]; then
+  umask 077
+  VAULT_PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/video-mask-vault.XXXXXX")"
+  trap '[[ -z "$VAULT_PASSWORD_FILE" ]] || rm -f "$VAULT_PASSWORD_FILE"' EXIT
+  read -r -s -p "Ansible Vault password: " vault_password
+  echo
+  printf '%s\n' "$vault_password" > "$VAULT_PASSWORD_FILE"
+  unset vault_password
+  VAULT_ARGUMENTS=(--vault-password-file "$VAULT_PASSWORD_FILE")
+fi
+
 if [[ "$START_STOPPED" -eq 1 ]]; then
   START_COMMAND="${VIDEO_MASK_WORKER_START_COMMAND:-/opt/dataai-ec2/bin/start_ec2.sh}"
   if [[ ! -f "$START_COMMAND" ]]; then
@@ -56,11 +69,11 @@ if [[ "$START_STOPPED" -eq 1 ]]; then
     exit 2
   fi
   for host in "${HOSTS[@]}"; do
-    if ansible -i ansible/inventory.yml "$host" -m ansible.builtin.ping -o >/dev/null 2>&1; then
+    if ansible -i ansible/inventory.yml "${VAULT_ARGUMENTS[@]}" "$host" -m ansible.builtin.ping -o >/dev/null 2>&1; then
       echo "$host is already reachable; skipping EC2 start."
       continue
     fi
-    host_ip="$(ansible-inventory -i ansible/inventory.yml --host "$host" | python3 -c '
+    host_ip="$(ansible-inventory -i ansible/inventory.yml "${VAULT_ARGUMENTS[@]}" --host "$host" | python3 -c '
 import ipaddress
 import json
 import sys
@@ -75,12 +88,12 @@ except ValueError:
     echo "$host is unreachable; starting EC2 instance for $host_ip."
     sudo -n "$START_COMMAND" --ips "$host_ip"
     echo "Waiting for $host SSH connection..."
-    ansible -i ansible/inventory.yml "$host" -m ansible.builtin.wait_for_connection \
+    ansible -i ansible/inventory.yml "${VAULT_ARGUMENTS[@]}" "$host" -m ansible.builtin.wait_for_connection \
       -a 'timeout=900 connect_timeout=10 sleep=5'
   done
 fi
 
 COMMAND=(ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit "$LIMIT")
 [[ "$RESTART_SLOT" -eq 1 ]] && COMMAND+=(--extra-vars video_mask_restart_worker=true)
-[[ "$ASK_VAULT" -eq 1 ]] && COMMAND+=(--ask-vault-pass)
+COMMAND+=("${VAULT_ARGUMENTS[@]}")
 "${COMMAND[@]}"
