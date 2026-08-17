@@ -49,15 +49,12 @@ if (s3IngestControl) {
       const nextEnabled = !enabled;
       const action = nextEnabled ? 'resume' : 'pause';
       if (!window.confirm(`Do you want to ${action} automatic S3 task ingestion?`)) return;
-      const token = window.prompt('Enter the Controller admin token to continue:');
-      if (!token) return;
       toggle.disabled = true;
       message.textContent = '';
       try {
         const response = await fetch('/api/admin/s3-ingest', {
           method: 'PUT',
           headers: {
-            Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({enabled: nextEnabled}),

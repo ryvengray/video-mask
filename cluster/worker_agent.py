@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
+DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
                 "--face-conf", "0.35", "--face-int", "5", "--frame-skip", "2",
                 "--face-model", "yolov8"]
 DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"

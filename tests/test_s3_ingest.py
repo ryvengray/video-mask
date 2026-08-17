@@ -167,3 +167,31 @@ def test_controller_scans_s3_in_background_without_http_requests(tmp_path: Path)
     ingestor = asyncio.run(run())
     assert ingestor.validated
     assert ingestor.scans >= 1
+
+
+def test_controller_manual_s3_scan_runs_while_scheduled_ingestion_is_paused(tmp_path: Path):
+    try:
+        from cluster.controller import create_app
+    except TypeError as exc:
+        if "eval_type_backport" in str(exc):
+            pytest.skip("Controller's Pydantic v2 annotations require Python 3.10+ in this environment")
+        raise
+
+    class ManualIngestor:
+        def __init__(self):
+            self.scans = 0
+
+        def scan(self):
+            self.scans += 1
+            return 3
+
+    database = tmp_path / "controller.sqlite3"
+    store = ClusterStore(database)
+    store.set_boolean_setting("s3_ingest_enabled", False)
+    store.close()
+    ingestor = ManualIngestor()
+    app = create_app(database, "a" * 16, s3_ingestor=ingestor)  # type: ignore[arg-type]
+    route = next(route for route in app.routes if route.path == "/api/admin/s3-ingest/scan")
+
+    assert route.endpoint() == {"configured": True, "enabled": False, "created": 3}
+    assert ingestor.scans == 1

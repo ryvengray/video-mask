@@ -291,6 +291,14 @@ vault_video_mask_nginx_basic_auth_password: REPLACE_WITH_A_RANDOM_16_PLUS_CHARAC
 3. 输出写入 `s3://OUTPUT_BUCKET/outputs/`，保存名为 `masked_<原文件名>.mp4`，并保留输入子目录结构。
 4. 查看状态使用 SSH 隧道后的 `http://127.0.0.1:8080/`：任务页每页展示 50 条，可翻页查看持续累积的历史任务；完成任务会显示输入/输出文件、大小、输出时长、处理耗时、算法和参数。也可通过 Bearer Token 调用 `/api/tasks?limit=50&offset=0`、`/api/workers`。若 S3 上传首次失败（例如预签名 PUT URL 过期），Worker 会向 Controller 获取一个新的上传 URL 并重试一次，不重新下载或处理视频。
 
+若在 Controller 页面暂停了自动 S3 ingestion，但需要临时扫描一次源桶，可在 Controller 本机执行；该请求不会重新开启自动扫描，也不需要 Admin Token：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/admin/s3-ingest/scan
+```
+
+响应中的 `created` 表示本次新建任务数量；`enabled` 表示自动扫描当前状态。
+
 结果文件大于 5 GiB 时，Worker 会自动使用 S3 Multipart Upload：按 64 MiB 分片上传，Controller 仅签发分片 URL 并完成合并。输出桶权限须包含 `s3:AbortMultipartUpload`，以便 Worker 失败或取消时清理未完成分片。
 
 常用命令：

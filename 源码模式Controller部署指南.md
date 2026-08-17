@@ -368,6 +368,20 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 返回中的 `s3_ingested` 是本次新创建任务数。结果对象会上传至 `s3://processed-video-685538570851-us-east-2-an/outputs/`，保留源视频的子目录，并加上 `masked_` 前缀。数据库已记录的同一对象版本、或结果桶已存在的输出，会自动跳过。
 
+### 手动执行一次 S3 扫描
+
+即使在 Controller 页面暂停了自动 S3 ingestion，也可用以下接口只扫描一次；它不会重新开启后台自动扫描，也不需要 Admin Token：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/admin/s3-ingest/scan
+```
+
+返回中的 `created` 是本次新创建的任务数，`enabled` 表示自动扫描是否仍开启：
+
+```json
+{"configured": true, "enabled": false, "created": 3}
+```
+
 预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。结果小于等于 5 GiB 使用单次 S3 `PutObject`；更大的结果会自动使用 Multipart Upload，按 64 MiB 分片上传。Controller 为每一片签发短期 URL 并完成合并，Worker 不持有 AWS 凭证；失败或取消时会 Abort 未完成上传。
 
 若修复 IAM 权限、网络或算法配置后需要重新执行一个已失败的任务，使用管理员 Token 将其重新放回队列（重置该任务的重试次数）：

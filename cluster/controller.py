@@ -119,7 +119,7 @@ class TaskRequest(BaseModel):
     source_duration_seconds: float | None = None
     algorithm: str = "video_mask_batch_fish_v1.py"
     arguments: list[str] = Field(default_factory=lambda: [
-        "--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
+        "--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
         "--face-conf", "0.35", "--face-int", "5", "--frame-skip", "2",
         "--face-model", "yolov8",
     ])
@@ -409,15 +409,14 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return store.retire_worker(worker_id)
 
     @app.get("/api/admin/s3-ingest")
-    def get_s3_ingest_switch(authorization: str | None = Header(default=None)) -> dict[str, bool]:
-        require_admin(authorization)
+    def get_s3_ingest_switch() -> dict[str, bool]:
+        # Dashboard access is protected by the same outer proxy authentication
+        # as the UI control, so this browser-facing switch has no token prompt.
         return {"configured": bool(s3_ingestor), "enabled": s3_ingest_is_enabled()}
 
     @app.put("/api/admin/s3-ingest")
-    def set_s3_ingest_switch(request: S3IngestSwitchRequest,
-                             authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    def set_s3_ingest_switch(request: S3IngestSwitchRequest) -> dict[str, bool]:
         nonlocal s3_ingest_enabled
-        require_admin(authorization)
         if not s3_ingestor:
             raise HTTPException(status_code=409, detail="S3 ingestion is not configured on this Controller")
         if request.enabled and not s3_ingest_enabled:
@@ -427,6 +426,15 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         s3_ingest_enabled = store.set_boolean_setting("s3_ingest_enabled", request.enabled)
         logger.warning("S3 ingestion %s by administrator", "enabled" if s3_ingest_enabled else "disabled")
         return {"configured": True, "enabled": s3_ingest_enabled}
+
+    @app.post("/api/admin/s3-ingest/scan")
+    def scan_s3_ingest_once() -> dict[str, bool | int]:
+        """Run one S3 discovery pass even while scheduled ingestion is paused."""
+        if not s3_ingestor:
+            raise HTTPException(status_code=409, detail="S3 ingestion is not configured on this Controller")
+        created = s3_ingestor.scan()
+        logger.warning("S3 ingestion manual scan created %d task(s)", created)
+        return {"configured": True, "enabled": s3_ingest_is_enabled(), "created": created}
 
     @app.get("/api/tasks")
     def list_tasks(limit: int = 100, offset: int = 0, status: str | None = None,
