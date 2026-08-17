@@ -114,17 +114,44 @@ FISHEYE_PRESETS = {
 }
 
 
-def fisheye_undistort(img, strength=1.0, device="generic", downscale=2):
+def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="auto"):
     """对单帧做鱼眼去畸变, 返回矫正后的图像。
 
     支持设备预置(device="pico4" 等)或通用模式手动 strength 调节。
     映射表按 (分辨率, 参数) 缓存, 同一视频只算一次。
+
+    dual: 双鱼眼模式。
+        "auto"=按宽高比自动检测(w>=2h 视为双鱼眼拼接, 适用于 Pico4 双目录像);
+        "true"=强制切分; "false"=强制单鱼眼(兼容旧版)。
+        双鱼眼会切左右两半各自独立矫正, 避免单鱼眼模型把光心设在中央黑缝导致的
+        错误畸变(Pico4 3840x1456 是两个 1920x1456 鱼眼左右拼接, 必须启用此模式)。
 
     downscale: 降采样倍数(>=1)。>1 时在 1/downscale 分辨率上做 remap 再上采样,
         remap 面积减 downscale² 倍, 大幅提速(1920x1456 downscale=2 约 -75% 耗时)。
         画质损失可忽略(双线性插值两次, 人脸打码场景无感知)。设 1 关闭。
     """
     h, w = img.shape[:2]
+
+    # 双鱼眼模式判定: 显式指定或按宽高比自动检测
+    if dual == "auto":
+        # 宽>=2倍高 视为双鱼眼拼接(典型 Pico4 双目 3840x1456 = 2.64:1)
+        is_dual = (w >= 2 * h)
+    else:
+        is_dual = (dual == "true" or dual is True)
+
+    if is_dual and w >= 2:
+        # 双鱼眼拼接(如 Pico4 3840x1456 = 两个 1920x1456 左右并排):
+        # 切左右两半各自独立矫正, 否则单鱼眼模型把光心设在 (w/2, h/2) 正好落在
+        # 中央黑缝, 黑缝被当作"鱼眼中心"展开 → 中间一大块拉成黑填充;
+        # 左右两个真实鱼眼被当作"远离光心的边缘区域"反向错误畸变 → 检测率暴跌。
+        # 切分后每个半边用自身维度算 fx = max(1920,1456)*0.44 = 845(正确),
+        # 而非错误的 max(3840,1456)*0.44 = 1690(2x 偏大)。
+        mid = w // 2
+        left = fisheye_undistort(img[:, :mid], strength, device, downscale, dual="false")
+        right = fisheye_undistort(img[:, mid:], strength, device, downscale, dual="false")
+        return np.concatenate([left, right], axis=1)
+
+    # === 以下为单鱼眼处理逻辑 ===
 
     # 获取设备参数
     preset = FISHEYE_PRESETS.get(device, FISHEYE_PRESETS["generic"])
@@ -666,7 +693,7 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
 def _process_pipe(src, dst, face_on, model_dir, face_size,
                   face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                   frame_skip, fisheye, fisheye_strength, fisheye_device,
-                  fisheye_downscale, log):
+                  fisheye_downscale, fisheye_dual, log):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -847,7 +874,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             # 鱼眼去畸变: 矫正后再检测人脸, 大幅提升识别率
             if fisheye:
                 img = fisheye_undistort(img, fisheye_strength, fisheye_device,
-                                        downscale=fisheye_downscale)
+                                        downscale=fisheye_downscale,
+                                        dual=fisheye_dual)
 
             faces = []
             if face_on:
@@ -934,7 +962,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 def _process_files(src, dst, face_on, model_dir, face_size,
                    face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                    frame_skip, fisheye, fisheye_strength, fisheye_device,
-                   fisheye_downscale, log):
+                   fisheye_downscale, fisheye_dual, log):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -977,7 +1005,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         # 鱼眼去畸变
         if fisheye:
             img = fisheye_undistort(img, fisheye_strength, fisheye_device,
-                                    downscale=fisheye_downscale)
+                                    downscale=fisheye_downscale,
+                                    dual=fisheye_dual)
         faces = []
         if face_on:
             faces = face_proc.process(img, i)
@@ -1025,7 +1054,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   use_pipe=True, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
-                  fisheye_downscale=1, log=print):
+                  fisheye_downscale=1, fisheye_dual="auto", log=print):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1033,14 +1062,16 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  face_int, face_conf, face_model,
                                  keep_tmp, force_h264, use_gpu,
                                  frame_skip, fisheye, fisheye_strength,
-                                 fisheye_device, fisheye_downscale, log)
+                                 fisheye_device, fisheye_downscale,
+                                 fisheye_dual, log)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
                           face_int, face_conf, face_model,
                           keep_tmp, force_h264, use_gpu,
                           frame_skip, fisheye, fisheye_strength,
-                          fisheye_device, fisheye_downscale, log)
+                          fisheye_device, fisheye_downscale,
+                          fisheye_dual, log)
 
 
 def expand_inputs(inputs):
@@ -1074,6 +1105,12 @@ def main():
                     help="鱼眼设备预置: generic(通用强鱼眼,默认) / pico4(Pico 4 RGB摄像头, 130°FOV)")
     ap.add_argument("--fisheye-downscale", type=int, default=1, metavar="N",
                     help="鱼眼remap降采样倍数(默认1=关闭; 2=在1/2分辨率remap再上采样提速但会降低人脸检出率,不推荐)")
+    ap.add_argument("--fisheye-dual", default="auto",
+                    choices=["auto", "true", "false"],
+                    help="双鱼眼拼接模式(默认auto=按宽高比自动检测,w>=2h视为双鱼眼); "
+                         "true=强制切左右两半各自矫正; false=强制单鱼眼(兼容旧版). "
+                         "Pico4双目录像(3840x1456=两个1920x1456左右拼接)必须启用(auto或true), "
+                         "否则光心落在中央黑缝导致错误畸变,人脸检测率暴跌")
     ap.add_argument("--face-conf", type=float, default=FACE_CONF,
                     help=f"人脸置信度阈值(默认{FACE_CONF}; 降底如0.25可检出更多侧脸/遮挡, 可能增误检)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
@@ -1109,7 +1146,8 @@ def main():
                          frame_skip=args.frame_skip,
                          fisheye=args.fisheye, fisheye_strength=args.fisheye_strength,
                          fisheye_device=args.fisheye_device,
-                         fisheye_downscale=args.fisheye_downscale):
+                         fisheye_downscale=args.fisheye_downscale,
+                         fisheye_dual=args.fisheye_dual):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
