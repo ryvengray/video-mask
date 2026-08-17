@@ -82,14 +82,20 @@ document.querySelector('.task-table')?.addEventListener('click', async (event) =
   if (!taskId) return;
   const token = window.prompt('Enter the Controller admin token to play the file:');
   if (!token) return;
+  const newTab = window.open('', '_blank', 'noopener,noreferrer');
   try {
     const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
-    window.open(payload.url, '_blank', 'noopener,noreferrer');
+    if (newTab) {
+      newTab.location.href = payload.url;
+    } else {
+      window.open(payload.url, '_blank', 'noopener,noreferrer');
+    }
   } catch (error) {
+    newTab?.close();
     window.alert(error instanceof Error ? error.message : 'Unable to get playback URL.');
   }
 });
