@@ -55,6 +55,37 @@ def test_task_without_upload_url_is_valid_for_worker_local_output(tmp_path: Path
     store.close()
 
 
+def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store = new_store(tmp_path)
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr("cluster.store.now", lambda: clock[0])
+    first = store.create_task(task_payload())
+    second_payload = task_payload()
+    second_payload["source_url"] = "https://storage.example/second.mov"
+    second_payload["source_object_key"] = "source/inbox/second.mov"
+    second = store.create_task(second_payload)
+    store.conn.execute("UPDATE tasks SET status='completed', finished_at=?", (clock[0],))
+    store.conn.commit()
+
+    claimed_first = store.claim_next_face_review("browser-a-unique-id", 300)
+    claimed_second = store.claim_next_face_review("browser-b-unique-id", 300)
+    assert {claimed_first["task_id"], claimed_second["task_id"]} == {first["task_id"], second["task_id"]}
+    assert store.claim_next_face_review("browser-c-unique-id", 300) is None
+
+    labelled = store.annotate_face(claimed_first["task_id"], "browser-a-unique-id", True)
+    assert labelled["face_annotation"] == 1
+    status = store.face_review_status((claimed_first["task_id"], claimed_second["task_id"]))["reviews"]
+    by_task_id = {review["task_id"]: review for review in status}
+    assert by_task_id[claimed_first["task_id"]]["reviewable"] is True
+    assert by_task_id[claimed_first["task_id"]]["has_face"] is True
+    assert by_task_id[claimed_second["task_id"]]["reviewing"] is True
+
+    clock[0] += 301
+    reclaimed = store.claim_next_face_review("browser-c-unique-id", 300)
+    assert reclaimed and reclaimed["task_id"] == claimed_second["task_id"]
+    store.close()
+
+
 def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     store = ClusterStore(database)

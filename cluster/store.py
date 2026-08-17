@@ -77,12 +77,18 @@ class ClusterStore:
             started_at REAL,
             restarted_at REAL,
             finished_at REAL,
+            face_annotation INTEGER,
+            face_annotated_at REAL,
+            face_review_owner TEXT,
+            face_review_lease_until REAL,
             updated_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_tasks_worker ON tasks(assigned_worker_id, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_finished ON tasks(finished_at, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_started ON tasks(started_at);
+        CREATE INDEX IF NOT EXISTS idx_tasks_face_review
+          ON tasks(status, face_annotation, face_review_owner, finished_at);
         CREATE TABLE IF NOT EXISTS controller_settings (
             setting_key TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL,
@@ -92,6 +98,14 @@ class ClusterStore:
         task_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(tasks)")}
         if "restarted_at" not in task_columns:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN restarted_at REAL")
+        for column, definition in (
+            ("face_annotation", "INTEGER"),
+            ("face_annotated_at", "REAL"),
+            ("face_review_owner", "TEXT"),
+            ("face_review_lease_until", "REAL"),
+        ):
+            if column not in task_columns:
+                self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
         self.conn.commit()
 
     @synchronized
@@ -291,7 +305,9 @@ class ClusterStore:
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
-              error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL, updated_at=?
+              error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
+              face_annotation=NULL, face_annotated_at=NULL, face_review_owner=NULL,
+              face_review_lease_until=NULL, updated_at=?
             WHERE task_id=?
         """, (stamp, stamp, task_id))
         self.conn.commit()
@@ -304,11 +320,117 @@ class ClusterStore:
         cursor = self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
-              error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL, updated_at=?
+              error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
+              face_annotation=NULL, face_annotated_at=NULL, face_review_owner=NULL,
+              face_review_lease_until=NULL, updated_at=?
             WHERE status='completed'
         """, (stamp, stamp))
         self.conn.commit()
         return {"restarted_tasks": cursor.rowcount, "restarted_at": stamp}
+
+    def _expire_face_review_leases(self, stamp: float) -> None:
+        self.conn.execute("""
+            UPDATE tasks SET face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
+            WHERE face_annotation IS NULL AND face_review_lease_until IS NOT NULL AND face_review_lease_until <= ?
+        """, (stamp, stamp))
+
+    @synchronized
+    def claim_next_face_review(self, reviewer_id: str, lease_seconds: int) -> dict[str, Any] | None:
+        """Atomically reserve one unlabelled completed source video for review."""
+        stamp = now()
+        lease_until = stamp + lease_seconds
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._expire_face_review_leases(stamp)
+            row = self.conn.execute("""
+                SELECT task_id FROM tasks
+                WHERE status='completed' AND face_annotation IS NULL AND source_object_key IS NOT NULL
+                  AND face_review_owner IS NULL
+                ORDER BY finished_at, created_at
+                LIMIT 1
+            """).fetchone()
+            if row is None:
+                self.conn.execute("COMMIT")
+                return None
+            task_id = str(row[0])
+            self.conn.execute("""
+                UPDATE tasks SET face_review_owner=?, face_review_lease_until=?, updated_at=?
+                WHERE task_id=?
+            """, (reviewer_id, lease_until, stamp, task_id))
+            self.conn.execute("COMMIT")
+            return self.task(task_id)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @synchronized
+    def renew_face_review(self, task_id: str, reviewer_id: str, lease_seconds: int) -> dict[str, Any]:
+        stamp = now()
+        self._expire_face_review_leases(stamp)
+        cursor = self.conn.execute("""
+            UPDATE tasks SET face_review_lease_until=?, updated_at=?
+            WHERE task_id=? AND face_annotation IS NULL AND face_review_owner=?
+        """, (stamp + lease_seconds, stamp, task_id, reviewer_id))
+        if cursor.rowcount != 1:
+            self.conn.commit()
+            raise ValueError("face-review lease is no longer held by this browser")
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def release_face_review(self, task_id: str, reviewer_id: str) -> bool:
+        stamp = now()
+        cursor = self.conn.execute("""
+            UPDATE tasks SET face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
+            WHERE task_id=? AND face_annotation IS NULL AND face_review_owner=?
+        """, (stamp, task_id, reviewer_id))
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    @synchronized
+    def annotate_face(self, task_id: str, reviewer_id: str, has_face: bool) -> dict[str, Any]:
+        stamp = now()
+        self._expire_face_review_leases(stamp)
+        cursor = self.conn.execute("""
+            UPDATE tasks SET face_annotation=?, face_annotated_at=?, face_review_owner=NULL,
+              face_review_lease_until=NULL, updated_at=?
+            WHERE task_id=? AND status='completed' AND face_annotation IS NULL AND face_review_owner=?
+        """, (1 if has_face else 0, stamp, stamp, task_id, reviewer_id))
+        if cursor.rowcount != 1:
+            self.conn.commit()
+            raise ValueError("face-review lease expired or this task was already labelled")
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def face_review_status(self, task_ids: tuple[str, ...] | None = None) -> dict[str, Any]:
+        stamp = now()
+        self._expire_face_review_leases(stamp)
+        if task_ids:
+            placeholders = ", ".join("?" for _ in task_ids)
+            rows = self.conn.execute(f"""
+                SELECT task_id, status, source_object_key, face_annotation, face_review_owner,
+                  face_review_lease_until FROM tasks
+                WHERE task_id IN ({placeholders})
+            """, task_ids).fetchall()
+        else:
+            rows = self.conn.execute("""
+                SELECT task_id, status, source_object_key, face_annotation, face_review_owner,
+                  face_review_lease_until FROM tasks
+                WHERE face_annotation IS NULL AND face_review_owner IS NOT NULL
+                ORDER BY face_review_lease_until
+            """).fetchall()
+        self.conn.commit()
+        return {"reviews": [
+            {
+                "task_id": str(row[0]),
+                "reviewable": row[1] == "completed" and bool(row[2]),
+                "has_face": None if row[3] is None else bool(row[3]),
+                "reviewing": bool(row[4] and float(row[5] or 0) > stamp),
+                "lease_until": float(row[5] or 0),
+            }
+            for row in rows
+        ]}
 
     @synchronized
     def cancel_task(self, task_id: str) -> dict[str, Any]:

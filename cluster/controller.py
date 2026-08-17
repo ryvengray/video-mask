@@ -44,6 +44,7 @@ TASK_FILTER_STATUSES = (
     "pending", "assigned", "downloading", "processing", "uploading",
     "cancelling", "completed", "failed", "cancelled",
 )
+FACE_REVIEW_LEASE_SECONDS = 300
 
 
 def statistics_window(start_value: str | None, end_value: str | None) -> tuple[float, float]:
@@ -137,6 +138,14 @@ class WorkerProvisionRequest(BaseModel):
 
 class S3IngestSwitchRequest(BaseModel):
     enabled: bool
+
+
+class FaceReviewRequest(BaseModel):
+    reviewer_id: str = Field(min_length=16, max_length=128)
+
+
+class FaceAnnotationRequest(FaceReviewRequest):
+    has_face: bool
 
 
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
@@ -443,6 +452,46 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/face-reviews/claim")
+    def claim_face_review(request: FaceReviewRequest) -> dict[str, Any]:
+        # The dashboard's outer access control identifies authorized reviewers;
+        # reviewer_id is a browser-session lease owner, not an account identity.
+        task = store.claim_next_face_review(request.reviewer_id, FACE_REVIEW_LEASE_SECONDS)
+        if task is None:
+            return {"task": None, "lease_seconds": FACE_REVIEW_LEASE_SECONDS}
+        task_id = str(task["task_id"])
+        playback_file = "output" if task.get("output_object_key") else "input"
+        return {
+            "task": task,
+            "lease_seconds": FACE_REVIEW_LEASE_SECONDS,
+            "playback_url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/play?file={playback_file}",
+            "playback_file": playback_file,
+        }
+
+    @app.post("/api/face-reviews/{task_id}/heartbeat")
+    def renew_face_review(task_id: str, request: FaceReviewRequest) -> dict[str, Any]:
+        try:
+            task = store.renew_face_review(task_id, request.reviewer_id, FACE_REVIEW_LEASE_SECONDS)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"task": task, "lease_seconds": FACE_REVIEW_LEASE_SECONDS}
+
+    @app.post("/api/face-reviews/{task_id}/release")
+    def release_face_review(task_id: str, request: FaceReviewRequest) -> dict[str, bool]:
+        return {"released": store.release_face_review(task_id, request.reviewer_id)}
+
+    @app.put("/api/face-reviews/{task_id}/annotation")
+    def annotate_face_review(task_id: str, request: FaceAnnotationRequest) -> dict[str, Any]:
+        try:
+            return store.annotate_face(task_id, request.reviewer_id, request.has_face)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/face-reviews/status")
+    def get_face_review_status(task_ids: str = "") -> dict[str, Any]:
+        selected = tuple(value for value in task_ids.split(",") if value)[:100]
+        return store.face_review_status(selected or None)
+
     @app.delete("/api/tasks")
     def purge_tasks(confirm: str = "", authorization: str | None = Header(default=None)) -> dict[str, int]:
         """Delete every task record after an explicit destructive-action confirmation."""
@@ -574,6 +623,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 worker_name, worker_slot = worker_id or "-", ""
             processing = progress.get("processing_seconds", progress.get("elapsed_seconds"))
             started, restarted, finished = task.get("started_at"), task.get("restarted_at"), task.get("finished_at")
+            face_annotation = task.get("face_annotation")
+            review_active = (face_annotation is None and task.get("face_review_owner")
+                             and float(task.get("face_review_lease_until") or 0) > time.time())
+            manual_label = ("👍 Face" if face_annotation == 1 else "👎 No face"
+                            if face_annotation == 0 else "👀 Reviewing" if review_active else "Unlabelled")
             if isinstance(processing, (int, float)):
                 process_label = f"Process: {seconds(processing)}"
             elif task.get("status") in {"processing", "uploading", "cancelling"}:
@@ -600,6 +654,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                     else progress.get("processing_started_at", started)
                 ),
                 "execution_finished_at": last_seen(finished),
+                "manual_label": manual_label,
+                "manual_label_state": "labelled" if face_annotation is not None else "reviewing" if review_active else "unlabelled",
                 "error_message": str(task.get("error_message") or "-"),
             }
 

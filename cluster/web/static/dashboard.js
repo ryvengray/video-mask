@@ -79,9 +79,11 @@ const playKindBadge = document.getElementById('play-modal-kind');
 const playFileName = document.getElementById('play-modal-name');
 const playOpenLink = document.getElementById('play-modal-open');
 let autoRefreshTimer;
+let activeFaceReview = null;
 
 function scheduleAutoRefresh() {
   window.clearTimeout(autoRefreshTimer);
+  if (activeFaceReview) return;
   autoRefreshTimer = window.setTimeout(() => window.location.reload(), 60_000);
 }
 
@@ -117,6 +119,216 @@ document.addEventListener('keydown', event => {
 });
 scheduleAutoRefresh();
 const taskTable = document.querySelector('.task-table');
+
+const faceReviewControl = document.getElementById('face-review-control');
+if (faceReviewControl) {
+  const reviewerStorageKey = 'video-mask-face-reviewer-id';
+  let reviewerId = sessionStorage.getItem(reviewerStorageKey);
+  if (!reviewerId) {
+    reviewerId = window.crypto?.randomUUID?.() ||
+      `face-review-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    sessionStorage.setItem(reviewerStorageKey, reviewerId);
+  }
+
+  const claimButton = document.getElementById('face-review-claim');
+  const activeBadge = document.getElementById('face-review-active');
+  const message = document.getElementById('face-review-message');
+  const player = document.getElementById('face-review-player');
+  const video = document.getElementById('face-review-video');
+  const faceButton = document.getElementById('face-review-face');
+  const noFaceButton = document.getElementById('face-review-no-face');
+  const releaseButton = document.getElementById('face-review-release');
+  let heartbeatTimer;
+
+  async function reviewRequest(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: {'Content-Type': 'application/json', ...(options.headers || {})},
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    return payload;
+  }
+
+  function setReviewMessage(value) {
+    message.textContent = value;
+  }
+
+  function setReviewControls(busy = false) {
+    claimButton.disabled = busy || Boolean(activeFaceReview);
+    faceButton.disabled = busy;
+    noFaceButton.disabled = busy;
+    releaseButton.disabled = busy;
+  }
+
+  function stopActiveReview({keepMessage = false} = {}) {
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = undefined;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    player.hidden = true;
+    activeFaceReview = null;
+    activeBadge.className = 'badge muted';
+    activeBadge.textContent = 'No active review';
+    setReviewControls();
+    if (!keepMessage) setReviewMessage('Video released. You can claim another unlabelled completed video.');
+    scheduleAutoRefresh();
+  }
+
+  async function heartbeatFaceReview() {
+    if (!activeFaceReview) return;
+    try {
+      await reviewRequest(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/heartbeat`, {
+        method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
+      });
+    } catch (error) {
+      stopActiveReview({keepMessage: true});
+      setReviewMessage(error instanceof Error ? `${error.message}. This video is available for another reviewer.` : 'Review lease ended.');
+      refreshFaceReviewStatuses();
+    }
+  }
+
+  async function claimFaceReview() {
+    setReviewControls(true);
+    setReviewMessage('Finding an unlabelled completed video…');
+    try {
+      const payload = await reviewRequest('/api/face-reviews/claim', {
+        method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
+      });
+      if (!payload.task) {
+        setReviewMessage('No unlabelled completed videos are available right now.');
+        setReviewControls();
+        return;
+      }
+      activeFaceReview = payload.task;
+      video.src = payload.playback_url;
+      player.hidden = false;
+      activeBadge.className = 'badge active';
+      activeBadge.textContent = 'Review in progress';
+      const filename = payload.playback_file === 'output'
+        ? (payload.task.output_object_key || 'output video')
+        : (payload.task.source_object_key || 'input video');
+      setReviewMessage(`Reserved for this browser. Playing ${payload.playback_file} video: ${filename}`);
+      setReviewControls();
+      pauseAutoRefresh();
+      heartbeatTimer = window.setInterval(heartbeatFaceReview, 30_000);
+      refreshFaceReviewStatuses();
+    } catch (error) {
+      setReviewMessage(error instanceof Error ? error.message : 'Unable to claim a video.');
+      setReviewControls();
+    }
+  }
+
+  async function annotateFaceReview(hasFace) {
+    if (!activeFaceReview) return;
+    setReviewControls(true);
+    try {
+      await reviewRequest(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/annotation`, {
+        method: 'PUT', body: JSON.stringify({reviewer_id: reviewerId, has_face: hasFace}),
+      });
+      stopActiveReview({keepMessage: true});
+      setReviewMessage(hasFace ? 'Saved: face detected.' : 'Saved: no face detected.');
+      refreshFaceReviewStatuses();
+    } catch (error) {
+      setReviewMessage(error instanceof Error ? error.message : 'Unable to save the label.');
+      setReviewControls();
+    }
+  }
+
+  async function releaseFaceReview() {
+    if (!activeFaceReview) return;
+    setReviewControls(true);
+    try {
+      await reviewRequest(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/release`, {
+        method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
+      });
+      stopActiveReview();
+      refreshFaceReviewStatuses();
+    } catch (error) {
+      setReviewMessage(error instanceof Error ? error.message : 'Unable to release this video.');
+      setReviewControls();
+    }
+  }
+
+  function ensureFaceAnnotationColumn() {
+    if (!taskTable) return [];
+    const table = taskTable.querySelector('table');
+    const header = table?.querySelector('thead tr');
+    if (!table || !header) return [];
+    if (!header.querySelector('.face-annotation-heading')) {
+      const cell = document.createElement('th');
+      cell.className = 'face-annotation-heading';
+      cell.textContent = 'Manual label';
+      header.insertBefore(cell, header.children[2] || null);
+    }
+    const rows = [...table.querySelectorAll('tbody tr')];
+    rows.forEach(row => {
+      const playButton = row.querySelector('.file-play[data-task-id]');
+      if (!playButton) {
+        row.querySelector('td')?.setAttribute('colspan', String(header.children.length));
+        return;
+      }
+      if (!row.querySelector('.face-annotation-cell')) {
+        const cell = document.createElement('td');
+        cell.className = 'face-annotation-cell';
+        cell.dataset.taskId = playButton.dataset.taskId;
+        cell.textContent = 'Loading…';
+        row.insertBefore(cell, row.children[2] || null);
+      }
+    });
+    return [...table.querySelectorAll('.face-annotation-cell')];
+  }
+
+  function renderFaceReviewStatuses(reviews) {
+    const byTaskId = new Map(reviews.map(review => [review.task_id, review]));
+    ensureFaceAnnotationColumn().forEach(cell => {
+      const review = byTaskId.get(cell.dataset.taskId);
+      cell.className = 'face-annotation-cell';
+      if (!review?.reviewable) {
+        cell.textContent = '–';
+      } else if (review.has_face === true) {
+        cell.textContent = '👍 Face';
+        cell.classList.add('labelled');
+      } else if (review.has_face === false) {
+        cell.textContent = '👎 No face';
+        cell.classList.add('labelled');
+      } else if (review.reviewing) {
+        cell.textContent = '👀 Reviewing';
+        cell.classList.add('reviewing');
+      } else {
+        cell.textContent = 'Unlabelled';
+      }
+    });
+  }
+
+  async function refreshFaceReviewStatuses() {
+    const cells = ensureFaceAnnotationColumn();
+    const taskIds = [...new Set(cells.map(cell => cell.dataset.taskId).filter(Boolean))];
+    if (!taskIds.length) return;
+    try {
+      const payload = await reviewRequest(`/api/face-reviews/status?task_ids=${encodeURIComponent(taskIds.join(','))}`);
+      renderFaceReviewStatuses(payload.reviews || []);
+    } catch (error) {
+      console.warn('[video-mask] unable to refresh face-review status', error);
+    }
+  }
+
+  claimButton.addEventListener('click', claimFaceReview);
+  faceButton.addEventListener('click', () => annotateFaceReview(true));
+  noFaceButton.addEventListener('click', () => annotateFaceReview(false));
+  releaseButton.addEventListener('click', releaseFaceReview);
+  window.addEventListener('pagehide', () => {
+    if (!activeFaceReview) return;
+    fetch(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/release`, {
+      method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reviewer_id: reviewerId}),
+    });
+  });
+  refreshFaceReviewStatuses();
+  window.setInterval(refreshFaceReviewStatuses, 10_000);
+}
+
 console.info('[video-mask] task-table found:', Boolean(taskTable),
   '| play buttons:', document.querySelectorAll('.file-play').length,
   '| modal:', Boolean(document.getElementById('play-link-modal')));
