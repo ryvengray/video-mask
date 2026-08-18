@@ -1,6 +1,6 @@
 # 源码模式 Controller 部署指南
 
-本文用于在客户的 Controller 机器上部署视频打码集群。Controller 从私有 `video-mask` 源码仓库运行；Controller 同时作为 Ansible 控制端，通过 SSH 将运行代码 rsync 到 Worker 并初始化、升级 Worker。Worker 不保存 Git 仓库或 GitHub Deploy Key。
+本文用于在客户的 Controller 机器上部署视频打码集群。Controller 从公开的 `video-mask` GitHub HTTPS 仓库运行；Controller 同时作为 Ansible 控制端，通过 SSH 将运行代码 rsync 到 Worker 并初始化、升级 Worker。Worker 不保存 Git 仓库或 GitHub 凭证。
 
 ## 1. 网络与机器要求
 
@@ -15,49 +15,17 @@ Controller 私网 IP 可通过下面命令查看：
 hostname -I
 ```
 
-## 2. 创建 Controller 源码只读 Deploy Key（一次性）
-
-这把 Key 只用于 Controller 读取私有源码仓库。它只授权 `ryvengray/video-mask`，不要勾选 GitHub 写权限；Worker 不接收这把私钥。
-
-在受信任机器生成：
-
-```bash
-ssh-keygen -t ed25519 \
-  -f ~/.ssh/video-mask-source \
-  -C "video-mask-cluster-source-readonly" \
-  -N ""
-
-cat ~/.ssh/video-mask-source.pub
-```
-
-在 GitHub 的 `ryvengray/video-mask` 仓库中进入 `Settings` → `Deploy keys` → `Add deploy key`，粘贴公钥，**不要**勾选 `Allow write access`。
-
-将私钥安全传到 Controller，保存为：
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-# 将私钥内容保存到 ~/.ssh/video-mask-source 后执行：
-chmod 600 ~/.ssh/video-mask-source
-
-ssh -i ~/.ssh/video-mask-source -o IdentitiesOnly=yes -T git@github.com
-```
-
-看到 GitHub 认证成功但不提供 shell 即为正常。
-
-## 3. 在 Controller 安装工具并 clone 源码
+## 2. 在 Controller 安装工具并 clone 源码
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ansible git
-
-GIT_SSH_COMMAND="ssh -i ~/.ssh/video-mask-source -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-  git clone git@github.com:ryvengray/video-mask.git ~/video-mask
+sudo apt-get install -y ansible git rsync
+git clone https://github.com/ryvengray/video-mask.git ~/video-mask
 
 cd ~/video-mask/ansible
 ```
 
-## 4. 配置 Ansible
+## 3. 配置 Ansible
 
 创建客户本机配置，这些文件已经被 `.gitignore` 忽略，不能提交：
 
@@ -71,11 +39,6 @@ ansible-vault create group_vars/all/vault.yml
 Vault 密码是本地加密密码，请保存到密码管理器。创建 Vault 后填写：
 
 ```yaml
-vault_video_mask_source_deploy_key: |
-  -----BEGIN OPENSSH PRIVATE KEY-----
-  粘贴 ~/.ssh/video-mask-source 的完整私钥内容
-  -----END OPENSSH PRIVATE KEY-----
-
 vault_video_mask_admin_token: 替换为至少32位随机Token
 vault_video_mask_worker_token: 替换为至少32位随机Token
 ```
@@ -103,11 +66,9 @@ gpu_workers:
 编辑 `group_vars/all/settings.yml`，至少替换 Controller 私网 IP：
 
 ```yaml
-video_mask_repo: git@github.com:ryvengray/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
-video_mask_source_deploy_key_path: /home/ubuntu/.ssh/video-mask-source
-video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
 
 video_mask_controller_url: http://Controller私网IP:8080
 video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
@@ -118,7 +79,7 @@ video_mask_local_source_dir: /home/ubuntu/cluster_test_sources
 video_mask_local_output_dir: /home/ubuntu/cluster_test_outputs
 ```
 
-## 5. 启动 Controller
+## 4. 启动 Controller
 
 先检查变量与本机连接：
 
@@ -445,9 +406,13 @@ ssh ubuntu@Worker私网IP 'sudo systemctl status "video-mask-worker@slot-*" --no
 
 命令缺少 `--ask-vault-pass`。所有 Ansible 命令均应带上该参数。
 
-### `Permission denied (publickey)`
+### `git clone` 或 `git pull` 失败
 
-检查 `~/.ssh/video-mask-source`、GitHub `video-mask` 仓库 Deploy Key 与 Vault 中的 `vault_video_mask_source_deploy_key` 是否为同一把私钥。
+确认 Controller 能访问 `https://github.com`，并检查仓库 remote：
+
+```bash
+git -C ~/video-mask remote set-url origin https://github.com/ryvengray/video-mask.git
+```
 
 ### `nvidia-smi` 不可用
 

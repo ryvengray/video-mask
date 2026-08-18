@@ -21,7 +21,7 @@ S3 outputs/      <──Worker 以预签名 URL 上传── Controller 记录�
 - Controller 可以是无 GPU 的 EC2；Worker 必须是带 NVIDIA GPU 的实例。Worker 初始化会在缺少 `nvidia-smi` 时安装 Ubuntu 推荐 NVIDIA 驱动，并在需要时自动重启一次后继续；非 GPU 实例仍会明确失败。
 - 建议 Controller 和 Worker 都在私有子网。Controller 需要出站访问 GitHub、Ubuntu 软件源、AWS S3；Worker 首次部署需要访问 Ubuntu 软件源、PyTorch/Hugging Face，运行时需访问 S3 预签名 URL，不需要访问 GitHub。
 - 准备 Terraform 生成的 SSH 私钥 `terraform-host.pem`。它只保存在 Controller（运行 Ansible 的机器）或你的受控运维主机，绝不提交到仓库。
-- 准备 GitHub 仓库的**只读 Deploy Key**。它与 `terraform-host.pem` 不同，只用于 Controller 拉取代码；Worker 由 Controller rsync 推送运行文件，不保存此私钥。
+- Controller 使用公开 GitHub HTTPS 地址拉取代码；Worker 由 Controller rsync 推送运行文件，不需要 GitHub 凭证。
 - 准备两个 S3 Bucket，或同一 Bucket 的两个不重叠前缀：输入 `source/inbox/`、输出 `outputs/`。
 
 ## 2. AWS 网络与 IAM
@@ -117,50 +117,28 @@ bash scripts/bootstrap_cluster_controller.sh \
 
 ## 4. 配置 Vault、S3 与 inventory
 
-创建 Ansible Vault；以下三个值都应只出现在 Vault 中。`vault_video_mask_source_deploy_key` 的值是专供 Ansible 拉取仓库的 **Git Deploy Key 私钥**，不是 Terraform 的 `terraform-host.pem`：
-
-```bash
-mkdir -p /home/ubuntu/.ssh
-chmod 700 /home/ubuntu/.ssh
-ssh-keygen -t ed25519 -N '' \
-  -C 'video-mask-ansible-deploy' \
-  -f /home/ubuntu/.ssh/video-mask-source-deploy
-chmod 600 /home/ubuntu/.ssh/video-mask-source-deploy
-```
-
-在 GitHub 仓库中打开 **Settings → Deploy keys → Add deploy key**，名称可填 `aws-video-mask-ansible`。将下列命令输出的**公钥**粘贴进去，保持只读，不要勾选 `Allow write access`：
-
-```bash
-cat /home/ubuntu/.ssh/video-mask-source-deploy.pub
-```
-
-然后创建 Vault：
+创建 Ansible Vault；以下两个 Token 都应只出现在 Vault 中：
 
 ```bash
 cd /home/ubuntu/video-mask/ansible
 ansible-vault create group_vars/all/vault.yml
 ```
 
-在编辑器中填写内容。将 `/home/ubuntu/.ssh/video-mask-source-deploy` 的**私钥全部内容**（包括首尾 `BEGIN`/`END` 行）粘贴到 `vault_video_mask_source_deploy_key: |` 下，并且每一行缩进两个空格：
+在编辑器中填写内容：
 
 ```yaml
 vault_video_mask_admin_token: REPLACE_WITH_A_RANDOM_32_BYTE_HEX_TOKEN
 vault_video_mask_worker_token: REPLACE_WITH_A_DIFFERENT_RANDOM_32_BYTE_HEX_TOKEN
-vault_video_mask_source_deploy_key: |
-  -----BEGIN OPENSSH PRIVATE KEY-----
-  REPLACE_WITH_THE_PRIVATE_KEY_CONTENT
-  -----END OPENSSH PRIVATE KEY-----
 ```
 
-生成 Token 可使用两次 `openssl rand -hex 32`。保存 Vault 密码到受控的密码管理器；不要将 Vault 密码、Git Deploy Key 私钥或 Terraform SSH 私钥填入 Git 仓库。Git Deploy Key 仅保留在 Controller；远程 Worker 部署时，Ansible 从 Controller 同步运行所需的文件，不会向 Worker 复制该私钥。
+生成 Token 可使用两次 `openssl rand -hex 32`。保存 Vault 密码到受控的密码管理器；不要将 Vault 密码或 Terraform SSH 私钥填入 Git 仓库。Controller 使用 GitHub HTTPS；远程 Worker 部署时，Ansible 从 Controller 同步运行所需的文件。
 
 编辑 `ansible/group_vars/all/settings.yml`，替换为实际 S3 配置：
 
 ```yaml
-video_mask_repo: git@github.com:ryvengray/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
-video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
 
 video_mask_controller_url: http://CONTROLLER_PRIVATE_IP:8080
 video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
@@ -250,7 +228,7 @@ ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit worker-01 \
   --ask-vault-pass
 ```
 
-Worker role 会从执行 Ansible 的 Controller rsync 运行代码、安装 CUDA 人脸流水线依赖、在缺少驱动时安装 Ubuntu 推荐 NVIDIA 驱动并自动重启一次、校验 CUDA/ONNX Runtime、向 Controller 预注册 Worker slot，并创建和启动 `video-mask-worker@slot-1.service`。首次升级到此版本时，会清理旧 Worker 上的 `.git` 目录和 Deploy Key。
+Worker role 会从执行 Ansible 的 Controller rsync 运行代码、安装 CUDA 人脸流水线依赖、在缺少驱动时安装 Ubuntu 推荐 NVIDIA 驱动并自动重启一次、校验 CUDA/ONNX Runtime、向 Controller 预注册 Worker slot，并创建和启动 `video-mask-worker@slot-1.service`。首次升级到此版本时，会清理旧 Worker 上的 `.git` 目录和 GitHub SSH 凭证。
 
 验证：
 
@@ -420,7 +398,7 @@ sudo systemd-run --wait --collect --pipe \
 - [ ] Controller 和所有 Worker 均为 Ubuntu，Controller API 仅对 Worker 安全组开放 TCP 8080。
 - [ ] `nvidia-smi`、`torch.cuda.is_available()`、ONNX Runtime CUDA Provider 均在每台 Worker 可用。
 - [ ] Controller EC2 IAM Role 能列举输入、读取输入、检查及写入输出；Worker 未配置长期 AWS 凭证。
-- [ ] Git Deploy Key、Ansible Vault 密码、`terraform-host.pem` 不在 Git 工作区或日志中。
+- [ ] Ansible Vault 密码、`terraform-host.pem` 不在 Git 工作区或日志中。
 - [ ] 以一个短视频验证 S3 下载、打码、S3 上传、哈希和时长记录全链路。
 - [ ] 再以多个视频和至少两台 Worker 验证并发领取；一台 Worker 停止后验证心跳超时重试。
 - [ ] autoscaler 先以 `--once --dry-run` 验证，再用一条 pending 任务验证仅启动一个 stopped Worker；最后以空闲阈值验证不会关闭 busy 或未注册的机器。

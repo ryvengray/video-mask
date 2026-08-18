@@ -10,7 +10,7 @@ Usage: bash scripts/deploy_worker.sh WORKER_HOST [WORKER_HOST ...] [--start-stop
 
 Deploys one or more hosts defined in ansible/inventory.yml. Runtime source is
 rsynced from this Controller/Ansible machine; Workers do not clone the Git
-repository or retain its Deploy Key. With --restart-slot, restarts every
+repository or retain GitHub credentials. With --restart-slot, restarts every
 configured Worker slot on each selected host after the source has updated.
 With --start-stopped, starts unreachable EC2 Workers through the Controller-
 local start script, waits for SSH, then deploys. A missing NVIDIA driver can

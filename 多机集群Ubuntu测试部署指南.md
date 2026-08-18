@@ -131,30 +131,11 @@ gpu_workers:
 
 ## 4. 配置本地测试参数和 Token
 
-`terraform-host.pem` 仅用于 Ansible SSH 登录。Worker 不再拉取私有仓库：运行代码由执行 Ansible 的 Controller 通过 rsync 推送，因此 Worker 不需要 GitHub Deploy Key。若需要让 Controller 自己从私有仓库更新代码，才为 Controller 保存只读 Deploy Key，并可用 Ansible Vault 管理其私钥：
+`terraform-host.pem` 仅用于 Ansible SSH 登录。Worker 不拉取 Git 仓库：运行代码由执行 Ansible 的 Controller 通过 rsync 推送，因此 Worker 不需要 GitHub 凭证。Controller 使用公开 GitHub HTTPS 地址更新代码。
 
 ```bash
-cd /home/ubuntu/video-mask/ansible
-ansible-vault create group_vars/all/vault.yml
+git -C /home/ubuntu/video-mask remote set-url origin https://github.com/ryvengray/video-mask.git
 ```
-
-在 Vault 文件中填写（保留 Deploy Key 的完整多行内容）：
-
-```yaml
-vault_video_mask_source_deploy_key: |
-  -----BEGIN OPENSSH PRIVATE KEY-----
-  REPLACE_WITH_READ_ONLY_REPOSITORY_DEPLOY_KEY
-  -----END OPENSSH PRIVATE KEY-----
-```
-
-下面的 `settings.yml` 保持对该 Vault 变量的引用，并将仓库地址设为 SSH 地址：
-
-```yaml
-video_mask_repo: git@github.com:ryvengray/video-mask.git
-video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
-```
-
-创建 Vault 后，所有 Ansible 命令均需提供 Vault 密码；下文命令以 `--ask-vault-pass` 为例。
 
 先生成两个随机 Token：
 
@@ -172,10 +153,9 @@ nano group_vars/all/settings.yml
 保留 `video_mask_repo` 等已有配置，并至少设置以下内容；把两处 Token 替换成刚刚生成的不同随机值：
 
 ```yaml
-video_mask_repo: git@github.com:ryvengray/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
-video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
 
 # Controller 与 Worker 同机，不需要域名或 HTTPS。
 video_mask_controller_url: http://127.0.0.1:8080

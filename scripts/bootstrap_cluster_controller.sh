@@ -45,9 +45,9 @@ Examples:
 The default local directories are for Controller-only testing.  S3 task
 ingestion is not configured by this script.
 
-This script uses the source checkout it creates above for the Controller, so
-it does not require a repository Deploy Key. A Deploy Key is still required
-later when Ansible deploys source code to remote Workers.
+This script uses the public GitHub HTTPS repository for the Controller source
+checkout. Remote Workers receive source through Ansible rsync and do not need
+GitHub credentials.
 EOF
 }
 
@@ -158,7 +158,7 @@ controller:
   hosts:
     controller-01:
       ansible_connection: local
-      # This node is already checked out above, so do not require a Git Deploy Key.
+      # This node is already checked out above, so do not check out source again.
       video_mask_manage_source: false
 
 gpu_workers:

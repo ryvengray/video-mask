@@ -63,9 +63,9 @@
     path: "{{ video_mask_app_dir }}/.git"
     state: absent
 
-- name: Remove legacy Git deploy key from Worker
+- name: Remove legacy GitHub SSH key from Worker
   ansible.builtin.file:
-    path: "{{ video_mask_source_deploy_key_path | default('/home/ubuntu/.ssh/video-mask-source') }}"
+    path: /home/ubuntu/.ssh/video-mask-source
     state: absent
 
 - name: Validate Worker slot count
