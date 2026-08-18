@@ -506,6 +506,67 @@ if (faceReviewControl) {
   window.setInterval(refreshFaceReviewStatuses, 10_000);
 }
 
+function ensureTaskActionsColumn() {
+  if (!taskTable) return;
+  const table = taskTable.querySelector('table');
+  const header = table?.querySelector('thead tr');
+  if (!table || !header) return;
+  if (!header.querySelector('.task-actions-heading')) {
+    const cell = document.createElement('th');
+    cell.className = 'task-actions-heading';
+    cell.textContent = 'Actions';
+    header.append(cell);
+  }
+  table.querySelectorAll('tbody tr').forEach(row => {
+    if (row.querySelector('.task-actions-cell')) return;
+    const playButton = row.querySelector('.file-play[data-task-id]');
+    if (!playButton) {
+      row.querySelector('td')?.setAttribute('colspan', String(header.children.length));
+      return;
+    }
+    const status = row.querySelector('.badge')?.textContent?.trim();
+    const cell = document.createElement('td');
+    cell.className = 'task-actions-cell';
+    if (status === 'completed' || ['assigned', 'downloading', 'processing', 'uploading'].includes(status)) {
+      const action = status === 'completed' ? 'restart' : 'cancel';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'play-btn';
+      button.dataset.taskAction = action;
+      button.dataset.taskId = playButton.dataset.taskId;
+      button.textContent = action === 'restart' ? 'Restart' : 'Cancel';
+      cell.append(button);
+    } else {
+      cell.textContent = '–';
+    }
+    row.append(cell);
+  });
+}
+
+ensureTaskActionsColumn();
+taskTable?.addEventListener('click', async event => {
+  const button = event.target.closest('[data-task-action]');
+  if (!button) return;
+  const {taskAction, taskId} = button.dataset;
+  const message = taskAction === 'restart'
+    ? 'Restart this completed task? Its existing output and face annotation will be cleared.'
+    : 'Cancel this active task? The Worker will stop it as soon as possible.';
+  if (!window.confirm(message)) return;
+  button.disabled = true;
+  try {
+    const response = await fetch(
+      `/api/dashboard/tasks/${encodeURIComponent(taskId)}/${encodeURIComponent(taskAction)}`,
+      {method: 'POST'},
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    window.location.reload();
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : 'Unable to update this task.');
+    button.disabled = false;
+  }
+});
+
 console.info('[video-mask] task-table found:', Boolean(taskTable),
   '| play buttons:', document.querySelectorAll('.file-play').length,
   '| modal:', Boolean(document.getElementById('play-link-modal')));

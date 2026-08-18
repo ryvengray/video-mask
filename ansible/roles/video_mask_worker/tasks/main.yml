@@ -5,6 +5,7 @@
       - python3
       - python3-venv
       - python3-pip
+      - logrotate
     state: present
     update_cache: true
 
@@ -66,6 +67,22 @@
     owner: ubuntu
     group: ubuntu
     mode: '0750'
+
+- name: Create Worker persistent log directory
+  ansible.builtin.file:
+    path: /var/log/video-mask-worker
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+
+- name: Install Worker log rotation policy
+  ansible.builtin.template:
+    src: video-mask-worker.logrotate.j2
+    dest: /etc/logrotate.d/video-mask-worker
+    owner: root
+    group: root
+    mode: '0644'
 
 - name: Install Worker slot environment files
   ansible.builtin.template:

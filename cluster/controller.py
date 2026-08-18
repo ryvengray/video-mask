@@ -620,6 +620,26 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/dashboard/tasks/{task_id}/restart")
+    def dashboard_restart_task(task_id: str) -> dict[str, Any]:
+        """Restart one completed task from the Nginx-protected dashboard."""
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if task.get("status") != "completed":
+            raise HTTPException(status_code=409, detail="only completed tasks can be restarted here")
+        return store.restart_task(task_id)
+
+    @app.post("/api/dashboard/tasks/{task_id}/cancel")
+    def dashboard_cancel_task(task_id: str) -> dict[str, Any]:
+        """Request cancellation of an active task from the Nginx-protected dashboard."""
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if task.get("status") not in {"assigned", "downloading", "processing", "uploading"}:
+            raise HTTPException(status_code=409, detail="only active tasks can be cancelled here")
+        return store.cancel_task(task_id)
+
     @app.post("/api/face-reviews/claim")
     def claim_face_review(request: FaceReviewRequest) -> dict[str, Any]:
         # The dashboard's outer access control identifies authorized reviewers;
