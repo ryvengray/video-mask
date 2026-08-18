@@ -155,8 +155,9 @@ class TaskRequest(BaseModel):
     algorithm: str = "video_mask_batch_fish_v1.py"
     arguments: list[str] = Field(default_factory=lambda: [
         "--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
-        "--face-conf", "0.35", "--face-int", "5", "--frame-skip", "2",
-        "--face-model", "yolov8",
+        "--face-int", "5", "--face-conf", "0.4", "--frame-skip", "1",
+        "--face-model", "yolov8+yolo11", "--dual-iou", "0.4",
+        "--fisheye-crop", "0.8",
     ])
     output_object_key: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=20)
