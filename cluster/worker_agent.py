@@ -102,6 +102,17 @@ class Worker:
     def report(self, task_id: str, status: str, **progress: Any) -> None:
         self.api(f"/api/tasks/{task_id}/progress", self.payload(status=status, progress=progress))
 
+    def report_logs(self, task_id: str, lines: list[str]) -> None:
+        """Mirror algorithm output to the Controller in small, non-fatal batches."""
+        if not lines:
+            return
+        try:
+            self.api(f"/api/tasks/{task_id}/logs", self.payload(lines=lines))
+        except Exception as exc:
+            # Never fail video processing merely because the dashboard log
+            # mirror is temporarily unavailable; the local service log remains.
+            print(f"[{task_id}] Controller log mirror failed: {exc}", file=sys.stderr, flush=True)
+
     def busy_heartbeat(self, stop: threading.Event, capabilities: dict[str, Any],
                        cancel_requested: threading.Event) -> None:
         """Keep long downloads/encodes leased to this Worker."""
@@ -294,13 +305,21 @@ class Worker:
             cancel_monitor = threading.Thread(target=stop_cancelled_process, daemon=True)
             cancel_monitor.start()
             tail: list[str] = []
+            log_batch: list[str] = []
+            last_log_upload = time.monotonic()
             assert process.stdout is not None
             for line in process.stdout:
                 line = line.rstrip()
                 if line:
                     print(f"[{task_id}] {line}", flush=True)
                     tail = (tail + [line])[-20:]
+                    log_batch.append(line)
+                    if len(log_batch) >= 20 or time.monotonic() - last_log_upload >= 5:
+                        self.report_logs(task_id, log_batch)
+                        log_batch = []
+                        last_log_upload = time.monotonic()
             exit_code = process.wait()
+            self.report_logs(task_id, log_batch)
             cancel_monitor_stop.set()
             cancel_monitor.join(timeout=1)
             if cancel_requested.is_set():

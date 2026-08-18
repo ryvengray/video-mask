@@ -79,6 +79,9 @@ const playKindBadge = document.getElementById('play-modal-kind');
 const playFileName = document.getElementById('play-modal-name');
 const playOpenLink = document.getElementById('play-modal-open');
 const playDownloadLink = document.getElementById('play-modal-download');
+const taskLogModal = document.getElementById('task-log-modal');
+const taskLogNote = document.getElementById('task-log-modal-note');
+const taskLogContent = document.getElementById('task-log-modal-content');
 let autoRefreshTimer;
 let activeFaceReview = null;
 let beginModalAnnotation = () => {};
@@ -119,10 +122,43 @@ function closePlayModal() {
   scheduleAutoRefresh();
 }
 
+async function openTaskLogModal(taskId) {
+  taskLogModal.hidden = false;
+  taskLogNote.textContent = 'Loading logs…';
+  taskLogContent.textContent = '';
+  pauseAutoRefresh();
+  try {
+    const response = await fetch(`/api/dashboard/tasks/${encodeURIComponent(taskId)}/logs?limit=1000`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    const logs = payload.logs || [];
+    taskLogNote.textContent = logs.length
+      ? `Showing the latest ${logs.length} Worker algorithm log lines.`
+      : 'No Worker algorithm logs are available for this task.';
+    taskLogContent.textContent = logs.map(log => {
+      const timestamp = new Date(Number(log.created_at || 0) * 1000).toLocaleString();
+      return `[${timestamp}] ${log.line}`;
+    }).join('\n');
+  } catch (error) {
+    taskLogNote.textContent = error instanceof Error ? error.message : 'Unable to load task logs.';
+  }
+}
+
+function closeTaskLogModal() {
+  if (!taskLogModal || taskLogModal.hidden) return;
+  taskLogModal.hidden = true;
+  scheduleAutoRefresh();
+}
+
 playModal?.querySelectorAll('[data-play-close]').forEach(element =>
   element.addEventListener('click', closePlayModal));
+taskLogModal?.querySelectorAll('[data-task-log-close]').forEach(element =>
+  element.addEventListener('click', closeTaskLogModal));
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape') closePlayModal();
+  if (event.key === 'Escape') {
+    closePlayModal();
+    closeTaskLogModal();
+  }
 });
 scheduleAutoRefresh();
 const taskTable = document.querySelector('.task-table');
@@ -536,9 +572,14 @@ function ensureTaskActionsColumn() {
       button.dataset.taskId = playButton.dataset.taskId;
       button.textContent = action === 'restart' ? 'Restart' : 'Cancel';
       cell.append(button);
-    } else {
-      cell.textContent = '–';
     }
+    const logsButton = document.createElement('button');
+    logsButton.type = 'button';
+    logsButton.className = 'play-btn';
+    logsButton.dataset.taskAction = 'logs';
+    logsButton.dataset.taskId = playButton.dataset.taskId;
+    logsButton.textContent = 'View logs';
+    cell.append(logsButton);
     row.append(cell);
   });
 }
@@ -548,8 +589,12 @@ taskTable?.addEventListener('click', async event => {
   const button = event.target.closest('[data-task-action]');
   if (!button) return;
   const {taskAction, taskId} = button.dataset;
+  if (taskAction === 'logs') {
+    openTaskLogModal(taskId);
+    return;
+  }
   const message = taskAction === 'restart'
-    ? 'Restart this completed task? Its existing output and face annotation will be cleared.'
+    ? 'Restart this completed task? Its existing output will be cleared; its face annotation will be kept.'
     : 'Cancel this active task? The Worker will stop it as soon as possible.';
   if (!window.confirm(message)) return;
   button.disabled = true;

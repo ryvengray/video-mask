@@ -6,7 +6,7 @@
   <title>Video Mask · Operations</title>
   <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}?v=20260817e">
   <style>.face-review-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:10px}.face-review-tab{border:0;border-bottom:2px solid transparent;background:transparent;padding:7px 11px;color:var(--muted);font:500 13px Arial;cursor:pointer}.face-review-tab.active{color:var(--blue);border-bottom-color:var(--blue)}.face-review-frames{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}.face-review-frames figure{margin:0;border:1px solid var(--line);border-radius:5px;overflow:hidden;background:#f8f9fa}.face-review-frames img{display:block;width:100%;height:135px;object-fit:cover;background:#111}.face-review-frames figcaption{padding:4px 7px;color:var(--muted);font-size:11px}</style>
-  <style>.play-modal-annotation{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px}.play-modal-annotation[hidden]{display:none}.play-modal-annotation-status{margin-right:auto}</style>
+  <style>.play-modal-annotation{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px}.play-modal-annotation[hidden]{display:none}.play-modal-annotation-status{margin-right:auto}.task-log-modal-card{width:min(1100px,100%)}.task-log-modal-content{max-height:65vh;overflow:auto;margin:0 0 14px;padding:12px;background:#202124;color:#e8eaed;border-radius:6px;white-space:pre-wrap;word-break:break-word;font:12px/1.45 Consolas,monospace}</style>
 </head>
 <body>
   <header class="topbar">
@@ -73,7 +73,16 @@
       </div>
     </div>
   </div>
+  <div id="task-log-modal" class="play-modal" hidden>
+    <div class="play-modal-backdrop" data-task-log-close></div>
+    <div class="play-modal-card task-log-modal-card" role="dialog" aria-modal="true" aria-labelledby="task-log-modal-title">
+      <div class="play-modal-head"><h3 id="task-log-modal-title">Task execution logs</h3><button class="play-modal-close" type="button" data-task-log-close aria-label="Close">&times;</button></div>
+      <p id="task-log-modal-note" class="play-modal-note">Loading logs…</p>
+      <pre id="task-log-modal-content" class="task-log-modal-content"></pre>
+      <div class="play-modal-actions"><button class="play-btn" type="button" data-task-log-close>Close</button></div>
+    </div>
+  </div>
   <script id="processing-statistics" type="application/json">{{ processing_statistics | tojson }}</script>
-  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260818a"></script>
+  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260818b"></script>
 </body>
 </html>

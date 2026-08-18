@@ -117,6 +117,10 @@ class ProgressRequest(WorkerRequest):
     progress: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskLogsRequest(WorkerRequest):
+    lines: list[str] = Field(min_length=1, max_length=50)
+
+
 class FinishRequest(WorkerRequest):
     output_sha256: str | None = None
     output_duration_seconds: float | None = None
@@ -346,6 +350,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     @app.post("/api/tasks/{task_id}/progress")
     def progress(task_id: str, request: ProgressRequest):
         return store.progress(request.worker_id, request.token, task_id, request.status, request.progress)
+
+    @app.post("/api/tasks/{task_id}/logs")
+    def append_task_logs(task_id: str, request: TaskLogsRequest) -> dict[str, int]:
+        return {"appended": store.append_task_logs(request.worker_id, request.token, task_id, request.lines)}
 
     @app.post("/api/tasks/{task_id}/complete")
     def complete(task_id: str, request: FinishRequest):
@@ -639,6 +647,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if task.get("status") not in {"assigned", "downloading", "processing", "uploading"}:
             raise HTTPException(status_code=409, detail="only active tasks can be cancelled here")
         return store.cancel_task(task_id)
+
+    @app.get("/api/dashboard/tasks/{task_id}/logs")
+    def dashboard_task_logs(task_id: str, limit: int = 1000) -> dict[str, Any]:
+        if store.task(task_id) is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        return {"task_id": task_id, "logs": store.task_logs(task_id, limit)}
 
     @app.post("/api/face-reviews/claim")
     def claim_face_review(request: FaceReviewRequest) -> dict[str, Any]:

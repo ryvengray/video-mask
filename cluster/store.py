@@ -87,6 +87,15 @@ class ClusterStore:
         CREATE INDEX IF NOT EXISTS idx_tasks_worker ON tasks(assigned_worker_id, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_finished ON tasks(finished_at, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_started ON tasks(started_at);
+        CREATE TABLE IF NOT EXISTS task_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            line TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id, id);
         CREATE TABLE IF NOT EXISTS controller_settings (
             setting_key TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL,
@@ -288,6 +297,7 @@ class ClusterStore:
         if current["status"] != "failed":
             raise ValueError("only failed tasks can be retried")
         stamp = now()
+        self.conn.execute("DELETE FROM task_logs WHERE task_id=?", (task_id,))
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', error_message=NULL, started_at=NULL, restarted_at=NULL,
@@ -306,12 +316,12 @@ class ClusterStore:
         if current["status"] not in TERMINAL:
             raise ValueError("only completed, failed, or cancelled tasks can be restarted")
         stamp = now()
+        self.conn.execute("DELETE FROM task_logs WHERE task_id=?", (task_id,))
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
               error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
-              face_annotation=NULL, face_annotated_at=NULL, face_review_owner=NULL,
-              face_review_lease_until=NULL, updated_at=?
+              face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
             WHERE task_id=?
         """, (stamp, stamp, task_id))
         self.conn.commit()
@@ -321,12 +331,12 @@ class ClusterStore:
     def restart_completed_tasks(self) -> dict[str, Any]:
         """Queue every completed task again and retain the bulk restart time."""
         stamp = now()
+        self.conn.execute("DELETE FROM task_logs WHERE task_id IN (SELECT task_id FROM tasks WHERE status='completed')")
         cursor = self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
               error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
-              face_annotation=NULL, face_annotated_at=NULL, face_review_owner=NULL,
-              face_review_lease_until=NULL, updated_at=?
+              face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
             WHERE status='completed'
         """, (stamp, stamp))
         self.conn.commit()
@@ -834,6 +844,41 @@ class ClusterStore:
         self.conn.execute("UPDATE workers SET last_seen_at=?, updated_at=? WHERE worker_id=?", (stamp, stamp, worker_id))
         self.conn.commit()
         return self.task(task_id) or {}
+
+    @synchronized
+    def append_task_logs(self, worker_id: str, token: str, task_id: str,
+                         lines: list[str]) -> int:
+        """Persist a bounded batch of Worker algorithm output for the dashboard."""
+        self.authenticate_worker(worker_id, token)
+        task = self.task(task_id)
+        if task is None or task.get("assigned_worker_id") != worker_id or task.get("status") not in ACTIVE:
+            raise ValueError("task is not actively assigned to this worker")
+        normalized = [str(line).rstrip()[:2000] for line in lines if str(line).strip()]
+        if not normalized:
+            return 0
+        stamp = now()
+        self.conn.executemany("""
+            INSERT INTO task_logs(task_id, worker_id, attempt_count, created_at, line)
+            VALUES(?, ?, ?, ?, ?)
+        """, [(task_id, worker_id, int(task.get("attempt_count") or 0), stamp, line)
+              for line in normalized[:50]])
+        # Keep a task's dashboard log bounded even when an algorithm is verbose.
+        self.conn.execute("""
+            DELETE FROM task_logs WHERE task_id=? AND id NOT IN (
+              SELECT id FROM task_logs WHERE task_id=? ORDER BY id DESC LIMIT 5000
+            )
+        """, (task_id, task_id))
+        self.conn.commit()
+        return len(normalized[:50])
+
+    @synchronized
+    def task_logs(self, task_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        rows = self.conn.execute("""
+            SELECT id, worker_id, attempt_count, created_at, line FROM task_logs
+            WHERE task_id=? ORDER BY id DESC LIMIT ?
+        """, (task_id, max(1, min(limit, 5000)))).fetchall()
+        return [{"id": int(row[0]), "worker_id": str(row[1]), "attempt_count": int(row[2]),
+                 "created_at": float(row[3]), "line": str(row[4])} for row in reversed(rows)]
 
     @synchronized
     def finish(self, worker_id: str, token: str, task_id: str,

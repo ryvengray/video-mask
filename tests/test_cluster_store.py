@@ -45,6 +45,22 @@ def test_worker_claims_task_once_and_finishes(tmp_path: Path):
     store.close()
 
 
+def test_worker_task_logs_are_persisted_and_cleared_on_restart(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    created = store.create_task(task_payload())
+    store.claim("worker-01", TOKEN)
+
+    assert store.append_task_logs("worker-01", TOKEN, created["task_id"], ["first line", "second line"]) == 2
+    assert [entry["line"] for entry in store.task_logs(created["task_id"])] == ["first line", "second line"]
+
+    store.finish("worker-01", TOKEN, created["task_id"], True, {})
+    store.restart_task(created["task_id"])
+    assert store.task_logs(created["task_id"]) == []
+    store.close()
+
+
 def test_task_without_upload_url_is_valid_for_worker_local_output(tmp_path: Path):
     store = new_store(tmp_path)
     payload = task_payload()
@@ -357,8 +373,10 @@ def test_all_completed_tasks_can_be_restarted_with_a_shared_timestamp(tmp_path: 
     failed = store.create_task({**task_payload(), "source_url": "https://storage.example/failed.mov"})
     store.conn.execute("""
         UPDATE tasks SET status='completed', attempt_count=2, started_at=10, finished_at=20,
-          output_sha256='done', output_duration_seconds=12 WHERE task_id IN (?, ?)
-    """, (completed["task_id"], second_completed["task_id"]))
+          output_sha256='done', output_duration_seconds=12,
+          face_annotation=CASE task_id WHEN ? THEN 1 ELSE 0 END,
+          face_annotated_at=18 WHERE task_id IN (?, ?)
+    """, (completed["task_id"], completed["task_id"], second_completed["task_id"]))
     store.conn.execute("UPDATE tasks SET status='failed', finished_at=20 WHERE task_id=?", (failed["task_id"],))
     store.conn.commit()
     monkeypatch.setattr("cluster.store.now", lambda: 1234.5)
@@ -374,6 +392,8 @@ def test_all_completed_tasks_can_be_restarted_with_a_shared_timestamp(tmp_path: 
         assert restarted["restarted_at"] == 1234.5
         assert restarted["finished_at"] is None
         assert restarted["output_sha256"] is None
+        assert restarted["face_annotation"] == (1 if task_id == completed["task_id"] else 0)
+        assert restarted["face_annotated_at"] == 18
     assert store.task(failed["task_id"])["status"] == "failed"
     store.close()
 
