@@ -567,7 +567,7 @@ function ensureTaskActionsColumn() {
       const action = status === 'completed' ? 'restart' : 'cancel';
       const button = document.createElement('button');
       button.type = 'button';
-      button.className = 'play-btn';
+      button.className = `task-action-button task-action-${action}`;
       button.dataset.taskAction = action;
       button.dataset.taskId = playButton.dataset.taskId;
       button.textContent = action === 'restart' ? 'Restart' : 'Cancel';
@@ -575,7 +575,7 @@ function ensureTaskActionsColumn() {
     }
     const logsButton = document.createElement('button');
     logsButton.type = 'button';
-    logsButton.className = 'play-btn';
+    logsButton.className = 'task-action-button task-action-logs';
     logsButton.dataset.taskAction = 'logs';
     logsButton.dataset.taskId = playButton.dataset.taskId;
     logsButton.textContent = 'View logs';
