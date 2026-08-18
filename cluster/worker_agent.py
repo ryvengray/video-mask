@@ -61,6 +61,7 @@ class Worker:
         self.work_dir = args.work_dir.resolve()
         self.completed_output_dir = args.completed_output_dir.resolve()
         self.algorithm = args.algorithm.resolve()
+        self.algorithm_dir = self.algorithm.parent
         self.python = args.python
         self.poll_seconds = args.poll_seconds
         self.extra_args = args.extra_arg or DEFAULT_ARGS
@@ -75,7 +76,8 @@ class Worker:
         """Describe this process so the Controller dashboard can identify it."""
         hostname = socket.gethostname()
         info: dict[str, Any] = {
-            "algorithm": DEFAULT_ALGORITHM,
+            "algorithm": self.algorithm.name,
+            "default_algorithm": self.algorithm.name,
             "pid": os.getpid(),
             "hostname": hostname,
         }
@@ -230,7 +232,18 @@ class Worker:
                 except Exception as exc:
                     print(f"[{task_id}] failed to abort multipart upload: {exc}", file=sys.stderr, flush=True)
 
-    def algorithm_command(self, source: Path, output_dir: Path, arguments: list[str]) -> list[str]:
+    def algorithm_path_for_task(self, task: dict[str, Any]) -> Path:
+        """Resolve the Controller-selected algorithm without allowing path traversal."""
+        name = str(task.get("algorithm") or self.algorithm.name).strip()
+        if not name or Path(name).name != name:
+            raise RuntimeError("task algorithm must be a filename in the Worker source directory")
+        candidate = (self.algorithm_dir / name).resolve()
+        if candidate.parent != self.algorithm_dir:
+            raise RuntimeError("task algorithm is outside the Worker source directory")
+        return candidate
+
+    def algorithm_command(self, algorithm: Path, source: Path, output_dir: Path,
+                          arguments: list[str]) -> list[str]:
         """Build an invocation for either a development script or a release binary.
 
         The normal source deployment supplies a ``.py`` algorithm and therefore
@@ -239,13 +252,15 @@ class Worker:
         as a Python script makes an otherwise valid Worker fail at task claim time.
         """
         shared = [str(source), "--out-dir", str(output_dir), *arguments]
-        if self.algorithm.suffix.lower() == ".py":
-            return [self.python, "-u", str(self.algorithm), *shared]
-        if not self.algorithm.is_file():
-            raise RuntimeError(f"algorithm executable does not exist: {self.algorithm}")
-        if not os.access(self.algorithm, os.X_OK):
-            raise RuntimeError(f"algorithm executable is not executable: {self.algorithm}")
-        return [str(self.algorithm), *shared]
+        if algorithm.suffix.lower() == ".py":
+            if not algorithm.is_file():
+                raise RuntimeError(f"algorithm script does not exist: {algorithm.name}")
+            return [self.python, "-u", str(algorithm), *shared]
+        if not algorithm.is_file():
+            raise RuntimeError(f"algorithm executable does not exist: {algorithm.name}")
+        if not os.access(algorithm, os.X_OK):
+            raise RuntimeError(f"algorithm executable is not executable: {algorithm.name}")
+        return [str(algorithm), *shared]
 
     def persist_output(self, output: Path, task_id: str) -> Path:
         """Keep a completed result after the task work directory is cleaned."""
@@ -282,9 +297,9 @@ class Worker:
             processing_started_at = time.time()
             self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size,
                         processing_started_at=processing_started_at)
-            command = self.algorithm_command(
-                source, output_dir, task.get("arguments") or self.extra_args
-            )
+            algorithm = self.algorithm_path_for_task(task)
+            print(f"[{task_id}] Controller selected algorithm: {algorithm.name}", flush=True)
+            command = self.algorithm_command(algorithm, source, output_dir, task.get("arguments") or self.extra_args)
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1, start_new_session=True,
