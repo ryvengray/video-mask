@@ -40,6 +40,7 @@ import argparse
 import glob
 import os
 import queue
+import select
 import shutil
 import subprocess
 import sys
@@ -58,7 +59,7 @@ FACE_EXPAND = 0.12            # 人脸打码框外扩比例(确保盖住完整�
 FACE_YUNET_SIZE = 640         # 人脸检测输入尺寸(YuNet/YOLOv8 均自动调整为32的倍数, 640x640)
 FACE_DETECT_INT = 5           # 人脸检测间隔: 每5帧检测1次, 中间帧光流跟踪(默认5; 运动剧烈可改2~3)
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
-FACE_GRACE = 4               # 人脸漏检沿用旧框帧数(运动时收紧, 防打码框滞后)
+FACE_GRACE = 8               # 人脸漏检沿用旧框帧数(运动时收紧, 防打码框滞后)
 # 误检几何过滤(排除手/玩具等非人脸误检, 零耗时增加)
 FACE_MIN_SIZE = 15           # 人脸框最小边长(像素), 低于视为噪点丢弃
 FACE_MAX_AREA_RATIO = 0.12   # 单脸最大面积占比(超过画面12%视为大物体误检, 如玩具堆)
@@ -120,7 +121,7 @@ FISHEYE_PRESETS = {
 }
 
 
-def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="auto"):
+def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="auto", crop=1.0):
     """对单帧做鱼眼去畸变, 返回矫正后的图像。
 
     支持设备预置(device="pico4" 等)或通用模式手动 strength 调节。
@@ -135,6 +136,10 @@ def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="au
     downscale: 降采样倍数(>=1)。>1 时在 1/downscale 分辨率上做 remap 再上采样,
         remap 面积减 downscale² 倍, 大幅提速(1920x1456 downscale=2 约 -75% 耗时)。
         画质损失可忽略(双线性插值两次, 人脸打码场景无感知)。设 1 关闭。
+
+    crop: 裁剪比例(0~1)。矫正后裁剪边缘区域, 去除畸变最严重的外围。
+        双鱼眼模式下每目独立居中裁剪, 避免从拼接缝中心裁剪导致两目内容丢失。
+        默认 1.0 不裁剪。
     """
     h, w = img.shape[:2]
 
@@ -153,8 +158,8 @@ def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="au
         # 切分后每个半边用自身维度算 fx = max(1920,1456)*0.44 = 845(正确),
         # 而非错误的 max(3840,1456)*0.44 = 1690(2x 偏大)。
         mid = w // 2
-        left = fisheye_undistort(img[:, :mid], strength, device, downscale, dual="false")
-        right = fisheye_undistort(img[:, mid:], strength, device, downscale, dual="false")
+        left = fisheye_undistort(img[:, :mid], strength, device, downscale, dual="false", crop=crop)
+        right = fisheye_undistort(img[:, mid:], strength, device, downscale, dual="false", crop=crop)
         return np.concatenate([left, right], axis=1)
 
     # === 以下为单鱼眼处理逻辑 ===
@@ -169,8 +174,8 @@ def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="au
     if downscale > 1:
         # 降采样路径: 在小图上 remap 再上采样回原尺寸
         sw, sh = max(2, w // downscale), max(2, h // downscale)
-        cache_key = (sw, sh, f_ratio, k1, k2, balance)
-        if cache_key not in _fisheye_maps_cache:
+        ds_key = (sw, sh, f_ratio, k1, k2, balance)
+        if ds_key not in _fisheye_maps_cache:
             fx = max(sw, sh) * f_ratio
             K = np.array([[fx, 0, sw / 2], [0, fx, sh / 2], [0, 0, 1]], dtype=np.float64)
             D = np.array([k1, k2, 0, 0], dtype=np.float64)
@@ -178,30 +183,36 @@ def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="au
                 K, D, (sw, sh), np.eye(3), balance=balance)
             map1, map2 = cv2.fisheye.initUndistortRectifyMap(
                 K, D, np.eye(3), new_K, (sw, sh), cv2.CV_16SC2)
-            _fisheye_maps_cache[cache_key] = (map1, map2)
-        map1, map2 = _fisheye_maps_cache[cache_key]
+            _fisheye_maps_cache[ds_key] = (map1, map2)
+        map1, map2 = _fisheye_maps_cache[ds_key]
         img_small = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_LINEAR)
         undistorted_small = cv2.remap(img_small, map1, map2, cv2.INTER_LINEAR)
-        return cv2.resize(undistorted_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        img = cv2.resize(undistorted_small, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # 原分辨率路径
-    cache_key = (w, h, f_ratio, k1, k2, balance)
-    if cache_key in _fisheye_maps_cache:
-        map1, map2 = _fisheye_maps_cache[cache_key]
-        return cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+    else:
+        # 原分辨率路径
+        full_key = (w, h, f_ratio, k1, k2, balance)
+        if full_key not in _fisheye_maps_cache:
+            fx = max(w, h) * f_ratio
+            K = np.array([[fx, 0, w / 2], [0, fx, h / 2], [0, 0, 1]], dtype=np.float64)
+            D = np.array([k1, k2, 0, 0], dtype=np.float64)
+            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                K, D, (w, h), np.eye(3), balance=balance)
+            map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+                K, D, np.eye(3), new_K, (w, h), cv2.CV_16SC2)
+            _fisheye_maps_cache[full_key] = (map1, map2)
+        map1, map2 = _fisheye_maps_cache[full_key]
+        img = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
 
-    # 估算内参矩阵 K
-    fx = max(w, h) * f_ratio
-    K = np.array([[fx, 0, w / 2], [0, fx, h / 2], [0, 0, 1]], dtype=np.float64)
-    # 畸变系数: k1 主导桶形畸变, k2 高阶修正
-    D = np.array([k1, k2, 0, 0], dtype=np.float64)
-
-    new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-        K, D, (w, h), np.eye(3), balance=balance)
-    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
-        K, D, np.eye(3), new_K, (w, h), cv2.CV_16SC2)
-    _fisheye_maps_cache[cache_key] = (map1, map2)
-    return cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+    # 裁剪边缘(单鱼眼分支, 双鱼眼已在递归调用中各自裁剪)
+    if 0 < crop < 1.0:
+        ch, cw = img.shape[:2]
+        new_w = int(cw * crop) // 2 * 2
+        new_h = int(ch * crop) // 2 * 2
+        y0 = (ch - new_h) // 2
+        x0 = (cw - new_w) // 2
+        img = np.ascontiguousarray(img[y0:y0 + new_h, x0:x0 + new_w])
+    return img
 
 
 # ================= 人脸检测 =================
@@ -212,6 +223,7 @@ YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 
 # YOLOv8 nano 人脸检测模型 (ultralytics 自动下载，约 6MB)
 YOLO_FACE_FILE = "yolov8n-face.pt"
+YOLO_FACE_M_FILE = "yolov8m-face.pt"  # YOLOv8 medium 人脸检测模型(精度更高, 约 52MB)
 YOLO11_FACE_FILE = "yolo11n-face.pt"  # YOLOv11 nano 人脸检测模型(ultralytics 最新一代, 6MB)
 YOLO11_FACE_FILE_ALT = "yolov11n-face.pt"  # 社区常见命名变体(同一模型, 文件名带v)
 YOLO_INPUT_SIZE = 640          # YOLOv8 检测输入尺寸(32的倍数; 降低可提速)
@@ -520,6 +532,108 @@ class YOLO11FaceDetector(YOLOFaceDetector):
         return None
 
 
+class YOLOv8MFaceDetector(YOLOFaceDetector):
+    """YOLOv8-medium 人脸检测器 — 精度更高的中型模型。
+
+    与 YOLOFaceDetector 接口完全一致, 仅模型文件不同(yolov8m-face.pt)。
+    YOLOv8m 参数量约为 YOLOv8n 的 8 倍(52MB vs 6MB), 精度更高但速度更慢。
+    适合追求检出率、对速度要求不极端的场景(如鱼眼视频、小脸场景)。
+    继承 YOLOFaceDetector 复用 _normalize_size / _select_device / detect 等方法。
+    """
+
+    def __init__(self, model_dir=None, yolo_size=YOLO_INPUT_SIZE, use_gpu=True):
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 ultralytics。请安装：pip install ultralytics"
+            ) from exc
+        self.yolo_size = self._normalize_size(yolo_size)
+        self.device = self._select_device(use_gpu)
+
+        model_path = self._find_model_m(model_dir)
+        if model_path is None:
+            # 回退到 yolov8n-face.pt
+            fallback = YOLOFaceDetector._find_model(model_dir)
+            if fallback:
+                print(f"[人脸] [警告] 未找到 {YOLO_FACE_M_FILE}, "
+                      f"回退使用 {os.path.basename(fallback)}")
+                model_path = fallback
+            else:
+                model_path = YOLO_FACE_M_FILE
+        self._model = YOLO(model_path)
+
+        try:
+            self._model.fuse()
+        except Exception:
+            pass
+
+        import numpy as np
+        dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
+        self._model(dummy, imgsz=self.yolo_size, device=self.device,
+                    conf=0.5, verbose=False)
+
+    @staticmethod
+    def _find_model_m(model_dir):
+        """按优先级搜索 yolov8m-face.pt 文件。"""
+        candidates = []
+        if model_dir:
+            candidates.append(os.path.join(model_dir, YOLO_FACE_M_FILE))
+        candidates.append(os.path.join(os.getcwd(), YOLO_FACE_M_FILE))
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       YOLO_FACE_M_FILE))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+
+class DualFaceDetector:
+    """双模型共识检测器: 两个模型同时检测, IoU 匹配一致才保留。
+
+    大幅降低单模型误检率(如 YOLO 把手/玩具误认为人脸, 但另一个模型不认;
+    此时双方不一致, 不打码, 宁可漏打不误打)。
+    支持任意两个检测器组合: YOLO11+YuNet, YOLOv8+YOLO11 等。
+    """
+    def __init__(self, det_a, det_b, name_a="A", name_b="B"):
+        self._det_a = det_a
+        self._det_b = det_b
+        self._name = f"{name_a}+{name_b}"
+
+    @staticmethod
+    def _iou(a, b):
+        x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+        x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0
+
+    def detect(self, img, conf=FACE_CONF, iou_thresh=0.2):
+        dets_a = self._det_a.detect(img, conf=conf)
+        if not dets_a:
+            return []  # A 没检出 → 共识必为空, 跳过 B 的推理
+        dets_b = self._det_b.detect(img, conf=conf)
+        if not dets_b:
+            return []
+        # 贪心匹配: 对每个 A 框找最佳 IoU 匹配的 B 框
+        consensus = []
+        used = set()
+        for da in dets_a:
+            best_iou, best_j = 0, -1
+            for j, db in enumerate(dets_b):
+                if j in used:
+                    continue
+                score = self._iou(da, db)
+                if score > best_iou:
+                    best_iou, best_j = score, j
+            if best_iou >= iou_thresh and best_j >= 0:
+                consensus.append(da)
+                used.add(best_j)
+        return consensus
+
+
 class SCRFDVerifier:
     """SCRFD 人脸验证器 — 用关键点模型验证 YOLO 检出的候选框是否为真脸。
 
@@ -677,7 +791,7 @@ class FaceProcessor:
     - F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
       导致视频开头几帧没打码(YuNet DNN 后端初始化可能首帧漏检)
     """
-    def __init__(self, detector, detect_int=FACE_DETECT_INT, grace=FACE_GRACE, conf=FACE_CONF, scrfd_verifier=None):
+    def __init__(self, detector, detect_int=FACE_DETECT_INT, grace=FACE_GRACE, conf=FACE_CONF, scrfd_verifier=None, dual_iou=0.2):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.conf = conf
@@ -687,6 +801,7 @@ class FaceProcessor:
         self.prev_gray = None
         self.face_pts = {}
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
+        self.dual_iou = dual_iou    # 双模型共识 IoU 阈值(仅 DualFaceDetector 使用)
         # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
         self.lk = dict(winSize=(21, 21), maxLevel=3,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
@@ -767,13 +882,15 @@ class FaceProcessor:
         cold_start = frame_idx <= 2
         need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_faces or cold_start
         if need_detect:
+            # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
+            if isinstance(self.detector, DualFaceDetector):
+                dets = self.detector.detect(img, conf=self.conf, iou_thresh=self.dual_iou)
             # SCRFD 二次验证: 高conf框直接保留, 低conf框用SCRFD确认(过滤手/玩具误检)
-            if self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
+            elif self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
                 dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf)
                 dets = self.scrfd_verifier.verify(dets_with_conf, img)
             else:
                 dets = self.detector.detect(img, conf=self.conf)
-            # 多人场景: 保留全部检测结果, 不再用单人 Tracker 过滤
             if dets:
                 faces = dets
                 self.miss_count = 0
@@ -944,9 +1061,9 @@ def nvenc_available():
 
     encoders = _run(["ffmpeg", "-hide_banner", "-encoders"])
     _NVENC_AVAILABLE = (
-        encoders.returncode == 0
-        and "h264_nvenc" in encoders.stdout
-        and _hw_encoder_is_usable("h264_nvenc")
+            encoders.returncode == 0
+            and "h264_nvenc" in encoders.stdout
+            and _hw_encoder_is_usable("h264_nvenc")
     )
     return _NVENC_AVAILABLE
 
@@ -1023,8 +1140,9 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
 def _process_pipe(src, dst, face_on, model_dir, face_size,
                   face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                   frame_skip, fisheye, fisheye_strength, fisheye_device,
-                  fisheye_downscale, fisheye_dual, log,
-                  scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35):
+                  fisheye_downscale, fisheye_dual, fisheye_crop, log,
+                  scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
+                  dual_iou=0.2):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -1035,6 +1153,26 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     w, h, fps, rot = get_video_info(src)
     has_aud = has_audio(src)
 
+    # 鱼眼裁剪: 计算输出尺寸
+    if fisheye and 0 < fisheye_crop < 1.0:
+        # 用 dummy 帧探测 fisheye_undistort 的实际输出尺寸,
+        # 避免双鱼眼 per-eye 裁剪与整图计算不一致导致编码器帧数据错位 → 死锁
+        _probe = fisheye_undistort(np.zeros((h, w, 3), dtype=np.uint8),
+                                   fisheye_strength, fisheye_device,
+                                   downscale=fisheye_downscale,
+                                   dual=fisheye_dual,
+                                   crop=fisheye_crop)
+        out_h, out_w = _probe.shape[:2]
+        # 对齐偶数(编码器要求)
+        out_w = out_w // 2 * 2
+        out_h = out_h // 2 * 2
+        log(f"  [鱼眼] 裁剪边缘: crop={fisheye_crop}, 输出 {out_w}x{out_h} (原 {w}x{h})")
+    elif fisheye_crop != 1.0 and not fisheye:
+        log(f"  [警告] --fisheye-crop 需要 --fisheye 同时启用, 已忽略")
+        out_w, out_h = w, h
+    else:
+        out_w, out_h = w, h
+
     log(f"  [管道模式] {w}x{h} {fps:.1f}fps 音轨={'有' if has_aud else '无'}"
         + (f" 旋转{rot}°" if rot else ""))
 
@@ -1042,7 +1180,22 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     hw = find_hw_encoder(family="h264" if force_h264 else "hevc")
 
     # 初始化检测器 — 根据 face_model 参数选择
-    if face_model == "yolov8":
+    if face_model == "yolo11+yunet":
+        fd = DualFaceDetector(
+            YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            YuNetFaceDetector(model_dir=model_dir, yunet_size=face_size, use_gpu=use_gpu),
+            name_a="YOLO11", name_b="YuNet")
+        log(f"  [人脸] YOLO11+YuNet 双模型共识 (输入{face_size})")
+    elif face_model == "yolov8+yolo11":
+        fd = DualFaceDetector(
+            YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            name_a="YOLOv8", name_b="YOLO11")
+        log(f"  [人脸] YOLOv8+YOLO11 双模型共识 (输入{face_size})")
+    elif face_model == "yolov8m":
+        fd = YOLOv8MFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
+        log(f"  [人脸] YOLOv8-medium (输入{face_size})")
+    elif face_model == "yolov8":
         fd = YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YOLOv8-nano (输入{face_size})")
     elif face_model == "yolo11":
@@ -1059,7 +1212,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             log(f"  [人脸] SCRFD 二次验证 (conf={scrfd_conf}, iou={scrfd_iou}, keep_conf={scrfd_keep_conf})")
         except Exception as e:
             log(f"  [警告] SCRFD 初始化失败: {e}, 跳过二次验证")
-    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf, scrfd_verifier=scrfd_verifier) if face_on else None
+    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf,
+                              scrfd_verifier=scrfd_verifier, dual_iou=dual_iou) if face_on else None
 
     # 启动抽帧进程(raw BGR → stdout pipe)
     # NVDEC 硬件解码(可用时): -hwaccel cuda 让 ffmpeg 用 GPU 解码
@@ -1091,7 +1245,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     # 省去原先 ffmpeg -vn -acodec copy audio.aac 的临时抽取步骤。
     enc_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s:v", f"{w}x{h}", "-r", str(fps / frame_skip), "-i", "pipe:0"]
+               "-s:v", f"{out_w}x{out_h}", "-r", str(fps / frame_skip), "-i", "pipe:0"]
     if has_aud:
         enc_cmd += ["-i", src]  # 第二输入: 内联读取音频, 省去临时抽取
     # 输出选项(必须在所有 -i 之后)
@@ -1103,7 +1257,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         # preset p6: 比 p4 画质更好, NVENC 吞吐影响小(硬件编码 preset 间差异远小于 CPU).
         use_hevc = (not force_h264) and _hw_encoder_is_usable("hevc_nvenc")
         nvenc_enc = "hevc_nvenc" if use_hevc else "h264_nvenc"
-        bitrate = hw_bitrate(w, h, fps, nvenc_enc, get_bitrate(src))
+        bitrate = hw_bitrate(out_w, out_h, fps, nvenc_enc, get_bitrate(src))
         enc_cmd += ["-c:v", nvenc_enc, "-preset", "p6", "-tune", "hq",
                     "-rc", "vbr", "-cq", "20", "-b:v", "0",
                     "-maxrate", f"{bitrate // 1000}k",
@@ -1112,7 +1266,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             enc_cmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
         log(f"  [编码] NVENC GPU 硬件编码 ({nvenc_enc}, preset=p6, maxrate={bitrate // 1000}kbps)")
     elif hw:
-        bitrate = hw_bitrate(w, h, fps, hw, get_bitrate(src))
+        bitrate = hw_bitrate(out_w, out_h, fps, hw, get_bitrate(src))
         enc_cmd += ["-c:v", hw, "-b:v", str(bitrate)]
         if hw.startswith(("hevc", "h265")):
             enc_cmd += ["-tag:v", "hvc1"]  # HEVC必须hvc1标签才能被QuickTime/iOS/多数播放器播放
@@ -1177,13 +1331,34 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             read_q.put(None)  # 哨兵: 通知主线程读取结束
 
     def _writer():
-        """消费者: 从写队列取帧, 写入 ffmpeg stdin。"""
+        """消费者: 从写队列取帧, 写入 ffmpeg stdin。
+        用 select 检测可写性, 避免编码器崩溃时 write() 永久阻塞。
+        """
         try:
             while True:
                 item = write_q.get()
                 if item is None:  # 哨兵
                     break
-                encode.stdin.write(item)
+                # select 等待 stdin 可写, 超时检查编码器是否存活
+                fd = encode.stdin.fileno()
+                try:
+                    mv = memoryview(item).cast('B')  # 零拷贝字节视图
+                except TypeError:
+                    # 非 C-contiguous (不应发生, fisheye crop 已做 ascontiguousarray)
+                    mv = memoryview(bytes(item))
+                offset = 0
+                while offset < len(mv):
+                    _, w_ready, _ = select.select([], [fd], [], 3.0)
+                    if not w_ready:
+                        # 超时: 检查编码器是否已退出
+                        if encode.poll() is not None:
+                            writer_done.set()
+                            return
+                        continue
+                    n = os.write(fd, mv[offset:])
+                    if n == 0:
+                        raise BrokenPipeError("编码器 stdin 已关闭")
+                    offset += n
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -1228,7 +1403,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             if fisheye:
                 img = fisheye_undistort(img, fisheye_strength, fisheye_device,
                                         downscale=fisheye_downscale,
-                                        dual=fisheye_dual)
+                                        dual=fisheye_dual,
+                                        crop=fisheye_crop)
 
             faces = []
             if face_on:
@@ -1315,8 +1491,9 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 def _process_files(src, dst, face_on, model_dir, face_size,
                    face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                    frame_skip, fisheye, fisheye_strength, fisheye_device,
-                   fisheye_downscale, fisheye_dual, log,
-                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35):
+                   fisheye_downscale, fisheye_dual, fisheye_crop, log,
+                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
+                   dual_iou=0.2):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1329,6 +1506,24 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     t0 = time.time()
     fps = get_fps(src)
     w, h, _, _ = get_video_info(src)
+
+    # 鱼眼裁剪: 计算输出尺寸
+    if fisheye and 0 < fisheye_crop < 1.0:
+        # 用 dummy 帧探测 fisheye_undistort 的实际输出尺寸
+        _probe = fisheye_undistort(np.zeros((h, w, 3), dtype=np.uint8),
+                                   fisheye_strength, fisheye_device,
+                                   downscale=fisheye_downscale,
+                                   dual=fisheye_dual,
+                                   crop=fisheye_crop)
+        out_h, out_w = _probe.shape[:2]
+        out_w = out_w // 2 * 2
+        out_h = out_h // 2 * 2
+        log(f"  [鱼眼] 裁剪边缘: crop={fisheye_crop}, 输出 {out_w}x{out_h} (原 {w}x{h})")
+    elif fisheye_crop != 1.0 and not fisheye:
+        log(f"  [警告] --fisheye-crop 需要 --fisheye 同时启用, 已忽略")
+        out_w, out_h = w, h
+    else:
+        out_w, out_h = w, h
 
     log(f"  [文件模式] 抽帧: {src}" + (f" (每{frame_skip}帧抽1帧,提速约{frame_skip}x)" if frame_skip > 1 else ""))
     extract_cmd = ["ffmpeg", "-y", "-i", src, "-q:v", "2"]
@@ -1343,7 +1538,22 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     frames = sorted(f for f in os.listdir(fin) if f.endswith(".jpg"))
     log(f"  共 {len(frames)} 帧")
 
-    if face_model == "yolov8":
+    if face_model == "yolo11+yunet":
+        fd = DualFaceDetector(
+            YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            YuNetFaceDetector(model_dir=model_dir, yunet_size=face_size, use_gpu=use_gpu),
+            name_a="YOLO11", name_b="YuNet")
+        log(f"  [人脸] YOLO11+YuNet 双模型共识 (输入{face_size})")
+    elif face_model == "yolov8+yolo11":
+        fd = DualFaceDetector(
+            YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            name_a="YOLOv8", name_b="YOLO11")
+        log(f"  [人脸] YOLOv8+YOLO11 双模型共识 (输入{face_size})")
+    elif face_model == "yolov8m":
+        fd = YOLOv8MFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
+        log(f"  [人脸] YOLOv8-medium (输入{face_size})")
+    elif face_model == "yolov8":
         fd = YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YOLOv8-nano (输入{face_size})")
     elif face_model == "yolo11":
@@ -1360,7 +1570,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
             log(f"  [人脸] SCRFD 二次验证 (conf={scrfd_conf}, iou={scrfd_iou}, keep_conf={scrfd_keep_conf})")
         except Exception as e:
             log(f"  [警告] SCRFD 初始化失败: {e}, 跳过二次验证")
-    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf, scrfd_verifier=scrfd_verifier) if face_on else None
+    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf,
+                              scrfd_verifier=scrfd_verifier, dual_iou=dual_iou) if face_on else None
     total_face = 0
 
     for i, fn in enumerate(frames, 1):
@@ -1371,7 +1582,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         if fisheye:
             img = fisheye_undistort(img, fisheye_strength, fisheye_device,
                                     downscale=fisheye_downscale,
-                                    dual=fisheye_dual)
+                                    dual=fisheye_dual,
+                                    crop=fisheye_crop)
         faces = []
         if face_on:
             faces = face_proc.process(img, i)
@@ -1392,7 +1604,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     if has_audio(src):
         vcmd += ["-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
     if hw:
-        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(w, h, fps, hw, get_bitrate(src)))]
+        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(out_w, out_h, fps, hw, get_bitrate(src)))]
         if hw.startswith(("hevc", "h265")):
             vcmd += ["-tag:v", "hvc1"]
         log(f"  [编码] 硬件: {hw}")
@@ -1419,8 +1631,9 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   use_pipe=True, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
-                  fisheye_downscale=2, fisheye_dual="auto", log=print,
-                  scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35):
+                  fisheye_downscale=2, fisheye_dual="auto", fisheye_crop=1.0, log=print,
+                  scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
+                  dual_iou=0.2):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1429,8 +1642,9 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  keep_tmp, force_h264, use_gpu,
                                  frame_skip, fisheye, fisheye_strength,
                                  fisheye_device, fisheye_downscale,
-                                 fisheye_dual, log,
-                                 scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf)
+                                 fisheye_dual, fisheye_crop, log,
+                                 scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
+                                 dual_iou)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -1438,8 +1652,9 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           keep_tmp, force_h264, use_gpu,
                           frame_skip, fisheye, fisheye_strength,
                           fisheye_device, fisheye_downscale,
-                          fisheye_dual, log,
-                          scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf)
+                          fisheye_dual, fisheye_crop, log,
+                          scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
+                          dual_iou)
 
 
 def expand_inputs(inputs):
@@ -1460,8 +1675,13 @@ def main():
     ap.add_argument("--out-dir", default="masked_out", help="输出目录(默认 masked_out)")
     ap.add_argument("--face-size", type=int, default=FACE_YUNET_SIZE,
                     help="人脸检测输入尺寸(默认640; YuNet/YOLOv8 均调整为32的倍数)")
-    ap.add_argument("--face-model", default="yunet", choices=["yunet", "yolov8", "yolo11"],
-                    help="人脸检测模型: yunet(默认,轻量,仅opencv) / yolov8(极速,需ultralytics) / yolo11(最新,需ultralytics)")
+    ap.add_argument("--face-model", default="yunet",
+                    choices=["yunet", "yolov8", "yolov8m", "yolo11", "yolo11+yunet", "yolov8+yolo11"],
+                    help="人脸检测模型: yunet(默认,轻量,仅opencv) / yolov8(极速) / yolov8m(高精度) / "
+                         "yolo11(最新) / yolo11+yunet(双模型共识) / yolov8+yolo11(双模型共识)")
+    ap.add_argument("--dual-iou", type=float, default=0.2, metavar="IOU",
+                    help="双模型共识 IoU 阈值(默认0.2; 仅--face-model 含+号时生效; "
+                         "越高越严格,越低越宽容)")
     ap.add_argument("--face-int", type=int, default=FACE_DETECT_INT,
                     help="人脸检测间隔帧数(默认5: 每5帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
     ap.add_argument("--fisheye", action="store_true",
@@ -1480,6 +1700,9 @@ def main():
                          "true=强制切左右两半各自矫正; false=强制单鱼眼(兼容旧版). "
                          "Pico4双目录像(3840x1456=两个1920x1456左右拼接)必须启用(auto或true), "
                          "否则光心落在中央黑缝导致错误畸变,人脸检测率暴跌")
+    ap.add_argument("--fisheye-crop", type=float, default=1.0, metavar="RATIO",
+                    help="鱼眼矫正后裁剪比例(默认1.0=不裁剪; 0.8=保留中心80%%, 四周各裁10%%; "
+                         "仅--fisheye启用时生效, 输出分辨率同步缩小)")
     ap.add_argument("--scrfd-verify", action="store_true",
                     help="SCRFD二次验证: YOLO检出后用SCRFD关键点模型确认, 过滤手/玩具误检 "
                          "(需scrfd_10g_bnkps.onnx+onnxruntime; 高conf框不验证, 低conf框才验证)")
@@ -1526,10 +1749,12 @@ def main():
                          fisheye_device=args.fisheye_device,
                          fisheye_downscale=args.fisheye_downscale,
                          fisheye_dual=args.fisheye_dual,
+                         fisheye_crop=args.fisheye_crop,
                          scrfd_verify=args.scrfd_verify,
                          scrfd_conf=args.scrfd_conf,
                          scrfd_iou=args.scrfd_iou,
-                         scrfd_keep_conf=args.scrfd_keep_conf):
+                         scrfd_keep_conf=args.scrfd_keep_conf,
+                         dual_iou=args.dual_iou):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
