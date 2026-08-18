@@ -68,11 +68,12 @@
       <div id="play-modal-annotation" class="play-modal-annotation" hidden><span id="play-modal-annotation-status" class="subtle">Opening manual label…</span><button id="play-modal-has-face" class="face-label-button face-label-yes" type="button">👍 Has face</button><button id="play-modal-no-face" class="face-label-button face-label-no" type="button">👎 No face</button></div>
       <div class="play-modal-actions">
         <a id="play-modal-open" class="play-btn play-btn-open" href="#" target="_blank" rel="noopener noreferrer">Open in new tab</a>
+        <a id="play-modal-download" class="play-btn play-btn-open" href="#" download>Download</a>
         <button class="play-btn" type="button" data-play-close>Close</button>
       </div>
     </div>
   </div>
   <script id="processing-statistics" type="application/json">{{ processing_statistics | tojson }}</script>
-  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260817i"></script>
+  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260817j"></script>
 </body>
 </html>

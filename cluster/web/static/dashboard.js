@@ -78,6 +78,7 @@ const playVideo = document.getElementById('play-modal-video');
 const playKindBadge = document.getElementById('play-modal-kind');
 const playFileName = document.getElementById('play-modal-name');
 const playOpenLink = document.getElementById('play-modal-open');
+const playDownloadLink = document.getElementById('play-modal-download');
 let autoRefreshTimer;
 let activeFaceReview = null;
 let beginModalAnnotation = () => {};
@@ -100,6 +101,8 @@ function openPlayModal(url, kind, name, taskId) {
   playFileName.title = name;
   playVideo.src = url;
   playOpenLink.href = url;
+  playDownloadLink.href = url;
+  playDownloadLink.download = name;
   playModal.hidden = false;
   pauseAutoRefresh();
   beginModalAnnotation(taskId);
