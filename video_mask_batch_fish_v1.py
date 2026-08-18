@@ -19,6 +19,7 @@ video_mask_batch_fish_v1.py — 视频批量打码（仅人脸），精简版
   python video_mask_batch_fish_v1.py ./videos/              # 整个目录
   python video_mask_batch_fish_v1.py a.mp4 b.mov            # 多文件
   python video_mask_batch_fish_v1.py video.mp4 --face-model yolov8
+  python video_mask_batch_fish_v1.py video.mp4 --face-model yolo11
   python video_mask_batch_fish_v1.py video.mp4 --out-dir ./out
   python video_mask_batch_fish_v1.py video.mp4 --no-face            # 关闭人脸打码
   python video_mask_batch_fish_v1.py video.mp4 --face-conf 0.25
@@ -52,12 +53,17 @@ import numpy as np
 # ================= 打码/检测参数 =================
 FACE_CELLS, FACE_SIGMA = 4, 45.0
 FACE_INPUT = 320              # 人脸检测输入尺寸(320: 比400快约30%, 精度几乎无损失)
-FACE_CONF = 0.25             # 人脸置信度阈值(0.45->0.35: 侧脸/低头/遮挡帧不漏检, 跟踪器滤误检)
+FACE_CONF = 0.45             # 人脸置信度阈值(0.45->0.35: 侧脸/低头/遮挡帧不漏检, 跟踪器滤误检)
 FACE_EXPAND = 0.12            # 人脸打码框外扩比例(确保盖住完整脸)
 FACE_YUNET_SIZE = 640         # 人脸检测输入尺寸(YuNet/YOLOv8 均自动调整为32的倍数, 640x640)
 FACE_DETECT_INT = 5           # 人脸检测间隔: 每5帧检测1次, 中间帧光流跟踪(默认5; 运动剧烈可改2~3)
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
 FACE_GRACE = 4               # 人脸漏检沿用旧框帧数(运动时收紧, 防打码框滞后)
+# 误检几何过滤(排除手/玩具等非人脸误检, 零耗时增加)
+FACE_MIN_SIZE = 15           # 人脸框最小边长(像素), 低于视为噪点丢弃
+FACE_MAX_AREA_RATIO = 0.12   # 单脸最大面积占比(超过画面12%视为大物体误检, 如玩具堆)
+FACE_ASPECT_MIN = 0.5        # 人脸长宽比(宽/高)下限, 低于视为细长物(手/手臂)误检
+FACE_ASPECT_MAX = 2.0        # 人脸长宽比上限, 超过视为细长物误检
 
 VIDEO_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v",
                  ".mpg", ".mpeg", ".ts", ".m2ts", ".wmv", ".3gp", ".rmvb",
@@ -206,6 +212,8 @@ YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 
 # YOLOv8 nano 人脸检测模型 (ultralytics 自动下载，约 6MB)
 YOLO_FACE_FILE = "yolov8n-face.pt"
+YOLO11_FACE_FILE = "yolo11n-face.pt"  # YOLOv11 nano 人脸检测模型(ultralytics 最新一代, 6MB)
+YOLO11_FACE_FILE_ALT = "yolov11n-face.pt"  # 社区常见命名变体(同一模型, 文件名带v)
 YOLO_INPUT_SIZE = 640          # YOLOv8 检测输入尺寸(32的倍数; 降低可提速)
 
 
@@ -401,13 +409,22 @@ class YOLOFaceDetector:
 
     def detect(self, img, conf=FACE_CONF):
         """返回 bbox 列表, 格式与 YuNetFaceDetector.detect() 完全一致。"""
+        return [b for b, _ in self.detect_with_conf(img, conf)]
+
+    def detect_with_conf(self, img, conf=FACE_CONF):
+        """返回 [(bbox, conf), ...] 带 YOLO 置信度, 供 SCRFD 验证按 conf 分流。
+
+        与 detect() 相同的几何过滤, 额外保留置信度供 verify() 决定是否需要二次验证。
+        """
         if img is None or img.size == 0:
             return []
 
         # stream=True: 生成器模式, 减少结果对象包装开销
         results = self._model(img, imgsz=self.yolo_size, conf=conf,
                               device=self.device, verbose=False, stream=True)
-        bboxes = []
+        h, w = img.shape[:2]
+        img_area = w * h
+        out = []
         for r in results:
             if r.boxes is None:
                 continue
@@ -416,17 +433,251 @@ class YOLOFaceDetector:
                 if cls_id != 0:  # class 0 = face (yolov8n-face 单类别模型)
                     continue
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-                h, w = img.shape[:2]
                 x1, y1 = max(0, int(x1)), max(0, int(y1))
                 x2, y2 = min(w, int(x2)), min(h, int(y2))
-                if x2 > x1 and y2 > y1:
-                    bboxes.append((x1, y1, x2, y2))
-        return bboxes
+                bw, bh = x2 - x1, y2 - y1
+                if bw <= 0 or bh <= 0:
+                    continue
+                # 几何过滤: 排除手/玩具等非人脸误检(零耗时增加)
+                if bw < FACE_MIN_SIZE or bh < FACE_MIN_SIZE:
+                    continue  # 太小, 噪点
+                if bw * bh > img_area * FACE_MAX_AREA_RATIO:
+                    continue  # 太大, 大物体误检(如玩具堆/整片区域)
+                ratio = bw / bh
+                if ratio < FACE_ASPECT_MIN or ratio > FACE_ASPECT_MAX:
+                    continue  # 长宽比异常, 细长物(手/手臂)误检
+                c = float(box.conf[0]) if box.conf is not None else 0.0
+                out.append(((x1, y1, x2, y2), c))
+        return out
+
+
+class YOLO11FaceDetector(YOLOFaceDetector):
+    """YOLOv11-nano 人脸检测器 — ultralytics 最新一代模型。
+
+    与 YOLOFaceDetector 接口完全一致, 仅模型文件不同(yolo11n-face.pt)。
+    YOLOv11 在 COCO 等数据集上 mAP 与速度均优于 YOLOv8, 作为备选方案。
+    继承 YOLOFaceDetector 复用 _normalize_size / _select_device / detect 等方法。
+    """
+
+    def __init__(self, model_dir=None, yolo_size=YOLO_INPUT_SIZE, use_gpu=True):
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 ultralytics。请安装：pip install ultralytics"
+            ) from exc
+        self.yolo_size = self._normalize_size(yolo_size)
+        self.device = self._select_device(use_gpu)
+
+        # 查找模型: model_dir > CWD > 脚本目录
+        # 支持 yolo11n-face.pt 和 yolov11n-face.pt 两种命名
+        model_path = self._find_yolo11_model(model_dir)
+        if model_path is None:
+            # yolo11n-face.pt 非 ultralytics 官方模型, 不会自动下载
+            # 回退到本地 yolov8n-face.pt(精度接近), 避免直接抛 FileNotFoundError
+            fallback = YOLOFaceDetector._find_model(model_dir)
+            if fallback:
+                print(f"[人脸] [警告] 未找到 {YOLO11_FACE_FILE}/{YOLO11_FACE_FILE_ALT}, "
+                      f"回退使用 {os.path.basename(fallback)} "
+                      f"(yolo11n 与 yolov8n 在 WIDERFace 人脸检测上精度接近)")
+                model_path = fallback
+            else:
+                # 本地无任何 face 模型, 交给 ultralytics 尝试下载(可能失败)
+                model_path = YOLO11_FACE_FILE
+        self._model = YOLO(model_path)
+
+        # fuse(): 融合 Conv+BN 层, 数学等价但推理快 5-15%
+        try:
+            self._model.fuse()
+        except Exception:
+            pass
+
+        # 预热: 跑一次空推理，避免首帧卡顿
+        import numpy as np
+        dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
+        self._model(dummy, imgsz=self.yolo_size, device=self.device,
+                    conf=0.5, verbose=False)
+
+    @staticmethod
+    def _find_yolo11_model(model_dir):
+        """按优先级搜索 yolo11n-face.pt / yolov11n-face.pt 文件。
+        返回路径或 None(交由调用方回退到 yolov8n-face.pt)。
+
+        查找顺序: --model-dir > CWD > 脚本所在目录
+        支持两种命名: yolo11n-face.pt(ultralytics 风格) / yolov11n-face.pt(社区常见)
+        """
+        names = [YOLO11_FACE_FILE, YOLO11_FACE_FILE_ALT]
+        candidates = []
+        if model_dir:
+            for n in names:
+                candidates.append(os.path.join(model_dir, n))
+        for n in names:
+            candidates.append(os.path.join(os.getcwd(), n))
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), n))
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+
+class SCRFDVerifier:
+    """SCRFD 人脸验证器 — 用关键点模型验证 YOLO 检出的候选框是否为真脸。
+
+    项目已有 scrfd_10g_bnkps.onnx (带5关键点: 双眼/鼻/双嘴角)。
+    YOLO 检出候选框后, SCRFD 全图检测, 两者 IoU 匹配:
+    - 匹配上(SCRFD 也认为是脸) → 保留 YOLO 框打码
+    - 未匹配(SCRFD 不认为是脸, 如手/玩具) → 丢弃误检
+
+    仅在 --scrfd-verify 开启时使用, 避免双模型推理的耗时翻倍。
+    """
+
+    SCRFD_FILE = "scrfd_10g_bnkps.onnx"
+    SCRFD_INPUT = 640
+    SCRFD_STRIDES = [8, 16, 32]
+    SCRFD_NUM_ANCHORS = 2
+
+    def __init__(self, model_path=None, input_size=640, conf=0.3, use_gpu=False,
+                 iou_thresh=0.3, keep_conf=0.35):
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError("缺少 onnxruntime。请安装：pip install onnxruntime") from exc
+
+        if model_path is None:
+            for p in [os.path.join(os.getcwd(), self.SCRFD_FILE),
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), self.SCRFD_FILE)]:
+                if os.path.isfile(p):
+                    model_path = p
+                    break
+        if model_path is None:
+            raise RuntimeError(f"未找到 {self.SCRFD_FILE}, 请放到项目目录")
+
+        providers = ["CPUExecutionProvider"]
+        if use_gpu:
+            avail = ort.get_available_providers()
+            if "CoreMLExecutionProvider" in avail:
+                providers.insert(0, "CoreMLExecutionProvider")
+        self._sess = ort.InferenceSession(model_path, providers=providers)
+        self._input_name = self._sess.get_inputs()[0].name
+        self._input_size = input_size
+        self._conf = conf
+        self._iou_thresh = iou_thresh    # YOLO框与SCRFD框匹配的IoU阈值
+        self._keep_conf = keep_conf      # YOLO conf≥此值直接保留不验证(避免SCRFD漏检误伤)
+
+    def detect(self, img):
+        """全图检测, 返回 [(x1,y1,x2,y2), ...] 真脸列表(SCRFD 检出即带关键点)。"""
+        if img is None or img.size == 0:
+            return []
+        h, w = img.shape[:2]
+        sz = self._input_size
+        scale = min(sz / h, sz / w)
+        nh, nw = int(h * scale), int(w * scale)
+        canvas = np.zeros((sz, sz, 3), dtype=np.float32)
+        canvas[:nh, :nw] = cv2.resize(img, (nw, nh))
+        # BGR→RGB, HWC→CHW, 归一化 (x-127.5)/128
+        blob = canvas[:, :, ::-1].transpose(2, 0, 1)
+        blob = (blob - 127.5) / 128.0
+        blob = blob[np.newaxis].astype(np.float32)
+
+        outs = self._sess.run(None, {self._input_name: blob})
+
+        # 9 个输出: 3 score + 3 bbox + 3 kps (stride 8/16/32)
+        scores_all, boxes_all = [], []
+        for idx, stride in enumerate(self.SCRFD_STRIDES):
+            scores = outs[idx]        # [N, 1]
+            bboxes = outs[idx + 3]    # [N, 4] left/top/right/bottom 偏移
+            h_grid = sz // stride
+            n = h_grid * h_grid * self.SCRFD_NUM_ANCHORS
+            if scores.shape[0] != n:
+                continue
+            # anchor 中心点 (每个 grid 点 num_anchors 个 anchor)
+            centers = np.zeros((n, 2), dtype=np.float32)
+            i = 0
+            for y in range(h_grid):
+                for x in range(h_grid):
+                    cx, cy = (x + 0.5) * stride, (y + 0.5) * stride
+                    for _ in range(self.SCRFD_NUM_ANCHORS):
+                        centers[i] = (cx, cy)
+                        i += 1
+            mask = scores[:, 0] > self._conf
+            if mask.sum() == 0:
+                continue
+            s = scores[mask, 0]
+            b = bboxes[mask]
+            c = centers[mask]
+            # anchor-free 解码: bbox = center ± offset*stride
+            x1 = (c[:, 0] - b[:, 0] * stride) / scale
+            y1 = (c[:, 1] - b[:, 1] * stride) / scale
+            x2 = (c[:, 0] + b[:, 2] * stride) / scale
+            y2 = (c[:, 1] + b[:, 3] * stride) / scale
+            for j in range(len(s)):
+                scores_all.append(float(s[j]))
+                boxes_all.append((max(0.0, x1[j]), max(0.0, y1[j]),
+                                  min(float(w), x2[j]), min(float(h), y2[j])))
+
+        if not boxes_all:
+            return []
+        boxes_np = np.array(boxes_all, dtype=np.float32)
+        scores_np = np.array(scores_all, dtype=np.float32)
+        xywh = boxes_np.copy()
+        xywh[:, 2] -= xywh[:, 0]
+        xywh[:, 3] -= xywh[:, 1]
+        idxs = cv2.dnn.NMSBoxes(xywh.tolist(), scores_np.tolist(), self._conf, 0.4)
+        if len(idxs) == 0:
+            return []
+        return [tuple(boxes_np[i]) for i in idxs.flatten()]
+
+    def verify(self, yolo_dets, img, iou_thresh=None, keep_conf=None):
+        """验证 YOLO 检测结果, 过滤误检(手/玩具)。
+
+        yolo_dets: [(bbox, conf), ...] YOLO 带置信度的检测结果
+        keep_conf: YOLO 置信度 ≥ 此值的直接保留(高置信度真脸, 不验证,
+                   避免 SCRFD 漏检误伤); < 此值的用 SCRFD 验证。
+
+        策略: 高 conf 真脸不验证(SCRFD 可能漏检), 低 conf 框才用 SCRFD 二次确认。
+        手/玩具误检通常 conf 低且 SCRFD 不会检出 → 被过滤。
+        """
+        if iou_thresh is None:
+            iou_thresh = self._iou_thresh
+        if keep_conf is None:
+            keep_conf = self._keep_conf
+        if not yolo_dets:
+            return []
+        keep = [b for b, c in yolo_dets if c >= keep_conf]
+        to_verify = [(b, c) for b, c in yolo_dets if c < keep_conf]
+        if not to_verify:
+            return keep
+        scrfd_boxes = self.detect(img)
+        for bbox, _ in to_verify:
+            for sbox in scrfd_boxes:
+                if self._iou(bbox, sbox) > iou_thresh:
+                    keep.append(bbox)
+                    break
+        return keep
+
+    @staticmethod
+    def _iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+        return inter / ua if ua > 0 else 0.0
 
 
 class FaceProcessor:
-    """人脸检测+光流跟踪：关键帧检测，中间帧LK光流跟踪。支持多人。"""
-    def __init__(self, detector, detect_int=FACE_DETECT_INT, grace=FACE_GRACE, conf=FACE_CONF):
+    """人脸检测+光流跟踪：关键帧检测，中间帧LK光流跟踪。支持多人。
+
+    跟踪质量保障(防"漏一帧"):
+    - F1 forward-backward LK 验证: 正向跟踪后再反向, FB 误差大的点剔除,
+      median 估计更稳健(避免跟踪点跑到背景上导致框瞬移到错误位置)
+    - F2 位移阈值兜底: dx/dy > 0.3×box_size 判定跟踪跑飞, 回退到旧框
+      (避免框瞬移导致原人脸位置那 1 帧没被打码)
+    - F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
+      导致视频开头几帧没打码(YuNet DNN 后端初始化可能首帧漏检)
+    """
+    def __init__(self, detector, detect_int=FACE_DETECT_INT, grace=FACE_GRACE, conf=FACE_CONF, scrfd_verifier=None):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.conf = conf
@@ -435,12 +686,20 @@ class FaceProcessor:
         self.last_faces = []
         self.prev_gray = None
         self.face_pts = {}
+        self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
         # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
         self.lk = dict(winSize=(21, 21), maxLevel=3,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
         # 网格采样点数: 3×3=9 点, 替代 goodFeaturesToTrack 的 corner detection 开销
         # 9 点 median 估计位移仍稳健, 比 5×5=25 点 LK 提速约 2x
         self._grid_rows, self._grid_cols = 3, 3
+        # F1 forward-backward 验证: FB 误差阈值(像素), 超过此值的跟踪点被剔除
+        # 2.0 像素: 对鱼眼去畸变后的非线性局部变形更宽容(鱼眼场景正向→反向 LK
+        # 天然有 1-2px 误差), 普通视频也兼容(正常跟踪误差 <1px)
+        self._fb_thresh = 2.0
+        # F2 跟踪跑飞阈值: 位移 > 0.3×box_size 判定跟踪失败, 回退到旧框
+        # 0.3 = 一帧内人脸移动不超过 30% 框宽, 超过即视为跟踪点跑到背景
+        self._max_disp_ratio = 0.3
 
     def _init_pts(self, gray, box):
         """用均匀网格采样替代 goodFeaturesToTrack 的角点检测。
@@ -460,11 +719,60 @@ class FaceProcessor:
         pts = np.column_stack((xv.ravel(), yv.ravel())).reshape(-1, 1, 2)
         return pts.astype(np.float32)
 
+    def _track_box(self, prev_gray, gray, box):
+        """F1+F2: 对一个 box 做 LK 跟踪, 返回 (new_box, tracked_pts) 或 (None, None)。
+
+        F1 forward-backward 验证: 正向 LK 后再反向 LK, FB 误差大的点剔除,
+        median 位移估计更稳健, 避免跟踪点跑到背景导致框瞬移漏帧。
+        F2 位移阈值: dx/dy > 0.3×box_size 判定跟踪跑飞, 返回 None 回退到旧框。
+        """
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        box_size = max(bw, bh)
+        pts = self._init_pts(prev_gray, box)
+        if pts is None or len(pts) < 4:
+            return None, None
+        # 正向 LK: prev_gray → gray
+        npts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, gray, pts, None, **self.lk)
+        fwd_mask = status.flatten() == 1
+        if fwd_mask.sum() < 4:
+            return None, None
+        # F1 反向 LK: gray → prev_gray, 验证点是否真的跟踪正确
+        # 原理: 真实跟踪的点反向应该回到原位, 跑到背景的点反向会跑飞
+        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            gray, prev_gray, npts, None, **self.lk)
+        back_mask = back_status.flatten() == 1
+        # FB 误差: |back_pts - 原始 pts|, 大于阈值的点视为跑飞剔除
+        fb_err = np.linalg.norm(
+            back_pts.reshape(-1, 2) - pts.reshape(-1, 2), axis=1)
+        good_mask = fwd_mask & back_mask & (fb_err <= self._fb_thresh)
+        if good_mask.sum() < 4:
+            return None, None
+        good = npts[good_mask].reshape(-1, 2)
+        old_flat = pts[good_mask].reshape(-1, 2)
+        dx = float(np.median(good[:, 0] - old_flat[:, 0]))
+        dy = float(np.median(good[:, 1] - old_flat[:, 1]))
+        # F2 位移阈值: 一帧内位移超过 30% 框宽判定跟踪跑飞, 回退旧框
+        # (正常人脸一帧位移 < 10% 框宽; 30% 已是极端, 超过必为跟踪点跑到背景)
+        if max(abs(dx), abs(dy)) > self._max_disp_ratio * box_size:
+            return None, None
+        new_box = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
+        return new_box, good.reshape(-1, 1, 2)
+
     def process(self, img, frame_idx):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_faces
+        # F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
+        # (YuNet 首帧可能因 DNN 后端初始化开销漏检, 普通帧间隔兜底无效)
+        cold_start = frame_idx <= 2
+        need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_faces or cold_start
         if need_detect:
-            dets = self.detector.detect(img, conf=self.conf)
+            # SCRFD 二次验证: 高conf框直接保留, 低conf框用SCRFD确认(过滤手/玩具误检)
+            if self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
+                dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf)
+                dets = self.scrfd_verifier.verify(dets_with_conf, img)
+            else:
+                dets = self.detector.detect(img, conf=self.conf)
             # 多人场景: 保留全部检测结果, 不再用单人 Tracker 过滤
             if dets:
                 faces = dets
@@ -484,24 +792,26 @@ class FaceProcessor:
             self.last_faces = faces
         elif self.prev_gray is not None and self.last_faces and self.face_pts:
             tracked, new_pts = [], {}
-            for i, (x1, y1, x2, y2) in enumerate(self.last_faces):
+            for i, box in enumerate(self.last_faces):
                 if i not in self.face_pts or len(self.face_pts[i]) < 4:
-                    tracked.append((x1, y1, x2, y2))
+                    tracked.append(box)
+                    # 跟踪点缺失/不足: 在当前框上重新初始化, 确保下一帧仍有 LK 点可用
+                    pts = self._init_pts(gray, box)
+                    if pts is not None:
+                        new_pts[i] = pts
                     continue
-                pts = self.face_pts[i]
-                npts, status, _ = cv2.calcOpticalFlowPyrLK(
-                    self.prev_gray, gray, pts, None, **self.lk)
-                good_mask = status.flatten() == 1
-                if good_mask.sum() >= 4:
-                    good = npts[good_mask].reshape(-1, 2)
-                    old_flat = pts[good_mask].reshape(-1, 2)
-                    dx = float(np.median(good[:, 0] - old_flat[:, 0]))
-                    dy = float(np.median(good[:, 1] - old_flat[:, 1]))
-                    tracked.append((int(x1 + dx), int(y1 + dy),
-                                    int(x2 + dx), int(y2 + dy)))
-                    new_pts[i] = good.reshape(-1, 1, 2)
+                # F1+F2 跟踪: forward-backward 验证 + 位移阈值兜底
+                new_box, good_pts = self._track_box(self.prev_gray, gray, box)
+                if new_box is not None:
+                    tracked.append(new_box)
+                    new_pts[i] = good_pts
                 else:
-                    tracked.append((x1, y1, x2, y2))
+                    # 跟踪跑飞或点不足: 沿用旧框, 重新初始化跟踪点
+                    # (避免跟踪点完全丢失导致后续帧无法 LK 跟踪 → 闪烁)
+                    tracked.append(box)
+                    pts = self._init_pts(gray, box)
+                    if pts is not None:
+                        new_pts[i] = pts
             self.face_pts = new_pts
             self.last_faces = tracked
         self.prev_gray = gray
@@ -713,7 +1023,8 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
 def _process_pipe(src, dst, face_on, model_dir, face_size,
                   face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                   frame_skip, fisheye, fisheye_strength, fisheye_device,
-                  fisheye_downscale, fisheye_dual, log):
+                  fisheye_downscale, fisheye_dual, log,
+                  scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -734,10 +1045,21 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     if face_model == "yolov8":
         fd = YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YOLOv8-nano (输入{face_size})")
+    elif face_model == "yolo11":
+        fd = YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
+        log(f"  [人脸] YOLOv11-nano (输入{face_size})")
     else:
         fd = YuNetFaceDetector(model_dir=model_dir, yunet_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YuNet (输入{face_size})")
-    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
+    scrfd_verifier = None
+    if scrfd_verify and face_on:
+        try:
+            scrfd_verifier = SCRFDVerifier(conf=scrfd_conf, use_gpu=use_gpu,
+                                           iou_thresh=scrfd_iou, keep_conf=scrfd_keep_conf)
+            log(f"  [人脸] SCRFD 二次验证 (conf={scrfd_conf}, iou={scrfd_iou}, keep_conf={scrfd_keep_conf})")
+        except Exception as e:
+            log(f"  [警告] SCRFD 初始化失败: {e}, 跳过二次验证")
+    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf, scrfd_verifier=scrfd_verifier) if face_on else None
 
     # 启动抽帧进程(raw BGR → stdout pipe)
     # NVDEC 硬件解码(可用时): -hwaccel cuda 让 ffmpeg 用 GPU 解码
@@ -993,7 +1315,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 def _process_files(src, dst, face_on, model_dir, face_size,
                    face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                    frame_skip, fisheye, fisheye_strength, fisheye_device,
-                   fisheye_downscale, fisheye_dual, log):
+                   fisheye_downscale, fisheye_dual, log,
+                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1023,10 +1346,21 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     if face_model == "yolov8":
         fd = YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YOLOv8-nano (输入{face_size})")
+    elif face_model == "yolo11":
+        fd = YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
+        log(f"  [人脸] YOLOv11-nano (输入{face_size})")
     else:
         fd = YuNetFaceDetector(model_dir=model_dir, yunet_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YuNet (输入{face_size})")
-    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
+    scrfd_verifier = None
+    if scrfd_verify and face_on:
+        try:
+            scrfd_verifier = SCRFDVerifier(conf=scrfd_conf, use_gpu=use_gpu,
+                                           iou_thresh=scrfd_iou, keep_conf=scrfd_keep_conf)
+            log(f"  [人脸] SCRFD 二次验证 (conf={scrfd_conf}, iou={scrfd_iou}, keep_conf={scrfd_keep_conf})")
+        except Exception as e:
+            log(f"  [警告] SCRFD 初始化失败: {e}, 跳过二次验证")
+    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf, scrfd_verifier=scrfd_verifier) if face_on else None
     total_face = 0
 
     for i, fn in enumerate(frames, 1):
@@ -1085,7 +1419,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   use_pipe=True, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
-                  fisheye_downscale=2, fisheye_dual="auto", log=print):
+                  fisheye_downscale=2, fisheye_dual="auto", log=print,
+                  scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1094,7 +1429,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  keep_tmp, force_h264, use_gpu,
                                  frame_skip, fisheye, fisheye_strength,
                                  fisheye_device, fisheye_downscale,
-                                 fisheye_dual, log)
+                                 fisheye_dual, log,
+                                 scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -1102,7 +1438,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           keep_tmp, force_h264, use_gpu,
                           frame_skip, fisheye, fisheye_strength,
                           fisheye_device, fisheye_downscale,
-                          fisheye_dual, log)
+                          fisheye_dual, log,
+                          scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf)
 
 
 def expand_inputs(inputs):
@@ -1123,8 +1460,8 @@ def main():
     ap.add_argument("--out-dir", default="masked_out", help="输出目录(默认 masked_out)")
     ap.add_argument("--face-size", type=int, default=FACE_YUNET_SIZE,
                     help="人脸检测输入尺寸(默认640; YuNet/YOLOv8 均调整为32的倍数)")
-    ap.add_argument("--face-model", default="yunet", choices=["yunet", "yolov8"],
-                    help="人脸检测模型: yunet(默认,轻量,仅opencv) / yolov8(极速,需ultralytics)")
+    ap.add_argument("--face-model", default="yunet", choices=["yunet", "yolov8", "yolo11"],
+                    help="人脸检测模型: yunet(默认,轻量,仅opencv) / yolov8(极速,需ultralytics) / yolo11(最新,需ultralytics)")
     ap.add_argument("--face-int", type=int, default=FACE_DETECT_INT,
                     help="人脸检测间隔帧数(默认5: 每5帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
     ap.add_argument("--fisheye", action="store_true",
@@ -1135,7 +1472,7 @@ def main():
                     choices=["generic", "pico4"],
                     help="鱼眼设备预置: generic(通用强鱼眼,默认) / pico4(Pico 4 RGB摄像头, 130°FOV)")
     ap.add_argument("--fisheye-downscale", type=int, default=1, metavar="N",
-                    help="鱼眼remap降采样倍数(默认1=原分辨率remap, 画质最好且误检最少(实测downscale=2大框误检+30%, 且提速仅+5%因瓶颈在检测); "
+                    help="鱼眼remap降采样倍数(默认1=原分辨率remap, 画质最好且误检最少(实测downscale=2大框误检+30%%, 且提速仅+5%%因瓶颈在检测); "
                          "2=1/2分辨率remap提速但bilinear上采样让YuNet更易误检; 3=1/3分辨率更快但可能影响小脸检出)")
     ap.add_argument("--fisheye-dual", default="auto",
                     choices=["auto", "true", "false"],
@@ -1143,6 +1480,15 @@ def main():
                          "true=强制切左右两半各自矫正; false=强制单鱼眼(兼容旧版). "
                          "Pico4双目录像(3840x1456=两个1920x1456左右拼接)必须启用(auto或true), "
                          "否则光心落在中央黑缝导致错误畸变,人脸检测率暴跌")
+    ap.add_argument("--scrfd-verify", action="store_true",
+                    help="SCRFD二次验证: YOLO检出后用SCRFD关键点模型确认, 过滤手/玩具误检 "
+                         "(需scrfd_10g_bnkps.onnx+onnxruntime; 高conf框不验证, 低conf框才验证)")
+    ap.add_argument("--scrfd-conf", type=float, default=0.3,
+                    help="SCRFD检测置信度阈值(默认0.3; 降如0.15检出更多但可能增误检)")
+    ap.add_argument("--scrfd-iou", type=float, default=0.3,
+                    help="YOLO框与SCRFD框匹配的IoU阈值(默认0.3; 降如0.2匹配更宽松)")
+    ap.add_argument("--scrfd-keep-conf", type=float, default=0.35,
+                    help="YOLO conf≥此值直接保留不验证(默认0.35; 避免SCRFD漏检误伤高置信度真脸)")
     ap.add_argument("--face-conf", type=float, default=FACE_CONF,
                     help=f"人脸置信度阈值(默认{FACE_CONF}; 降底如0.25可检出更多侧脸/遮挡, 可能增误检)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
@@ -1179,7 +1525,11 @@ def main():
                          fisheye=args.fisheye, fisheye_strength=args.fisheye_strength,
                          fisheye_device=args.fisheye_device,
                          fisheye_downscale=args.fisheye_downscale,
-                         fisheye_dual=args.fisheye_dual):
+                         fisheye_dual=args.fisheye_dual,
+                         scrfd_verify=args.scrfd_verify,
+                         scrfd_conf=args.scrfd_conf,
+                         scrfd_iou=args.scrfd_iou,
+                         scrfd_keep_conf=args.scrfd_keep_conf):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
