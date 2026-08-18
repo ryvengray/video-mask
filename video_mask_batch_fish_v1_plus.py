@@ -958,11 +958,13 @@ class FaceProcessor:
         return pts.astype(np.float32)
 
     def _track_box(self, prev_gray, gray, box):
-        """F1+F2: 对一个 box 做 LK 跟踪, 返回 (new_box, tracked_pts) 或 (None, None)。
+        """F1+F2+F3: 对一个 box 做 LK 跟踪, 返回 (new_box, tracked_pts) 或 (None, None)。
 
         F1 forward-backward 验证: 正向 LK 后再反向 LK, FB 误差大的点剔除,
         median 位移估计更稳健, 避免跟踪点跑到背景导致框瞬移漏帧。
         F2 位移阈值: dx/dy > 0.3×box_size 判定跟踪跑飞, 返回 None 回退到旧框。
+        F3 仿射变换: 用 estimateAffinePartial2D 拟合 4-DOF 变换(平移+旋转+均匀缩放),
+           替代纯平移, 解决人脸转头(旋转)和靠近/远离(缩放)时框偏移的问题。
         """
         x1, y1, x2, y2 = box
         bw, bh = x2 - x1, y2 - y1
@@ -989,13 +991,28 @@ class FaceProcessor:
             return None, None
         good = npts[good_mask].reshape(-1, 2)
         old_flat = pts[good_mask].reshape(-1, 2)
-        dx = float(np.median(good[:, 0] - old_flat[:, 0]))
-        dy = float(np.median(good[:, 1] - old_flat[:, 1]))
         # F2 位移阈值: 一帧内位移超过 30% 框宽判定跟踪跑飞, 回退旧框
         # (正常人脸一帧位移 < 10% 框宽; 30% 已是极端, 超过必为跟踪点跑到背景)
+        dx = float(np.median(good[:, 0] - old_flat[:, 0]))
+        dy = float(np.median(good[:, 1] - old_flat[:, 1]))
         if max(abs(dx), abs(dy)) > self._max_disp_ratio * box_size:
             return None, None
-        new_box = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
+        # F3 仿射变换: 4-DOF (平移+旋转+均匀缩放)
+        # estimateAffinePartial2D 需要 ≥2 点对, 用 RANSAC 剔除异常值
+        M, inliers = cv2.estimateAffinePartial2D(
+            old_flat, good, method=cv2.RANSAC,
+            ransacReprojThreshold=3.0, maxIters=5000)
+        if M is not None and inliers is not None and inliers.sum() >= 3:
+            # 将框四角做仿射变换, 得到新框
+            corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                               dtype=np.float64).reshape(-1, 1, 2)
+            tc = cv2.transform(corners, M).reshape(-1, 2)
+            nx1, ny1 = tc.min(axis=0)
+            nx2, ny2 = tc.max(axis=0)
+            new_box = (int(nx1), int(ny1), int(nx2), int(ny2))
+        else:
+            # 仿射拟合失败(点太少/退化构型), 回退纯平移
+            new_box = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
         return new_box, good.reshape(-1, 1, 2)
 
     @staticmethod
