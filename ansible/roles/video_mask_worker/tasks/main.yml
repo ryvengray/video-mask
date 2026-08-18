@@ -1,4 +1,22 @@
 ---
+- name: Validate Worker source distribution on the Ansible controller
+  ansible.builtin.stat:
+    path: "{{ video_mask_worker_source_dir | default(playbook_dir ~ '/..') }}/{{ item }}"
+  loop:
+    - cluster/worker_agent.py
+    - scripts/bootstrap_server.sh
+    - video_mask_batch_fish_v1.py
+    - pyproject.toml
+  register: video_mask_worker_source_files
+  delegate_to: localhost
+  become: false
+
+- name: Require a complete Worker source distribution
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "Worker distribution source is incomplete: {{ item.item }}"
+  loop: "{{ video_mask_worker_source_files.results }}"
+
 - name: Install Worker Python prerequisites
   ansible.builtin.apt:
     name:
@@ -6,8 +24,49 @@
       - python3-venv
       - python3-pip
       - logrotate
+      - rsync
     state: present
     update_cache: true
+
+- name: Create Worker application directory
+  ansible.builtin.file:
+    path: "{{ video_mask_app_dir }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
+
+- name: Synchronize Worker runtime source from the Ansible controller
+  ansible.posix.synchronize:
+    src: "{{ video_mask_worker_source_dir | default(playbook_dir ~ '/..') }}/"
+    dest: "{{ video_mask_app_dir }}/"
+    mode: push
+    archive: true
+    compress: true
+    delete: false
+    rsync_opts:
+      - '--exclude=.git/'
+      - '--exclude=.venv/'
+      - '--exclude=ansible/'
+      - '--exclude=tests/'
+      - '--exclude=.task_manager/'
+      - '--exclude=__pycache__/'
+      - '--exclude=*.pyc'
+      - '--exclude=.env'
+      - '--exclude=.env.*'
+      - '--exclude=*.pem'
+      - '--exclude=.DS_Store'
+  become: false
+
+- name: Remove legacy Git repository metadata from Worker
+  ansible.builtin.file:
+    path: "{{ video_mask_app_dir }}/.git"
+    state: absent
+
+- name: Remove legacy Git deploy key from Worker
+  ansible.builtin.file:
+    path: "{{ video_mask_source_deploy_key_path | default('/home/ubuntu/.ssh/video-mask-source') }}"
+    state: absent
 
 - name: Validate Worker slot count
   ansible.builtin.assert:

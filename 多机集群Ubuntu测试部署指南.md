@@ -131,7 +131,7 @@ gpu_workers:
 
 ## 4. 配置本地测试参数和 Token
 
-`terraform-host.pem` 仅用于 Ansible SSH 登录，**不能**替代 Worker 拉取私有仓库所需的 Git Deploy Key。`video_mask_source` role 会在每台目标主机用该 Deploy Key 拉取代码；先在仓库中添加只读 Deploy Key，并用 Ansible Vault 保存其私钥：
+`terraform-host.pem` 仅用于 Ansible SSH 登录。Worker 不再拉取私有仓库：运行代码由执行 Ansible 的 Controller 通过 rsync 推送，因此 Worker 不需要 GitHub Deploy Key。若需要让 Controller 自己从私有仓库更新代码，才为 Controller 保存只读 Deploy Key，并可用 Ansible Vault 管理其私钥：
 
 ```bash
 cd /home/ubuntu/video-mask/ansible

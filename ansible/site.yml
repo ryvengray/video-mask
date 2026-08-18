@@ -11,5 +11,4 @@
   become: true
   serial: 2
   roles:
-    - video_mask_source
     - video_mask_worker

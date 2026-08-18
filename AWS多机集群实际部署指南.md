@@ -19,9 +19,9 @@ S3 outputs/      <──Worker 以预签名 URL 上传── Controller 记录�
 
 - 所有节点必须使用 **Ubuntu 22.04 或 24.04**，SSH 登录用户为 `ubuntu`。当前 Ansible role 使用 `apt`、`/home/ubuntu` 和 `ubuntu` systemd 服务用户，不支持 Amazon Linux 的 `ec2-user`。
 - Controller 可以是无 GPU 的 EC2；Worker 必须是带 NVIDIA GPU 的实例。Worker 初始化会在缺少 `nvidia-smi` 时安装 Ubuntu 推荐 NVIDIA 驱动，并在需要时自动重启一次后继续；非 GPU 实例仍会明确失败。
-- 建议 Controller 和 Worker 都在私有子网。Controller 需要出站访问 GitHub、Ubuntu 软件源、AWS S3；Worker 首次部署还需访问 GitHub、Ubuntu 软件源、PyTorch/Hugging Face，运行时需访问 S3 预签名 URL。
+- 建议 Controller 和 Worker 都在私有子网。Controller 需要出站访问 GitHub、Ubuntu 软件源、AWS S3；Worker 首次部署需要访问 Ubuntu 软件源、PyTorch/Hugging Face，运行时需访问 S3 预签名 URL，不需要访问 GitHub。
 - 准备 Terraform 生成的 SSH 私钥 `terraform-host.pem`。它只保存在 Controller（运行 Ansible 的机器）或你的受控运维主机，绝不提交到仓库。
-- 准备 GitHub 仓库的**只读 Deploy Key**。它与 `terraform-host.pem` 不同，用于每台远程 Worker 拉取代码。
+- 准备 GitHub 仓库的**只读 Deploy Key**。它与 `terraform-host.pem` 不同，只用于 Controller 拉取代码；Worker 由 Controller rsync 推送运行文件，不保存此私钥。
 - 准备两个 S3 Bucket，或同一 Bucket 的两个不重叠前缀：输入 `source/inbox/`、输出 `outputs/`。
 
 ## 2. AWS 网络与 IAM
@@ -152,7 +152,7 @@ vault_video_mask_source_deploy_key: |
   -----END OPENSSH PRIVATE KEY-----
 ```
 
-生成 Token 可使用两次 `openssl rand -hex 32`。保存 Vault 密码到受控的密码管理器；不要将 Vault 密码、Git Deploy Key 私钥或 Terraform SSH 私钥填入 Git 仓库。远程 Worker 部署时，Ansible 会从 Vault 读取该私钥，并安全地复制到 Worker 的 `/home/ubuntu/.ssh/video-mask-source`，用于拉取 `video_mask_repo`。
+生成 Token 可使用两次 `openssl rand -hex 32`。保存 Vault 密码到受控的密码管理器；不要将 Vault 密码、Git Deploy Key 私钥或 Terraform SSH 私钥填入 Git 仓库。Git Deploy Key 仅保留在 Controller；远程 Worker 部署时，Ansible 从 Controller 同步运行所需的文件，不会向 Worker 复制该私钥。
 
 编辑 `ansible/group_vars/all/settings.yml`，替换为实际 S3 配置：
 
@@ -250,7 +250,7 @@ ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit worker-01 \
   --ask-vault-pass
 ```
 
-Worker role 会拉取指定 Git ref、安装 CUDA 人脸流水线依赖、在缺少驱动时安装 Ubuntu 推荐 NVIDIA 驱动并自动重启一次、校验 CUDA/ONNX Runtime、向 Controller 预注册 Worker slot，并创建和启动 `video-mask-worker@slot-1.service`。
+Worker role 会从执行 Ansible 的 Controller rsync 运行代码、安装 CUDA 人脸流水线依赖、在缺少驱动时安装 Ubuntu 推荐 NVIDIA 驱动并自动重启一次、校验 CUDA/ONNX Runtime、向 Controller 预注册 Worker slot，并创建和启动 `video-mask-worker@slot-1.service`。首次升级到此版本时，会清理旧 Worker 上的 `.git` 目录和 Deploy Key。
 
 验证：
 
@@ -322,7 +322,9 @@ sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
 sudo /home/ubuntu/video-mask/.venv/bin/python scripts/cluster_manager.py \
   restart-slot worker-01 --slot 1-15
 
-# 部署更新后的 Worker 代码并重启其所有 slot；先在 settings.yml 更新 video_mask_ref。
+# 先在 Controller 更新仓库，再将最新运行代码 rsync 到 Worker。
+git pull origin main
+# 加 --restart-slot 才会中断当前任务并重启所有 slot；仅算法 .py 改动可不加。
 bash scripts/deploy_worker.sh worker-01 --restart-slot
 
 # 若目标 EC2 已停止，先启动、等待 SSH 恢复，再部署最新代码。

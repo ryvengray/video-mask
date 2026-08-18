@@ -82,7 +82,7 @@ fi
 echo "==> 安装系统依赖"
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ffmpeg git curl pciutils python3 python3-venv python3-pip ca-certificates \
+  ffmpeg curl pciutils python3 python3-venv python3-pip ca-certificates \
   ubuntu-drivers-common util-linux
 
 if [[ "$MODE" == "auto" ]]; then

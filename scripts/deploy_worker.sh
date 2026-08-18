@@ -8,12 +8,13 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/deploy_worker.sh WORKER_HOST [WORKER_HOST ...] [--start-stopped] [--restart-slot] [--no-vault-prompt]
 
-Deploys one or more hosts defined in ansible/inventory.yml. With --restart-slot,
-restarts every configured Worker slot on each selected host after the source has
-updated. With --start-stopped, starts unreachable EC2 Workers through the
-Controller-local start script, waits for SSH, then deploys. A missing NVIDIA
-driver can cause one automatic reboot; run only after the selected Workers are
-drained/idle.
+Deploys one or more hosts defined in ansible/inventory.yml. Runtime source is
+rsynced from this Controller/Ansible machine; Workers do not clone the Git
+repository or retain its Deploy Key. With --restart-slot, restarts every
+configured Worker slot on each selected host after the source has updated.
+With --start-stopped, starts unreachable EC2 Workers through the Controller-
+local start script, waits for SSH, then deploys. A missing NVIDIA driver can
+cause one automatic reboot; run only after the selected Workers are drained/idle.
 
 Examples:
   bash scripts/deploy_worker.sh worker-01

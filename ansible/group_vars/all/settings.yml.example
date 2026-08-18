@@ -1,10 +1,15 @@
-# Every deployed machine checks out and runs source mode. Store the source
-# repository Deploy Key only in ansible-vault; never commit it in this file.
+# Only the Controller checks out source mode. Store its repository Deploy Key
+# only in ansible-vault; Worker hosts receive an rsync distribution and never
+# receive this key or repository access.
 video_mask_repo: git@github.com:ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
 video_mask_source_deploy_key_path: /home/ubuntu/.ssh/video-mask-source
 video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
+# Source directory on the machine executing Ansible (normally this Controller).
+# Worker deployment rsyncs from here and excludes .git, Ansible configuration,
+# virtualenvs, tests, and common secret-file patterns.
+video_mask_worker_source_dir: "{{ playbook_dir }}/.."
 # Use the Controller private VPC address for remote Workers. No HTTPS is
 # required on the private network; restrict TCP 8080 to the Worker security group.
 video_mask_controller_url: http://10.0.0.10:8080

@@ -108,7 +108,7 @@ if [[ $EUID -ne 0 ]] && sudo -n true; then
 fi
 sudo apt-get update
 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ansible ca-certificates curl git openssl python3 python3-pip python3-venv
+  ansible ca-certificates curl git openssl python3 python3-pip python3-venv rsync
 
 if ! getent hosts github.com >/dev/null; then
   cat >&2 <<'EOF'

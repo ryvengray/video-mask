@@ -1,13 +1,13 @@
 # 源码模式 Controller 部署指南
 
-本文用于在客户的 Controller 机器上部署视频打码集群。Controller 与 Worker 都从私有 `video-mask` 源码仓库运行；Controller 同时作为 Ansible 控制端，通过 SSH 初始化和升级 Worker。
+本文用于在客户的 Controller 机器上部署视频打码集群。Controller 从私有 `video-mask` 源码仓库运行；Controller 同时作为 Ansible 控制端，通过 SSH 将运行代码 rsync 到 Worker 并初始化、升级 Worker。Worker 不保存 Git 仓库或 GitHub Deploy Key。
 
 ## 1. 网络与机器要求
 
 - Controller：Ubuntu 24.04，建议 2 核 CPU、4 GB 内存起。
 - Worker：Ubuntu 24.04 x86_64，NVIDIA GPU Worker 建议 T4 及以上，驱动需预先由云镜像或云厂商安装。
 - Controller 和 Worker 使用私网通信；Worker 可访问 Controller 的 TCP `8080`。
-- Controller 需要能访问 GitHub，Worker 需要能访问 GitHub、PyPI、PyTorch 下载源和 Hugging Face（首次下载模型时）。
+- Controller 需要能访问 GitHub；Worker 首次部署需要访问 Ubuntu 软件源、PyPI、PyTorch 下载源和 Hugging Face（首次下载模型时），不需要访问 GitHub。
 
 Controller 私网 IP 可通过下面命令查看：
 
@@ -15,9 +15,9 @@ Controller 私网 IP 可通过下面命令查看：
 hostname -I
 ```
 
-## 2. 创建共享源码只读 Deploy Key（一次性）
+## 2. 创建 Controller 源码只读 Deploy Key（一次性）
 
-这把 Key 用于 Controller 和所有 Worker 读取私有源码仓库。它只授权 `ryvengray/video-mask`，不要勾选 GitHub 写权限。
+这把 Key 只用于 Controller 读取私有源码仓库。它只授权 `ryvengray/video-mask`，不要勾选 GitHub 写权限；Worker 不接收这把私钥。
 
 在受信任机器生成：
 
