@@ -392,6 +392,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=400, detail="file must be 'input' or 'output'")
         return url
 
+    def task_playback_filename(task: dict[str, Any], file: str) -> str:
+        key = task.get("output_object_key") if file == "output" else task.get("source_object_key")
+        filename = Path(str(key or "")).name
+        return filename or ("output.mp4" if file == "output" else "input.mp4")
+
     frame_preview_root = database.parent / "frame-previews"
     frame_preview_jobs: set[tuple[str, str, str]] = set()
     frame_preview_lock = threading.Lock()
@@ -534,6 +539,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     @app.get("/api/tasks/{task_id}/play", name="proxy_task_playback")
     def proxy_task_playback(request: Request, task_id: str, file: str = "input"):
         """Stream an S3 video through the Controller while preserving seek support."""
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
         url = task_playback_url(task_id, file)
         upstream_headers = {"User-Agent": "video-mask-controller-playback/1.0"}
         for header in ("range", "if-range"):
@@ -552,6 +560,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             value = upstream.headers.get(header)
             if value:
                 response_headers[header] = value
+        filename = task_playback_filename(task, file)
+        ascii_filename = filename.encode("ascii", "ignore").decode("ascii") or "video.mp4"
+        ascii_filename = ascii_filename.replace('"', "_").replace("\\", "_")
+        response_headers["Content-Disposition"] = (
+            f'inline; filename="{ascii_filename}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
+        )
 
         def stream_video():
             try:
