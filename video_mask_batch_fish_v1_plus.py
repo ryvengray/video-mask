@@ -60,9 +60,11 @@ FACE_INPUT = 320              # 人脸检测输入尺寸(320: 比400快约30%, �
 FACE_CONF = 0.45             # 人脸置信度阈值(0.45->0.35: 侧脸/低头/遮挡帧不漏检, 跟踪器滤误检)
 FACE_EXPAND = 0.12            # 人脸打码框外扩比例(确保盖住完整脸)
 FACE_YUNET_SIZE = 640         # 人脸检测输入尺寸(YuNet/YOLOv8 均自动调整为32的倍数, 640x640)
-FACE_DETECT_INT = 5           # 人脸检测间隔: 每5帧检测1次, 中间帧光流跟踪(默认5; 运动剧烈可改2~3)
+FACE_DETECT_INT = 1           # 已有人脸轨迹时默认逐帧检测，降低镜头移动造成的漏帧
+FACE_EMPTY_DETECT_INT = 5     # 无人场景每5帧扫描一次，避免空场景浪费推理
+FACE_BACKFILL = 5             # 双模型确认后，最多回补此前5帧的单模型候选
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
-FACE_GRACE = 3               # 单张脸允许漏掉的检测周期数(face-int=5/30fps时约0.5秒)
+FACE_GRACE = 3               # 单张脸允许漏掉的检测周期数
 FACE_BOX_SMOOTH = 0.65       # 检测框EMA中本次检测权重(越低越稳, 越高越跟手)
 # 误检几何过滤(排除手/玩具等非人脸误检, 零耗时增加)
 FACE_MIN_SIZE = 15           # 人脸框最小边长(像素), 低于视为噪点丢弃
@@ -149,6 +151,36 @@ def draw_raw_face_debug(img, raw_faces):
         color = (180, 180, 180) if not item.get("formal") else (255, 255, 0)
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(img, text, (x1, max(15, y1 - 5)), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def _interpolate_box(start_box, end_box, start_frame, end_frame, frame_idx):
+    span = max(1, end_frame - start_frame)
+    alpha = min(1.0, max(0.0, (frame_idx - start_frame) / span))
+    return tuple(int(round((1.0 - alpha) * start_box[i] + alpha * end_box[i]))
+                 for i in range(4))
+
+
+def apply_face_backfill(frame_buffer, events):
+    """在尚未编码的帧缓冲区中插值补码；返回实际补码帧次数。"""
+    applied = 0
+    for event in events:
+        for item in frame_buffer:
+            frame_idx = item["frame_idx"]
+            if not (event["start_frame"] <= frame_idx < event["end_frame"]):
+                continue
+            box = _interpolate_box(
+                event["start_box"], event["end_box"],
+                event["start_frame"], event["end_frame"], frame_idx)
+            image = _ensure_writable_frame(item["image"])
+            item["image"] = image
+            x1, y1, x2, y2 = box
+            bw, bh = x2 - x1, y2 - y1
+            heavy_mosaic(
+                image, int(x1 - FACE_EXPAND * bw), int(y1 - FACE_EXPAND * bh),
+                int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh),
+                FACE_CELLS, FACE_SIGMA)
+            applied += 1
+    return applied
 
 
 # -- 鱼眼去畸变 (无需标定, 自动估算) --
@@ -707,10 +739,10 @@ class DualFaceDetector:
         # 续上已经由双模型确认过的轨迹。
         self.last_candidates = [] if not include_single else [
             {"box": box, "scores": ((self._name_a, score), (self._name_b, None))}
-            for box, score in dets_a_all if score is None or score >= query_conf
+            for box, score in dets_a
         ] + ([
             {"box": box, "scores": ((self._name_a, None), (self._name_b, score))}
-            for box, score in dets_b_all if score is None or score >= query_conf
+            for box, score in dets_b
         ] if include_single else [])
         if not dets_a or not dets_b:
             return []
@@ -1195,11 +1227,16 @@ class FaceProcessor:
     - F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
       导致视频开头几帧没打码(YuNet DNN 后端初始化可能首帧漏检)
     """
-    def __init__(self, detector, detect_int=FACE_DETECT_INT, grace=FACE_GRACE,
+    def __init__(self, detector, detect_int=FACE_DETECT_INT,
+                 empty_detect_int=FACE_EMPTY_DETECT_INT, grace=FACE_GRACE,
                  conf=FACE_CONF, scrfd_verifier=None, dual_iou=0.2,
-                 box_smooth=FACE_BOX_SMOOTH, track_iou=0.2, track_dist=1.5):
+                 box_smooth=FACE_BOX_SMOOTH, track_iou=0.2, track_dist=1.5,
+                 backfill_frames=FACE_BACKFILL):
         self.detector = detector
         self.detect_int = max(1, detect_int)
+        self.empty_detect_int = max(1, empty_detect_int)
+        self.backfill_frames = (max(0, int(backfill_frames))
+                                if isinstance(detector, DualFaceDetector) else 0)
         self.conf = conf
         self.grace = max(0, int(grace))  # 单条轨迹允许漏掉的检测周期数
         self.box_smooth = min(1.0, max(0.05, float(box_smooth)))
@@ -1210,6 +1247,8 @@ class FaceProcessor:
         self.last_faces = []
         self.last_debug_faces = []
         self.last_raw_debug_faces = []
+        self.last_backfill_events = []
+        self._pending_single = []
         self.prev_gray = None
         self._force_detect = False
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
@@ -1530,30 +1569,103 @@ class FaceProcessor:
                 return True
         return False
 
+    @staticmethod
+    def _backfill_match_score(old_box, new_box):
+        """返回候选框中心距离/框尺寸；值越小越可能是同一张脸。"""
+        ocx, ocy = FaceProcessor._center(old_box)
+        ncx, ncy = FaceProcessor._center(new_box)
+        size = max(old_box[2] - old_box[0], old_box[3] - old_box[1],
+                   new_box[2] - new_box[0], new_box[3] - new_box[1], 1)
+        return ((ocx - ncx) ** 2 + (ocy - ncy) ** 2) ** 0.5 / size
+
+    def _update_backfill_candidates(self, frame_idx, confirmed, candidates):
+        """单模型候选先暂存；后续双模型确认后产生向前补码事件。"""
+        self.last_backfill_events = []
+        if self.backfill_frames <= 0:
+            self._pending_single = []
+            return
+        first_frame = frame_idx - self.backfill_frames
+        self._pending_single = [
+            item for item in self._pending_single
+            if item["frame_idx"] >= first_frame]
+
+        consumed = set()
+        for confirmed_item in confirmed:
+            end_box = confirmed_item["box"]
+            matches = []
+            for index, pending in enumerate(self._pending_single):
+                score = self._backfill_match_score(pending["box"], end_box)
+                # 最多允许约2.5个脸框的位移，覆盖短时镜头平移；仍限制空间邻近，
+                # 避免把画面另一侧的单模型误检回补成马赛克。
+                if score <= 2.5:
+                    matches.append((pending["frame_idx"], score, index, pending))
+            if not matches:
+                continue
+            # 优先从最早的相容候选开始回补；同帧则选择距离最近者。
+            _, _, index, start = min(matches, key=lambda item: (item[0], item[1]))
+            if start["frame_idx"] < frame_idx:
+                self.last_backfill_events.append({
+                    "start_frame": start["frame_idx"],
+                    "start_box": start["box"],
+                    "end_frame": frame_idx,
+                    "end_box": end_box,
+                })
+            for other_index, pending in enumerate(self._pending_single):
+                if (pending["frame_idx"] >= start["frame_idx"]
+                        and self._backfill_match_score(pending["box"], end_box) <= 2.5):
+                    consumed.add(other_index)
+        if consumed:
+            self._pending_single = [
+                item for index, item in enumerate(self._pending_single)
+                if index not in consumed]
+
+        added = False
+        for item in candidates:
+            box = item["box"]
+            if any(self._iou(box, confirmed_item["box"]) >= self.dual_iou
+                   for confirmed_item in confirmed):
+                continue
+            # 已有轨迹可直接用 S 续轨的候选不需要回补，避免重复事件。
+            if self._candidate_matches_existing_track(box):
+                continue
+            self._pending_single.append({
+                "frame_idx": frame_idx,
+                "box": tuple(box),
+                "scores": item.get("scores"),
+            })
+            added = True
+        # 单模型已经看到疑似人脸时，下一帧立即复检，而不是继续等待空场景间隔。
+        if added:
+            self._force_detect = True
+
     def process(self, img, frame_idx, raw_debug=False):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         self._track_all(gray)
         self.last_raw_debug_faces = []
+        self.last_backfill_events = []
         # F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
         # (YuNet 首帧可能因 DNN 后端初始化开销漏检, 普通帧间隔兜底无效)
         cold_start = frame_idx <= 2
-        # 空场景也遵守检测间隔。旧逻辑在没有活动轨迹时每帧推理，导致无人片段
-        # 反而成为最慢路径；现在最多等待 detect_int 帧重新扫描新入镜人脸。
-        # 前两帧仍强制检测，保留模型冷启动保护。
-        need_detect = ((frame_idx - 1) % self.detect_int == 0) or cold_start or self._force_detect
+        # 有轨迹时默认逐帧检测；无轨迹时降低扫描频率。跟踪失败会设置
+        # _force_detect，当前帧立即重检，不会误入无人场景等待周期。
+        interval = self.detect_int if self.tracks else self.empty_detect_int
+        need_detect = ((frame_idx - 1) % interval == 0) or cold_start or self._force_detect
         if need_detect:
             self._force_detect = False
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
             if isinstance(self.detector, DualFaceDetector):
                 dual_dets = self.detector.detect_with_scores(
                     img, conf=self.conf, iou_thresh=self.dual_iou,
-                    include_single=bool(self.tracks) or raw_debug,
+                    include_single=(bool(self.tracks) or raw_debug
+                                    or self.backfill_frames > 0),
                     raw_conf=self.conf / 2.0 if raw_debug else None)
                 self.last_raw_debug_faces = list(self.detector.last_raw_candidates) if raw_debug else []
                 dets = [item["box"] for item in dual_dets]
                 debug_scores = [item["scores"] for item in dual_dets]
                 allow_new = [True] * len(dets)
                 debug_sources = ["D"] * len(dets)
+                self._update_backfill_candidates(
+                    frame_idx, dual_dets, self.detector.last_candidates)
                 # 新人脸必须双模型共识；已确认人脸遇到运动模糊时，
                 # 允许 YOLO/SCRFD 任一模型续轨。这些框 allow_new=False，
                 # 因此不会把单模型误检建成新马赛克。
@@ -1885,14 +1997,15 @@ def _create_scrfd_verifier(enabled, face_model, model_dir, face_size, use_gpu,
 
 
 def _process_pipe(src, dst, face_on, model_dir, face_size,
-                  face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
+                  face_int, face_empty_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                   frame_skip, fisheye, fisheye_strength, fisheye_device,
                   fisheye_downscale, fisheye_dual, fisheye_crop, log,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                   scrfd_nms=0.4, scrfd_gpu_id=0,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
-                  scrfd_landmark_filter=True, debug=False, raw_debug=False):
+                  scrfd_landmark_filter=True, debug=False, raw_debug=False,
+                  face_backfill=FACE_BACKFILL):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -1939,12 +2052,18 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
-    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf,
+    face_proc = FaceProcessor(fd, detect_int=face_int,
+                              empty_detect_int=face_empty_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
-                              grace=face_grace, box_smooth=face_smooth) if face_on else None
+                              grace=face_grace, box_smooth=face_smooth,
+                              backfill_frames=face_backfill) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
-            f"(grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
+            f"(有人检测间隔={face_proc.detect_int}, "
+            f"无人扫描间隔={face_proc.empty_detect_int}, "
+            f"向前补码={face_proc.backfill_frames}帧, "
+            f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
+    backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
 
     # 启动抽帧进程(raw BGR → stdout pipe)
     # NVDEC 硬件解码(可用时): -hwaccel cuda 让 ffmpeg 用 GPU 解码
@@ -2114,6 +2233,21 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     total_face = 0
     encoder_finished_early = False
     _PIPE_TIMEOUT = 5  # 秒, 队列超时阈值
+    frame_buffer = []
+
+    def _enqueue_image(image):
+        nonlocal encoder_finished_early
+        try:
+            write_q.put(memoryview(image), timeout=_PIPE_TIMEOUT)
+            return True
+        except queue.Full:
+            if writer_done.is_set():
+                log("  [警告] 编码器提前结束(音频短于视频, -shortest 触发), "
+                    "输出已生成, 走完整性检查")
+                encoder_finished_early = True
+                return False
+            raise
+
     try:
         while True:
             try:
@@ -2152,26 +2286,32 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                                  int(y2 + FACE_EXPAND * bh),
                                  FACE_CELLS, FACE_SIGMA)
                 if debug:
-                    draw_face_debug_scores(img, face_proc.last_debug_faces)
-                    if raw_debug:
+                    if raw_debug and face_proc.last_raw_debug_faces:
+                        # 原始候选可能没有进入打码，此时 pipe 帧仍是只读视图。
+                        img = _ensure_writable_frame(img)
                         draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
+                    draw_face_debug_scores(img, face_proc.last_debug_faces)
                 total_face += len(faces)
 
-            # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
-            # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
-            try:
-                write_q.put(memoryview(img), timeout=_PIPE_TIMEOUT)
-            except queue.Full:
-                if writer_done.is_set():
-                    log("  [警告] 编码器提前结束(音频短于视频, -shortest 触发), "
-                        "输出已生成, 走完整性检查")
-                    encoder_finished_early = True
+            # 延迟若干帧再编码，使后续双模型确认能回改此前单模型候选帧。
+            # face_backfill=0 时仍然即时零拷贝写入。
+            frame_buffer.append({"frame_idx": frame_idx, "image": img})
+            if face_on and face_proc.last_backfill_events:
+                total_face += apply_face_backfill(
+                    frame_buffer, face_proc.last_backfill_events)
+            if len(frame_buffer) > backfill_buffer_size:
+                oldest = frame_buffer.pop(0)
+                if not _enqueue_image(oldest["image"]):
                     break
-                raise  # 队列阻塞且 writer 未退出, 疑似死锁, 抛出便于诊断
 
             if frame_idx % 50 == 0:
                 log(f"    [{frame_idx}] 人脸={len(faces)} "
                     f"elapsed={time.time()-t0:.0f}s")
+        if not encoder_finished_early:
+            for item in frame_buffer:
+                if not _enqueue_image(item["image"]):
+                    break
+            frame_buffer.clear()
     except BrokenPipeError:
         log("  [警告] 管道中断")
     finally:
@@ -2229,14 +2369,15 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 
 
 def _process_files(src, dst, face_on, model_dir, face_size,
-                   face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
+                   face_int, face_empty_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
                    frame_skip, fisheye, fisheye_strength, fisheye_device,
                    fisheye_downscale, fisheye_dual, fisheye_crop, log,
                    scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                    dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                    scrfd_nms=0.4, scrfd_gpu_id=0,
                    face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
-                   scrfd_landmark_filter=True, debug=False, raw_debug=False):
+                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
+                   face_backfill=FACE_BACKFILL):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -2290,13 +2431,20 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
-    face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf,
+    face_proc = FaceProcessor(fd, detect_int=face_int,
+                              empty_detect_int=face_empty_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
-                              grace=face_grace, box_smooth=face_smooth) if face_on else None
+                              grace=face_grace, box_smooth=face_smooth,
+                              backfill_frames=face_backfill) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
-            f"(grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
+            f"(有人检测间隔={face_proc.detect_int}, "
+            f"无人扫描间隔={face_proc.empty_detect_int}, "
+            f"向前补码={face_proc.backfill_frames}帧, "
+            f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
+    backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
     total_face = 0
+    frame_buffer = []
 
     for i, fn in enumerate(frames, 1):
         img = cv2.imread(os.path.join(fin, fn))
@@ -2317,13 +2465,26 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                 ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
                 heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
             if debug:
-                draw_face_debug_scores(img, face_proc.last_debug_faces)
                 if raw_debug:
                     draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
+                draw_face_debug_scores(img, face_proc.last_debug_faces)
             total_face += len(faces)
-        cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+        frame_buffer.append({"frame_idx": i, "image": img, "filename": fn})
+        if face_on and face_proc.last_backfill_events:
+            total_face += apply_face_backfill(
+                frame_buffer, face_proc.last_backfill_events)
+        if len(frame_buffer) > backfill_buffer_size:
+            oldest = frame_buffer.pop(0)
+            cv2.imwrite(
+                os.path.join(fout, oldest["filename"]), oldest["image"],
+                [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
             log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} elapsed={time.time()-t0:.0f}s")
+
+    for item in frame_buffer:
+        cv2.imwrite(
+            os.path.join(fout, item["filename"]), item["image"],
+            [cv2.IMWRITE_JPEG_QUALITY, 100])
 
     log("  合成视频...")
     hw = find_hw_encoder(family="h264" if force_h264 else "hevc")
@@ -2365,12 +2526,14 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                   scrfd_nms=0.4, scrfd_gpu_id=0,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
-                  scrfd_landmark_filter=True, debug=False, raw_debug=False):
+                  scrfd_landmark_filter=True, debug=False, raw_debug=False,
+                  face_empty_int=FACE_EMPTY_DETECT_INT,
+                  face_backfill=FACE_BACKFILL):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
             return _process_pipe(src, dst, face_on, model_dir, face_size,
-                                 face_int, face_conf, face_model,
+                                 face_int, face_empty_int, face_conf, face_model,
                                  keep_tmp, force_h264, use_gpu,
                                  frame_skip, fisheye, fisheye_strength,
                                  fisheye_device, fisheye_downscale,
@@ -2379,11 +2542,12 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  dual_iou, scrfd_model, scrfd_device,
                                  scrfd_nms, scrfd_gpu_id,
                                  face_grace, face_smooth,
-                                 scrfd_landmark_filter, debug, raw_debug)
+                                 scrfd_landmark_filter, debug, raw_debug,
+                                 face_backfill)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
-                          face_int, face_conf, face_model,
+                          face_int, face_empty_int, face_conf, face_model,
                           keep_tmp, force_h264, use_gpu,
                           frame_skip, fisheye, fisheye_strength,
                           fisheye_device, fisheye_downscale,
@@ -2392,7 +2556,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           dual_iou, scrfd_model, scrfd_device,
                           scrfd_nms, scrfd_gpu_id,
                           face_grace, face_smooth,
-                          scrfd_landmark_filter, debug, raw_debug)
+                          scrfd_landmark_filter, debug, raw_debug,
+                          face_backfill)
 
 
 def expand_inputs(inputs):
@@ -2424,7 +2589,14 @@ def main():
                     help="双模型共识 IoU 阈值(默认0.2; 仅--face-model 含+号时生效; "
                          "越高越严格,越低越宽容)")
     ap.add_argument("--face-int", type=int, default=FACE_DETECT_INT,
-                    help="人脸检测间隔帧数(默认5: 每5帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
+                    help=f"已有人脸轨迹时的检测间隔(默认{FACE_DETECT_INT}=逐帧检测; "
+                         "调大可提速，但镜头移动时更容易漏帧)")
+    ap.add_argument("--face-empty-int", type=int, default=FACE_EMPTY_DETECT_INT,
+                    help=f"无人脸轨迹时的扫描间隔(默认{FACE_EMPTY_DETECT_INT}; "
+                         "只影响空场景，新人脸最迟等待该帧数被发现)")
+    ap.add_argument("--face-backfill", type=int, default=FACE_BACKFILL,
+                    help=f"双模型确认后向前补码的最大帧数(默认{FACE_BACKFILL}; "
+                         "单模型候选不会直接打码，0=关闭)")
     ap.add_argument("--face-grace", type=int, default=FACE_GRACE,
                     help=f"单张脸漏检保活周期数(默认{FACE_GRACE}; 每周期=--face-int帧; "
                          "增大更不易闪, 但人脸离场后框保留更久)")
@@ -2491,6 +2663,11 @@ def main():
     ap.add_argument("--keep-tmp", action="store_true", help="保留中间帧")
     args = ap.parse_args()
 
+    if args.face_int < 1 or args.face_empty_int < 1:
+        ap.error("--face-int 和 --face-empty-int 必须 >= 1")
+    if args.face_backfill < 0:
+        ap.error("--face-backfill 必须 >= 0")
+
     files = expand_inputs(args.inputs)
     if not files:
         print("[错误] 未找到任何视频文件")
@@ -2505,6 +2682,8 @@ def main():
         if process_video(src, dst, face_on=not args.no_face,
                          model_dir=args.model_dir,
                          face_size=args.face_size, face_int=args.face_int,
+                         face_empty_int=args.face_empty_int,
+                         face_backfill=args.face_backfill,
                          face_conf=args.face_conf, face_model=args.face_model,
                          use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
                          force_h264=args.force_h264, use_gpu=not args.no_gpu,
