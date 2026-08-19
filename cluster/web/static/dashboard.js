@@ -76,6 +76,8 @@ if (s3IngestControl) {
 const manualTaskControl = document.getElementById('manual-task-control');
 if (manualTaskControl?.dataset.s3Configured === 'true') {
   const manualTaskForm = document.getElementById('manual-task-form');
+  const manualTaskOpen = document.getElementById('manual-task-open');
+  const manualTaskDetails = document.getElementById('manual-task-details');
   const manualTaskFile = document.getElementById('manual-task-file');
   const manualTaskAlgorithm = document.getElementById('manual-task-algorithm');
   const manualTaskArguments = document.getElementById('manual-task-arguments');
@@ -94,6 +96,11 @@ if (manualTaskControl?.dataset.s3Configured === 'true') {
       control.disabled = busy;
     });
   }
+
+  manualTaskOpen.addEventListener('click', () => {
+    manualTaskDetails.hidden = false;
+    manualTaskFile.focus();
+  });
 
   manualTaskForm.addEventListener('submit', event => {
     event.preventDefault();
@@ -251,6 +258,7 @@ if (faceReviewControl) {
   }
 
   const claimButton = document.getElementById('face-review-claim');
+  const reviewDetails = document.getElementById('face-review-details');
   const activeBadge = document.getElementById('face-review-active');
   const message = document.getElementById('face-review-message');
   const player = document.getElementById('face-review-player');
@@ -396,6 +404,7 @@ if (faceReviewControl) {
     frames.replaceChildren();
     framesMessage.textContent = 'Preparing low-resolution frame previews…';
     player.hidden = true;
+    reviewDetails.hidden = true;
     activeFaceReview = null;
     activeBadge.className = 'badge muted';
     activeBadge.textContent = 'No active review';
@@ -484,11 +493,12 @@ if (faceReviewControl) {
         method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
       });
       if (!payload.task) {
-        setReviewMessage('No unlabelled completed videos are available right now.');
+        window.alert('No unlabelled completed videos are available right now.');
         setReviewControls();
         return;
       }
       activeFaceReview = {...payload.task, playback_url: payload.playback_url};
+      reviewDetails.hidden = false;
       player.hidden = false;
       activeBadge.className = 'badge active';
       activeBadge.textContent = 'Review in progress';
@@ -502,7 +512,7 @@ if (faceReviewControl) {
       showFaceReviewTab('video');
       refreshFaceReviewStatuses();
     } catch (error) {
-      setReviewMessage(error instanceof Error ? error.message : 'Unable to claim a video.');
+      window.alert(error instanceof Error ? error.message : 'Unable to claim a video.');
       setReviewControls();
     }
   }
