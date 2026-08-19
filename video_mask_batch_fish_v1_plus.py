@@ -60,9 +60,10 @@ FACE_INPUT = 320              # 人脸检测输入尺寸(320: 比400快约30%, �
 FACE_CONF = 0.45             # 人脸置信度阈值(0.45->0.35: 侧脸/低头/遮挡帧不漏检, 跟踪器滤误检)
 FACE_EXPAND = 0.12            # 人脸打码框外扩比例(确保盖住完整脸)
 FACE_YUNET_SIZE = 640         # 人脸检测输入尺寸(YuNet/YOLOv8 均自动调整为32的倍数, 640x640)
-FACE_DETECT_INT = 1           # 已有人脸轨迹时默认逐帧检测，降低镜头移动造成的漏帧
+FACE_DETECT_INT = 5           # 常态每5帧检测一次；变化期临时逐帧检测
 FACE_EMPTY_DETECT_INT = 5     # 无人场景每5帧扫描一次，避免空场景浪费推理
 FACE_BACKFILL = 5             # 双模型确认后，最多回补此前5帧的单模型候选
+FACE_BURST = 5                # 检测人数变化后，接下来5帧逐帧检测
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
 FACE_GRACE = 3               # 单张脸允许漏掉的检测周期数
 FACE_BOX_SMOOTH = 0.65       # 检测框EMA中本次检测权重(越低越稳, 越高越跟手)
@@ -1231,12 +1232,13 @@ class FaceProcessor:
                  empty_detect_int=FACE_EMPTY_DETECT_INT, grace=FACE_GRACE,
                  conf=FACE_CONF, scrfd_verifier=None, dual_iou=0.2,
                  box_smooth=FACE_BOX_SMOOTH, track_iou=0.2, track_dist=1.5,
-                 backfill_frames=FACE_BACKFILL):
+                 backfill_frames=FACE_BACKFILL, burst_frames=FACE_BURST):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.empty_detect_int = max(1, empty_detect_int)
         self.backfill_frames = (max(0, int(backfill_frames))
                                 if isinstance(detector, DualFaceDetector) else 0)
+        self.burst_frames = max(0, int(burst_frames))
         self.conf = conf
         self.grace = max(0, int(grace))  # 单条轨迹允许漏掉的检测周期数
         self.box_smooth = min(1.0, max(0.05, float(box_smooth)))
@@ -1249,6 +1251,8 @@ class FaceProcessor:
         self.last_raw_debug_faces = []
         self.last_backfill_events = []
         self._pending_single = []
+        self._last_detection_count = None
+        self._burst_remaining = 0
         self.prev_gray = None
         self._force_detect = False
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
@@ -1649,9 +1653,13 @@ class FaceProcessor:
         # 有轨迹时默认逐帧检测；无轨迹时降低扫描频率。跟踪失败会设置
         # _force_detect，当前帧立即重检，不会误入无人场景等待周期。
         interval = self.detect_int if self.tracks else self.empty_detect_int
-        need_detect = ((frame_idx - 1) % interval == 0) or cold_start or self._force_detect
+        need_detect = (((frame_idx - 1) % interval == 0)
+                       or cold_start or self._force_detect
+                       or self._burst_remaining > 0)
         if need_detect:
             self._force_detect = False
+            if self._burst_remaining > 0:
+                self._burst_remaining -= 1
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
             if isinstance(self.detector, DualFaceDetector):
                 dual_dets = self.detector.detect_with_scores(
@@ -1666,6 +1674,7 @@ class FaceProcessor:
                 debug_sources = ["D"] * len(dets)
                 self._update_backfill_candidates(
                     frame_idx, dual_dets, self.detector.last_candidates)
+                detection_count = len(dual_dets)
                 # 新人脸必须双模型共识；已确认人脸遇到运动模糊时，
                 # 允许 YOLO/SCRFD 任一模型续轨。这些框 allow_new=False，
                 # 因此不会把单模型误检建成新马赛克。
@@ -1684,17 +1693,24 @@ class FaceProcessor:
             elif self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
                 dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf)
                 dets = self.scrfd_verifier.verify(dets_with_conf, img)
+                detection_count = len(dets)
                 debug_scores = None
                 allow_new = debug_sources = None
                 self.last_raw_debug_faces = []
             else:
                 dets = self.detector.detect(img, conf=self.conf)
+                detection_count = len(dets)
                 debug_scores = None
                 allow_new = debug_sources = None
                 self.last_raw_debug_faces = []
             self._update_tracks(
                 dets, gray, debug_scores,
                 allow_new=allow_new, debug_sources=debug_sources)
+            if (self._last_detection_count is not None
+                    and detection_count != self._last_detection_count
+                    and self._burst_remaining == 0):
+                self._burst_remaining = self.burst_frames
+            self._last_detection_count = detection_count
         self.last_faces = [
             track["box"] for track in self.tracks if track.get("visible", True)]
         self.last_debug_faces = [
@@ -2005,7 +2021,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   scrfd_nms=0.4, scrfd_gpu_id=0,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
-                  face_backfill=FACE_BACKFILL):
+                  face_backfill=FACE_BACKFILL, face_burst=FACE_BURST):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -2056,12 +2072,14 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                               empty_detect_int=face_empty_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
                               grace=face_grace, box_smooth=face_smooth,
-                              backfill_frames=face_backfill) if face_on else None
+                              backfill_frames=face_backfill,
+                              burst_frames=face_burst) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
             f"(有人检测间隔={face_proc.detect_int}, "
             f"无人扫描间隔={face_proc.empty_detect_int}, "
             f"向前补码={face_proc.backfill_frames}帧, "
+            f"变化突检={face_proc.burst_frames}帧, "
             f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
     backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
 
@@ -2377,7 +2395,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    scrfd_nms=0.4, scrfd_gpu_id=0,
                    face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                    scrfd_landmark_filter=True, debug=False, raw_debug=False,
-                   face_backfill=FACE_BACKFILL):
+                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -2435,12 +2453,14 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                               empty_detect_int=face_empty_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
                               grace=face_grace, box_smooth=face_smooth,
-                              backfill_frames=face_backfill) if face_on else None
+                              backfill_frames=face_backfill,
+                              burst_frames=face_burst) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
             f"(有人检测间隔={face_proc.detect_int}, "
             f"无人扫描间隔={face_proc.empty_detect_int}, "
             f"向前补码={face_proc.backfill_frames}帧, "
+            f"变化突检={face_proc.burst_frames}帧, "
             f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
     backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
     total_face = 0
@@ -2528,7 +2548,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
                   face_empty_int=FACE_EMPTY_DETECT_INT,
-                  face_backfill=FACE_BACKFILL):
+                  face_backfill=FACE_BACKFILL, face_burst=FACE_BURST):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -2543,7 +2563,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  scrfd_nms, scrfd_gpu_id,
                                  face_grace, face_smooth,
                                  scrfd_landmark_filter, debug, raw_debug,
-                                 face_backfill)
+                                 face_backfill, face_burst)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -2557,7 +2577,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           scrfd_nms, scrfd_gpu_id,
                           face_grace, face_smooth,
                           scrfd_landmark_filter, debug, raw_debug,
-                          face_backfill)
+                          face_backfill, face_burst)
 
 
 def expand_inputs(inputs):
@@ -2589,14 +2609,16 @@ def main():
                     help="双模型共识 IoU 阈值(默认0.2; 仅--face-model 含+号时生效; "
                          "越高越严格,越低越宽容)")
     ap.add_argument("--face-int", type=int, default=FACE_DETECT_INT,
-                    help=f"已有人脸轨迹时的检测间隔(默认{FACE_DETECT_INT}=逐帧检测; "
-                         "调大可提速，但镜头移动时更容易漏帧)")
+                    help=f"常态人脸检测间隔(默认{FACE_DETECT_INT}; "
+                         "变化期由 --face-burst 临时逐帧检测)")
     ap.add_argument("--face-empty-int", type=int, default=FACE_EMPTY_DETECT_INT,
                     help=f"无人脸轨迹时的扫描间隔(默认{FACE_EMPTY_DETECT_INT}; "
                          "只影响空场景，新人脸最迟等待该帧数被发现)")
     ap.add_argument("--face-backfill", type=int, default=FACE_BACKFILL,
                     help=f"双模型确认后向前补码的最大帧数(默认{FACE_BACKFILL}; "
                          "单模型候选不会直接打码，0=关闭)")
+    ap.add_argument("--face-burst", type=int, default=FACE_BURST,
+                    help=f"检测到人脸数量变化后逐帧复检的帧数(默认{FACE_BURST}; 0=关闭)")
     ap.add_argument("--face-grace", type=int, default=FACE_GRACE,
                     help=f"单张脸漏检保活周期数(默认{FACE_GRACE}; 每周期=--face-int帧; "
                          "增大更不易闪, 但人脸离场后框保留更久)")
@@ -2667,6 +2689,8 @@ def main():
         ap.error("--face-int 和 --face-empty-int 必须 >= 1")
     if args.face_backfill < 0:
         ap.error("--face-backfill 必须 >= 0")
+    if args.face_burst < 0:
+        ap.error("--face-burst 必须 >= 0")
 
     files = expand_inputs(args.inputs)
     if not files:
@@ -2684,6 +2708,7 @@ def main():
                          face_size=args.face_size, face_int=args.face_int,
                          face_empty_int=args.face_empty_int,
                          face_backfill=args.face_backfill,
+                         face_burst=args.face_burst,
                          face_conf=args.face_conf, face_model=args.face_model,
                          use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
                          force_h264=args.force_h264, use_gpu=not args.no_gpu,
