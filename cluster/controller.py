@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("Install cluster requirements: pip install -r requirements-cluster.txt") from exc
 
 from cluster.store import ClusterStore
-from cluster.local_ingest import LocalIngestor
+from cluster.local_ingest import DEFAULT_ALGORITHM, DEFAULT_ARGS, VIDEO_SUFFIXES, LocalIngestor
 from cluster.s3_ingest import S3Ingestor
 
 
@@ -52,6 +53,8 @@ TASK_FILTER_STATUSES = (
 )
 FACE_REVIEW_LEASE_SECONDS = 300
 FACE_ANNOTATION_FILTERS = ("has_face", "no_face", "unlabelled")
+MANUAL_SOURCE_PREFIX = "test/manual"
+MANUAL_UPLOAD_MAX_BYTES = 20 * 1024 * 1024 * 1024
 FRAME_PREVIEW_HEIGHT = 240
 FRAME_PREVIEW_PER_MINUTE = 2
 FRAME_PREVIEW_MAX_IMAGES = 24
@@ -152,13 +155,8 @@ class TaskRequest(BaseModel):
     source_size_bytes: int | None = None
     source_sha256: str | None = None
     source_duration_seconds: float | None = None
-    algorithm: str = "video_mask_batch_fish_v1.py"
-    arguments: list[str] = Field(default_factory=lambda: [
-        "--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
-        "--face-int", "5", "--face-conf", "0.4", "--frame-skip", "1",
-        "--face-model", "yolov8+yolo11", "--dual-iou", "0.4",
-        "--fisheye-crop", "0.8",
-    ])
+    algorithm: str = DEFAULT_ALGORITHM
+    arguments: list[str] = Field(default_factory=lambda: list(DEFAULT_ARGS))
     output_object_key: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=20)
 
@@ -649,6 +647,98 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=409, detail="only active tasks can be cancelled here")
         return store.cancel_task(task_id)
 
+    @app.put("/api/dashboard/manual-tasks")
+    async def create_dashboard_manual_task(
+        request: Request,
+        filename: str = Header(alias="X-Video-Mask-Filename"),
+        algorithm: str = Header(alias="X-Video-Mask-Algorithm"),
+        arguments: str = Header(alias="X-Video-Mask-Arguments"),
+    ) -> dict[str, Any]:
+        """Upload a dashboard-selected source video and queue it immediately.
+
+        The dashboard is protected by the outer Nginx authentication.  Keeping
+        the upload on this same route avoids exposing an S3 upload URL and its
+        CORS requirements to the browser.
+        """
+        if not s3_ingestor:
+            raise HTTPException(status_code=409, detail="manual upload requires S3 storage")
+        filename = Path(filename.replace("\\", "/")).name
+        if not filename or Path(filename).suffix.lower() not in VIDEO_SUFFIXES:
+            raise HTTPException(status_code=400, detail="choose a supported video file")
+        selected_algorithm = algorithm.strip()
+        if (not selected_algorithm or len(selected_algorithm) > 255
+                or Path(selected_algorithm).name != selected_algorithm):
+            raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
+        try:
+            selected_arguments = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of strings") from exc
+        if (not isinstance(selected_arguments, list) or len(selected_arguments) > 128
+                or not all(isinstance(value, str) and len(value) <= 4096 for value in selected_arguments)):
+            raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of at most 128 strings")
+        source_key = f"{MANUAL_SOURCE_PREFIX}/{uuid.uuid4().hex}_{filename}"
+        upload_root = database.parent / "manual-uploads"
+        upload_root.mkdir(parents=True, exist_ok=True)
+        temporary_source = upload_root / f"{uuid.uuid4().hex}.upload"
+        source_size_bytes = 0
+        try:
+            with temporary_source.open("xb") as handle:
+                async for block in request.stream():
+                    source_size_bytes += len(block)
+                    if source_size_bytes > MANUAL_UPLOAD_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="uploaded file exceeds the 20 GiB limit")
+                    handle.write(block)
+        except HTTPException:
+            temporary_source.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            temporary_source.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="unable to receive uploaded file") from exc
+        if not source_size_bytes:
+            temporary_source.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="uploaded file is empty")
+
+        content_type = request.headers.get("content-type", "")
+        extra_args = {"ContentType": content_type} if content_type else None
+        try:
+            await asyncio.to_thread(
+                s3_ingestor.source_client.upload_file,
+                str(temporary_source),
+                s3_ingestor.source_bucket,
+                source_key,
+                ExtraArgs=extra_args,
+            )
+        except Exception as exc:
+            logger.exception("Dashboard manual source upload failed for %s", filename)
+            raise HTTPException(status_code=502, detail="unable to upload the source video to S3") from exc
+        finally:
+            temporary_source.unlink(missing_ok=True)
+
+        try:
+            task = store.create_task({
+                "source_url": f"s3://{s3_ingestor.source_bucket}/{source_key}",
+                "source_object_key": source_key,
+                "source_size_bytes": source_size_bytes,
+                "algorithm": selected_algorithm,
+                "arguments": selected_arguments,
+                "output_object_key": s3_ingestor.output_key(source_key),
+            })
+        except Exception as exc:
+            # The source object is unique to this failed request; remove it so
+            # it cannot become an untracked charge or later be picked up by a scan.
+            try:
+                await asyncio.to_thread(
+                    s3_ingestor.source_client.delete_object,
+                    Bucket=s3_ingestor.source_bucket,
+                    Key=source_key,
+                )
+            except Exception:
+                logger.exception("Unable to remove failed manual upload %s", source_key)
+            if isinstance(exc, (ValueError, sqlite3.IntegrityError)):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+        return {"task": task, "source_object_key": source_key}
+
     @app.get("/api/dashboard/tasks/{task_id}/logs")
     def dashboard_task_logs(task_id: str, limit: int = 1000) -> dict[str, Any]:
         if store.task(task_id) is None:
@@ -958,6 +1048,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "status_tones": STATUS_TONES,
                 "s3_ingest_configured": bool(s3_ingestor),
                 "s3_ingest_enabled": s3_ingest_is_enabled(),
+                "manual_task_default_algorithm": DEFAULT_ALGORITHM,
+                "manual_task_default_arguments": DEFAULT_ARGS,
                 "processing_statistics": processing_statistics,
                 "statistics_range_hours": round((stats_end - stats_start) / 3600),
                 "statistics_start_input": datetime_local(stats_start),

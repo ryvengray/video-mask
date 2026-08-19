@@ -20,6 +20,7 @@ video_mask_nginx_enabled: false
 video_mask_nginx_server_name: _
 video_mask_nginx_basic_auth_user: admin
 video_mask_nginx_basic_auth_password: "{{ vault_video_mask_nginx_basic_auth_password }}"
+video_mask_dashboard_upload_max_size: 20g
 # Per physical Worker machine. Each slot is a separate Worker identity and
 # processes one task at a time. Start with 2; benchmark before increasing.
 video_mask_worker_slots: 1

@@ -1,4 +1,4 @@
-console.info('[video-mask] dashboard.js loaded (video-preview build 2026-08-17e, no token prompt)');
+console.info('[video-mask] dashboard.js loaded (manual-upload build 2026-08-19a, no token prompt)');
 const tabs = document.querySelectorAll('.tab');
 const panels = {
   tasks: document.getElementById('panel-tasks'),
@@ -71,6 +71,83 @@ if (s3IngestControl) {
       }
     });
   }
+}
+
+const manualTaskControl = document.getElementById('manual-task-control');
+if (manualTaskControl?.dataset.s3Configured === 'true') {
+  const manualTaskForm = document.getElementById('manual-task-form');
+  const manualTaskFile = document.getElementById('manual-task-file');
+  const manualTaskAlgorithm = document.getElementById('manual-task-algorithm');
+  const manualTaskArguments = document.getElementById('manual-task-arguments');
+  const manualTaskSubmit = document.getElementById('manual-task-submit');
+  const manualTaskMessage = document.getElementById('manual-task-message');
+  const defaultAlgorithm = manualTaskAlgorithm.value;
+  const defaultArguments = manualTaskArguments.value;
+
+  function setManualTaskMessage(text, error = false) {
+    manualTaskMessage.textContent = text;
+    manualTaskMessage.classList.toggle('error', error);
+  }
+
+  function setManualTaskBusy(busy) {
+    manualTaskForm.querySelectorAll('input, textarea, button').forEach(control => {
+      control.disabled = busy;
+    });
+  }
+
+  manualTaskForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const source = manualTaskFile.files?.[0];
+    if (!source) {
+      setManualTaskMessage('Choose a video file first.', true);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(manualTaskArguments.value);
+      if (!Array.isArray(parsed) || !parsed.every(value => typeof value === 'string')) {
+        throw new Error('not a string array');
+      }
+    } catch (_) {
+      setManualTaskMessage('Algorithm parameters must be a JSON array of strings.', true);
+      return;
+    }
+    const request = new XMLHttpRequest();
+    setManualTaskBusy(true);
+    pauseAutoRefresh();
+    setManualTaskMessage(`Uploading ${source.name}… 0%`);
+    request.open('PUT', '/api/dashboard/manual-tasks');
+    request.setRequestHeader('Content-Type', source.type || 'application/octet-stream');
+    request.setRequestHeader('X-Video-Mask-Filename', source.name);
+    request.setRequestHeader('X-Video-Mask-Algorithm', manualTaskAlgorithm.value.trim());
+    request.setRequestHeader('X-Video-Mask-Arguments', manualTaskArguments.value);
+    request.upload.addEventListener('progress', progress => {
+      if (!progress.lengthComputable) return;
+      const percent = Math.min(100, Math.round(progress.loaded / progress.total * 100));
+      setManualTaskMessage(`Uploading ${source.name}… ${percent}%`);
+    });
+    request.addEventListener('load', () => {
+      let response = {};
+      try { response = JSON.parse(request.responseText || '{}'); } catch (_) { /* use fallback below */ }
+      if (request.status >= 200 && request.status < 300) {
+        const taskId = response.task?.task_id || 'new task';
+        setManualTaskMessage(`Upload complete. ${taskId} is queued for processing.`);
+        manualTaskForm.reset();
+        manualTaskAlgorithm.value = defaultAlgorithm;
+        manualTaskArguments.value = defaultArguments;
+        window.setTimeout(() => window.location.reload(), 700);
+        return;
+      }
+      setManualTaskBusy(false);
+      scheduleAutoRefresh();
+      setManualTaskMessage(response.detail || `Upload failed (${request.status}).`, true);
+    });
+    request.addEventListener('error', () => {
+      setManualTaskBusy(false);
+      scheduleAutoRefresh();
+      setManualTaskMessage('The upload connection failed. The task was not queued.', true);
+    });
+    request.send(source);
+  });
 }
 
 const playModal = document.getElementById('play-link-modal');
