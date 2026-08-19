@@ -27,6 +27,11 @@
       - rsync
     state: present
     update_cache: true
+    # Newly started EC2 instances can still be running cloud-init's apt
+    # update. Wait for its lock instead of failing deployment or removing it.
+    lock_timeout: 600
+    update_cache_retries: 5
+    update_cache_retry_max_delay: 12
 
 - name: Create Worker application directory
   ansible.builtin.file:
