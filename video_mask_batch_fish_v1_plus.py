@@ -98,6 +98,59 @@ def heavy_mosaic(img, x1, y1, x2, y2, cells=6, sigma=35.0):
     img[y1:y2, x1:x2] = big
 
 
+def _ensure_writable_frame(img):
+    """ffmpeg pipe 返回 bytes，其 numpy 视图只读；需要绘制时才复制。"""
+    return img if img.flags.writeable else img.copy()
+
+
+def draw_face_debug_scores(img, debug_faces):
+    """绘制模型分值：D=双模型、S=单模型续轨、T=跟踪。"""
+    h, w = img.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.45, min(0.85, min(w, h) / 1100.0))
+    thickness = max(1, int(round(scale * 2)))
+    for item in debug_faces:
+        x1, y1, x2, y2 = [int(round(v)) for v in item["box"]]
+        x1, y1 = max(0, min(w - 1, x1)), max(0, min(h - 1, y1))
+        x2, y2 = max(0, min(w - 1, x2)), max(0, min(h - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        scores = item.get("scores") or ()
+        text = " | ".join(
+            f"{name} {score:.3f}" if score is not None else f"{name} n/a"
+            for name, score in scores)
+        text = f"[{item.get('source', 'T')}] {text}"
+        (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
+        tx = min(x1, max(0, w - tw - 8))
+        ty = y1 - 5 if y1 > th + base + 8 else y1 + th + 8
+        top = max(0, ty - th - 5)
+        bottom = min(h - 1, ty + base + 5)
+        cv2.rectangle(img, (tx, top), (min(w - 1, tx + tw + 8), bottom), (0, 0, 0), -1)
+        colors = {"D": (0, 255, 0), "S": (255, 180, 0), "T": (0, 200, 255)}
+        color = colors.get(item.get("source"), (0, 200, 255))
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        cv2.putText(img, text, (tx + 4, ty), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def draw_raw_face_debug(img, raw_faces):
+    """绘制正式阈值一半以上的原始候选框；仅用于诊断，不参与打码。"""
+    h, w = img.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.45, min(0.8, min(w, h) / 1200.0))
+    thickness = max(1, int(round(scale * 2)))
+    for item in raw_faces:
+        x1, y1, x2, y2 = [int(round(v)) for v in item["box"]]
+        x1, y1 = max(0, min(w - 1, x1)), max(0, min(h - 1, y1))
+        x2, y2 = max(0, min(w - 1, x2)), max(0, min(h - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        score = item.get("score")
+        text = f"RAW {item.get('model', '?')} {score:.3f}" if score is not None else f"RAW {item.get('model', '?')} n/a"
+        color = (180, 180, 180) if not item.get("formal") else (255, 255, 0)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        cv2.putText(img, text, (x1, max(15, y1 - 5)), font, scale, color, thickness, cv2.LINE_AA)
+
+
 # -- 鱼眼去畸变 (无需标定, 自动估算) --
 
 _fisheye_maps_cache = {}  # 按 (w, h, f_ratio, k1, k2, balance) 缓存 remap 映射表
@@ -602,7 +655,11 @@ class DualFaceDetector:
     def __init__(self, det_a, det_b, name_a="A", name_b="B"):
         self._det_a = det_a
         self._det_b = det_b
+        self._name_a = name_a
+        self._name_b = name_b
         self._name = f"{name_a}+{name_b}"
+        self.last_candidates = []
+        self.last_raw_candidates = []
 
     @staticmethod
     def _iou(a, b):
@@ -615,25 +672,65 @@ class DualFaceDetector:
         return inter / union if union > 0 else 0
 
     def detect(self, img, conf=FACE_CONF, iou_thresh=0.2):
-        dets_a = self._det_a.detect(img, conf=conf)
-        if not dets_a:
-            return []  # A 没检出 → 共识必为空, 跳过 B 的推理
-        dets_b = self._det_b.detect(img, conf=conf)
-        if not dets_b:
+        return [item["box"] for item in self.detect_with_scores(
+            img, conf=conf, iou_thresh=iou_thresh)]
+
+    @staticmethod
+    def _detect_with_conf(detector, img, conf):
+        if hasattr(detector, "detect_with_conf"):
+            return detector.detect_with_conf(img, conf=conf)
+        return [(box, None) for box in detector.detect(img, conf=conf)]
+
+    def detect_with_scores(self, img, conf=FACE_CONF, iou_thresh=0.2,
+                           include_single=False, raw_conf=None):
+        """返回共识框及两个模型各自分值，供 debug 模式区分检测/跟踪。"""
+        query_conf = conf if raw_conf is None else min(float(conf), float(raw_conf))
+        dets_a_all = self._detect_with_conf(self._det_a, img, query_conf)
+        dets_a = [(box, score) for box, score in dets_a_all
+                  if score is None or score >= conf]
+        if not dets_a_all and not include_single:
+            self.last_candidates = []
+            return []
+        dets_b_all = self._detect_with_conf(self._det_b, img, query_conf)
+        dets_b = [(box, score) for box, score in dets_b_all
+                  if score is None or score >= conf]
+        self.last_raw_candidates = [
+            {"box": box, "model": self._name_a, "score": score,
+             "formal": score is None or score >= conf}
+            for box, score in dets_a_all
+        ] + [
+            {"box": box, "model": self._name_b, "score": score,
+             "formal": score is None or score >= conf}
+            for box, score in dets_b_all
+        ]
+        # 单模型结果不能创建新轨迹，但可以在镜头移动/运动模糊时
+        # 续上已经由双模型确认过的轨迹。
+        self.last_candidates = [] if not include_single else [
+            {"box": box, "scores": ((self._name_a, score), (self._name_b, None))}
+            for box, score in dets_a_all if score is None or score >= query_conf
+        ] + ([
+            {"box": box, "scores": ((self._name_a, None), (self._name_b, score))}
+            for box, score in dets_b_all if score is None or score >= query_conf
+        ] if include_single else [])
+        if not dets_a or not dets_b:
             return []
         # 贪心匹配: 对每个 A 框找最佳 IoU 匹配的 B 框
         consensus = []
         used = set()
-        for da in dets_a:
+        for da, conf_a in dets_a:
             best_iou, best_j = 0, -1
-            for j, db in enumerate(dets_b):
+            for j, (db, _) in enumerate(dets_b):
                 if j in used:
                     continue
                 score = self._iou(da, db)
                 if score > best_iou:
                     best_iou, best_j = score, j
             if best_iou >= iou_thresh and best_j >= 0:
-                consensus.append(da)
+                _, conf_b = dets_b[best_j]
+                consensus.append({
+                    "box": da,
+                    "scores": ((self._name_a, conf_a), (self._name_b, conf_b)),
+                })
                 used.add(best_j)
         return consensus
 
@@ -653,7 +750,7 @@ class SCRFDFaceDetector:
 
     def __init__(self, model_dir=None, model="10g", input_size=640, conf=FACE_CONF,
                  nms_thresh=0.4, device="auto", gpu_id=0, use_gpu=True,
-                 model_path=None):
+                 model_path=None, landmark_filter=True):
         try:
             import onnxruntime as ort
         except ImportError as exc:
@@ -675,6 +772,7 @@ class SCRFDFaceDetector:
         self.nms_thresh = float(nms_thresh)
         self.model = model
         self.model_path = model_path
+        self.landmark_filter = bool(landmark_filter)
         self._center_cache = {}
 
         requested = device.lower()
@@ -735,6 +833,78 @@ class SCRFDFaceDetector:
                 model_path, options, providers=["CPUExecutionProvider"])
             self._sess.run(self._output_names, {self._input_name: dummy})
         self.backend = self._sess.get_providers()[0]
+        # 仅统计正式视频帧；模型加载和上面的预热不计入运行时性能数据。
+        self._timing = {
+            "calls": 0,
+            "preprocess": 0.0,
+            "inference": 0.0,
+            "postprocess": 0.0,
+        }
+        self._allocate_preprocess_buffers()
+
+    def _allocate_preprocess_buffers(self):
+        """为固定 SCRFD 输入尺寸分配一次可复用的预处理内存。"""
+        size = self.input_size
+        self._canvas = np.empty((size, size, 3), dtype=np.uint8)
+        self._blob = np.empty((1, 3, size, size), dtype=np.float32)
+        self._resized = None
+        self._resized_shape = None
+
+    def _prepare_input(self, img):
+        """等价于原 blobFromImage 路径，但复用 canvas/blob，避免逐帧分配。"""
+        h, w = img.shape[:2]
+        size = self.input_size
+        ratio_hw = h / w
+        if ratio_hw > 1.0:
+            new_h, new_w = size, int(size / ratio_hw)
+        else:
+            new_w, new_h = size, int(size * ratio_hw)
+        scale = new_h / h
+
+        self._canvas.fill(0)
+        # canvas[:, :new_w] 通常不是连续内存；部分服务器 OpenCV 版本不接受
+        # 非连续 numpy 切片作为 resize 的 dst。使用按尺寸缓存的连续缓冲区，
+        # 仍然避免逐帧分配，同时兼容不同 OpenCV 构建。
+        resized_shape = (new_h, new_w, 3)
+        if self._resized is None or self._resized_shape != resized_shape:
+            self._resized = np.empty(resized_shape, dtype=np.uint8)
+            self._resized_shape = resized_shape
+        cv2.resize(img, (new_w, new_h), dst=self._resized)
+        self._canvas[:new_h, :new_w] = self._resized
+        # BGR HWC uint8 -> RGB NCHW float32；copyto 完成转置和类型转换但不分配。
+        # 少数 ONNX Runtime/CUDA 组合可能把输入标记为只读；发生时只替换一次，
+        # 新 blob 仍会在后续检测中持续复用。
+        if not self._blob.flags.writeable:
+            self._blob = np.empty_like(self._blob)
+        np.copyto(
+            self._blob[0], self._canvas[:, :, ::-1].transpose(2, 0, 1),
+            casting="unsafe")
+        np.subtract(self._blob, 127.5, out=self._blob)
+        np.multiply(self._blob, 1.0 / 128.0, out=self._blob)
+        return self._blob, scale
+
+    def _record_timing(self, preprocess, inference, postprocess):
+        self._timing["calls"] += 1
+        self._timing["preprocess"] += max(0.0, float(preprocess))
+        self._timing["inference"] += max(0.0, float(inference))
+        self._timing["postprocess"] += max(0.0, float(postprocess))
+
+    def timing_stats(self):
+        """返回 SCRFD 正式检测调用的累计与平均分阶段耗时。"""
+        calls = self._timing["calls"]
+        stages = ("preprocess", "inference", "postprocess")
+        total = sum(self._timing[name] for name in stages)
+        stats = {
+            "calls": calls,
+            "total_seconds": total,
+            "average_ms": total * 1000.0 / calls if calls else 0.0,
+        }
+        for name in stages:
+            seconds = self._timing[name]
+            stats[f"{name}_seconds"] = seconds
+            stats[f"{name}_average_ms"] = seconds * 1000.0 / calls if calls else 0.0
+            stats[f"{name}_ratio"] = seconds / total if total else 0.0
+        return stats
 
     @classmethod
     def _find_model(cls, model_dir, model):
@@ -776,6 +946,65 @@ class SCRFDFaceDetector:
         ], axis=-1)
 
     @staticmethod
+    def _distance2kps(points, distance):
+        coords = []
+        for index in range(0, distance.shape[1], 2):
+            coords.append(points[:, index % 2] + distance[:, index])
+            coords.append(points[:, (index % 2) + 1] + distance[:, index + 1])
+        return np.stack(coords, axis=-1)
+
+    @staticmethod
+    def _landmarks_plausible(box, kps):
+        """用 SCRFD 五点拓扑过滤衣物褶皱等类人脸纹理。"""
+        x1, y1, x2, y2 = [float(v) for v in box]
+        width, height = x2 - x1, y2 - y1
+        points = np.asarray(kps, dtype=np.float32)
+        if width <= 0 or height <= 0 or points.shape != (5, 2):
+            return False
+
+        left_eye, right_eye, nose, left_mouth, right_mouth = points
+        if left_eye[0] >= right_eye[0] or left_mouth[0] >= right_mouth[0]:
+            return False
+
+        # 强侧脸时双眼或嘴角的 x 投影可能接近，因此下限只排除点位倒置。
+        eye_span = float(right_eye[0] - left_eye[0]) / width
+        mouth_span = float(right_mouth[0] - left_mouth[0]) / width
+        if not (0.04 <= eye_span <= 0.75 and 0.03 <= mouth_span <= 0.75):
+            return False
+
+        eye_y = float(left_eye[1] + right_eye[1]) / 2.0
+        mouth_y = float(left_mouth[1] + right_mouth[1]) / 2.0
+        eye_to_mouth = mouth_y - eye_y
+        if not (0.25 * height <= eye_to_mouth <= 0.70 * height):
+            return False
+        if (abs(float(right_eye[1] - left_eye[1])) > 0.35 * height
+                or abs(float(right_mouth[1] - left_mouth[1])) > 0.35 * height):
+            return False
+
+        # 鼻点应处于眼线与嘴线之间。衣服褶皱误检常在这里发生点序错乱。
+        nose_ratio = (float(nose[1]) - eye_y) / eye_to_mouth
+        if not (0.02 <= nose_ratio <= 1.05):
+            return False
+
+        # 鼻子可越过双眼，但不能远离眼睛和嘴角共同覆盖的横向范围。
+        feature_x = np.array([
+            left_eye[0], right_eye[0], left_mouth[0], right_mouth[0]],
+            dtype=np.float32)
+        nose_margin = 0.08 * width
+        if not (float(feature_x.min()) - nose_margin
+                <= float(nose[0])
+                <= float(feature_x.max()) + nose_margin):
+            return False
+
+        # 所有点都应落在框附近，保留 15% 余量兼容侧脸和回归误差。
+        margin_x, margin_y = 0.15 * width, 0.15 * height
+        if np.any(points[:, 0] < x1 - margin_x) or np.any(points[:, 0] > x2 + margin_x):
+            return False
+        if np.any(points[:, 1] < y1 - margin_y) or np.any(points[:, 1] > y2 + margin_y):
+            return False
+        return True
+
+    @staticmethod
     def _nms(dets, threshold):
         x1, y1, x2, y2 = dets[:, 0], dets[:, 1], dets[:, 2], dets[:, 3]
         areas = (x2 - x1 + 1) * (y2 - y1 + 1)
@@ -802,43 +1031,70 @@ class SCRFDFaceDetector:
         """返回 [((x1,y1,x2,y2), score), ...]。"""
         if img is None or img.size == 0:
             return []
+        preprocess_started = time.perf_counter()
         threshold = self.conf if conf is None else float(conf)
         h, w = img.shape[:2]
-        size = self.input_size
-        ratio_hw = h / w
-        if ratio_hw > 1.0:
-            new_h, new_w = size, int(size / ratio_hw)
-        else:
-            new_w, new_h = size, int(size * ratio_hw)
-        scale = new_h / h
-        resized = cv2.resize(img, (new_w, new_h))
-        canvas = np.zeros((size, size, 3), np.uint8)
-        canvas[:new_h, :new_w] = resized
-        blob = cv2.dnn.blobFromImage(
-            canvas, 1.0 / 128, (size, size), (127.5, 127.5, 127.5), swapRB=True)
+        blob, scale = self._prepare_input(img)
+        preprocess_finished = time.perf_counter()
         outputs = self._sess.run(self._output_names, {self._input_name: blob})
+        inference_finished = time.perf_counter()
 
-        scores_list, boxes_list = [], []
+        scores_list, boxes_list, kps_list = [], [], []
         for idx, stride in enumerate(self.STRIDES):
             scores = outputs[idx].reshape(-1)
             pos = np.where(scores >= threshold)[0]
             if pos.size == 0:
                 continue
             anchors = self._anchors(stride)
-            boxes = self._distance2bbox(anchors, outputs[idx + 3] * stride)
+            # 先筛高分 anchor，再解码框和关键点。高阈值场景下可避免为绝大多数
+            # 背景 anchor 创建 boxes/kps 临时数组。
+            positive_anchors = anchors[pos]
+            box_distances = outputs[idx + 3].reshape(-1, 4)[pos] * stride
+            boxes = self._distance2bbox(positive_anchors, box_distances)
             scores_list.append(scores[pos])
-            boxes_list.append(boxes[pos])
+            boxes_list.append(boxes)
+            kps_distances = outputs[idx + 6].reshape(-1, 10)[pos] * stride
+            kps = self._distance2kps(positive_anchors, kps_distances)
+            kps_list.append(kps)
         if not scores_list:
+            postprocess_finished = time.perf_counter()
+            self._record_timing(
+                preprocess_finished - preprocess_started,
+                inference_finished - preprocess_finished,
+                postprocess_finished - inference_finished)
             return []
 
         scores = np.concatenate(scores_list)
         boxes = np.concatenate(boxes_list) / scale
+        kpss = np.concatenate(kps_list).reshape(-1, 5, 2) / scale
         dets = np.hstack([boxes, scores[:, None]]).astype(np.float32)
         keep = self._nms(dets, self.nms_thresh)
         dets = dets[keep]
+        kpss = kpss[keep]
         dets[:, 0::2] = np.clip(dets[:, 0::2], 0, w)
         dets[:, 1::2] = np.clip(dets[:, 1::2], 0, h)
-        return [(tuple(row[:4]), float(row[4])) for row in dets]
+        # SCRFD 本身没有 YOLO 那层几何过滤；补上相同约束，避免大块家具、
+        # 衣物褶皱等被关键点拓扑“勉强放行”。
+        widths = dets[:, 2] - dets[:, 0]
+        heights = dets[:, 3] - dets[:, 1]
+        areas = widths * heights
+        geometric = ((widths >= FACE_MIN_SIZE) & (heights >= FACE_MIN_SIZE)
+                     & (areas <= (w * h) * FACE_MAX_AREA_RATIO)
+                     & ((widths / np.maximum(heights, 1e-6)) >= FACE_ASPECT_MIN)
+                     & ((widths / np.maximum(heights, 1e-6)) <= FACE_ASPECT_MAX))
+        dets = dets[geometric]
+        kpss = kpss[geometric]
+        if self.landmark_filter:
+            valid = [self._landmarks_plausible(row[:4], kps)
+                     for row, kps in zip(dets, kpss)]
+            dets = dets[np.asarray(valid, dtype=bool)]
+        result = [(tuple(row[:4]), float(row[4])) for row in dets]
+        postprocess_finished = time.perf_counter()
+        self._record_timing(
+            preprocess_finished - preprocess_started,
+            inference_finished - preprocess_finished,
+            postprocess_finished - inference_finished)
+        return result
 
 
 class SCRFDVerifier(SCRFDFaceDetector):
@@ -846,10 +1102,12 @@ class SCRFDVerifier(SCRFDFaceDetector):
 
     def __init__(self, model_dir=None, model="10g", input_size=640, conf=0.3,
                  use_gpu=False, iou_thresh=0.3, keep_conf=0.35,
-                 nms_thresh=0.4, device="auto", gpu_id=0):
+                 nms_thresh=0.4, device="auto", gpu_id=0,
+                 landmark_filter=True):
         super().__init__(model_dir=model_dir, model=model, input_size=input_size,
                          conf=conf, nms_thresh=nms_thresh, device=device,
-                         gpu_id=gpu_id, use_gpu=use_gpu)
+                         gpu_id=gpu_id, use_gpu=use_gpu,
+                         landmark_filter=landmark_filter)
         self._iou_thresh = iou_thresh
         self._keep_conf = keep_conf
 
@@ -892,6 +1150,37 @@ class SCRFDVerifier(SCRFDFaceDetector):
         return inter / ua if ua > 0 else 0.0
 
 
+def _log_scrfd_timing(detectors, log):
+    """汇总单模型、双模型及验证器中的 SCRFD 分阶段性能。"""
+    pending = list(detectors)
+    seen = set()
+    while pending:
+        detector = pending.pop(0)
+        if detector is None or id(detector) in seen:
+            continue
+        seen.add(id(detector))
+        if isinstance(detector, DualFaceDetector):
+            pending.extend([detector._det_a, detector._det_b])
+            continue
+        if not isinstance(detector, SCRFDFaceDetector):
+            continue
+        stats = detector.timing_stats()
+        calls = stats["calls"]
+        if not calls:
+            continue
+        log(
+            f"  [SCRFD性能] model={detector.model} backend={detector.backend} "
+            f"调用={calls} 平均={stats['average_ms']:.2f}ms | "
+            f"预处理={stats['preprocess_average_ms']:.2f}ms"
+            f"({stats['preprocess_ratio']:.1%}) | "
+            f"ONNX推理={stats['inference_average_ms']:.2f}ms"
+            f"({stats['inference_ratio']:.1%}) | "
+            f"后处理={stats['postprocess_average_ms']:.2f}ms"
+            f"({stats['postprocess_ratio']:.1%}) | "
+            f"累计={stats['total_seconds']:.2f}s"
+        )
+
+
 class FaceProcessor:
     """人脸检测+逐脸轨迹稳定：关键帧检测，中间帧 LK/模板跟踪。
 
@@ -919,7 +1208,10 @@ class FaceProcessor:
         self.tracks = []
         self._next_track_id = 1
         self.last_faces = []
+        self.last_debug_faces = []
+        self.last_raw_debug_faces = []
         self.prev_gray = None
+        self._force_detect = False
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
         self.dual_iou = dual_iou    # 双模型共识 IoU 阈值(仅 DualFaceDetector 使用)
         # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
@@ -957,8 +1249,8 @@ class FaceProcessor:
         pts = np.column_stack((xv.ravel(), yv.ravel())).reshape(-1, 1, 2)
         return pts.astype(np.float32)
 
-    def _track_box(self, prev_gray, gray, box):
-        """F1+F2+F3: 对一个 box 做 LK 跟踪, 返回 (new_box, tracked_pts) 或 (None, None)。
+    def _track_box_from_points(self, prev_gray, gray, box, pts):
+        """F1+F2+F3: 用给定特征点对 box 做 LK 跟踪。
 
         F1 forward-backward 验证: 正向 LK 后再反向 LK, FB 误差大的点剔除,
         median 位移估计更稳健, 避免跟踪点跑到背景导致框瞬移漏帧。
@@ -969,7 +1261,6 @@ class FaceProcessor:
         x1, y1, x2, y2 = box
         bw, bh = x2 - x1, y2 - y1
         box_size = max(bw, bh)
-        pts = self._init_pts(prev_gray, box)
         if pts is None or len(pts) < 4:
             return None, None
         # 正向 LK: prev_gray → gray
@@ -1015,6 +1306,11 @@ class FaceProcessor:
             new_box = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
         return new_box, good.reshape(-1, 1, 2)
 
+    def _track_box(self, prev_gray, gray, box):
+        """使用低成本 3x3 网格光流，不在失败帧追加昂贵角点检测。"""
+        return self._track_box_from_points(
+            prev_gray, gray, box, self._init_pts(prev_gray, box))
+
     @staticmethod
     def _center(box):
         return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
@@ -1040,6 +1336,19 @@ class FaceProcessor:
         if x2 - x1 < 8 or y2 - y1 < 8:
             return None
         return gray[y1:y2, x1:x2].copy()
+
+    def _appearance_score(self, gray, box, template):
+        """低成本比较当前跟踪区域与上次确认的人脸外观，仅用于大位移复核。"""
+        current = self._grab_template(gray, box)
+        if template is None or current is None:
+            return None
+        side = 24
+        a = cv2.resize(template, (side, side), interpolation=cv2.INTER_AREA).astype(np.float32)
+        b = cv2.resize(current, (side, side), interpolation=cv2.INTER_AREA).astype(np.float32)
+        a -= float(a.mean())
+        b -= float(b.mean())
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        return float(np.sum(a * b) / denom) if denom > 1e-6 else 0.0
 
     def _match_template(self, gray, track):
         """LK 失败时在上一位置附近做 NCC+PSR 模板桥接。"""
@@ -1086,12 +1395,35 @@ class FaceProcessor:
         """先把所有存量轨迹推进到当前帧，再与本帧检测框关联。"""
         if self.prev_gray is None:
             return
+        active_tracks = []
         for track in self.tracks:
             old_box = track["box"]
             new_box, _ = self._track_box(self.prev_gray, gray, old_box)
             if new_box is not None:
-                track["box"] = new_box
-                continue
+                # 只有较大位移时才做外观复核，避免为每个普通跟踪帧增加开销。
+                old_size = max(old_box[2] - old_box[0], old_box[3] - old_box[1], 1)
+                old_cx, old_cy = self._center(old_box)
+                new_cx, new_cy = self._center(new_box)
+                motion_ratio = (((new_cx - old_cx) ** 2 + (new_cy - old_cy) ** 2) ** 0.5
+                                / old_size)
+                if motion_ratio >= 0.18:
+                    appearance = self._appearance_score(
+                        gray, new_box, track.get("template"))
+                    # 大幅移动但模板几乎完全不相似，通常是 LK 跟到了背景。
+                    # 严格双模型模式宁可暂时漏打，也不保留明显漂移框。
+                    if (isinstance(self.detector, DualFaceDetector)
+                            and appearance is not None and appearance < 0.10):
+                        new_box = None
+                if new_box is None:
+                    # 镜头快速移动时 LK 可能只失败 1~2 帧。严格双模型
+                    # 旧逻辑会在这里立即删轨迹，导致马赛克闪一下。
+                    pass
+                else:
+                    track["box"] = new_box
+                    track["visible"] = True
+                    track["debug_source"] = "T"
+                    active_tracks.append(track)
+                    continue
             hit = self._match_template(gray, track)
             if hit is not None:
                 cx, cy = self._center(old_box)
@@ -1099,9 +1431,26 @@ class FaceProcessor:
                 track["box"] = tuple(int(round(v)) for v in (
                     old_box[0] + dx, old_box[1] + dy,
                     old_box[2] + dx, old_box[3] + dy))
+                track["visible"] = True
+                track["debug_source"] = "T"
+                active_tracks.append(track)
+                continue
+            # 无可靠位移时不绘制旧框（不再使用 H）。仅把轨迹作为
+            # 当帧单模型检测的关联先验，检测成功后才恢复绘制。
+            track["visible"] = False
+            active_tracks.append(track)
+            self._force_detect = True
+        self.tracks = active_tracks
 
-    def _update_tracks(self, dets, gray):
+    def _update_tracks(self, dets, gray, debug_scores=None,
+                       allow_new=None, debug_sources=None):
         """按 IoU/中心距离匹配；未匹配轨迹分别保活，不再整帧清空。"""
+        if debug_scores is None:
+            debug_scores = [None] * len(dets)
+        if allow_new is None:
+            allow_new = [True] * len(dets)
+        if debug_sources is None:
+            debug_sources = ["D"] * len(dets)
         pairs = []
         for ti, track in enumerate(self.tracks):
             current = track["box"]
@@ -1111,12 +1460,14 @@ class FaceProcessor:
             for di, det in enumerate(dets):
                 overlap = self._iou(current, det)
                 if overlap >= self.track_iou:
-                    pairs.append((2.0 + overlap, ti, di))
+                    priority = 4.0 if allow_new[di] else 0.0
+                    pairs.append((priority + 2.0 + overlap, ti, di))
                     continue
                 dcx, dcy = self._center(det)
                 dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
                 if dist <= gate:
-                    pairs.append((1.0 + 1.0 - dist / gate, ti, di))
+                    priority = 4.0 if allow_new[di] else 0.0
+                    pairs.append((priority + 2.0 - dist / gate, ti, di))
         pairs.sort(reverse=True)
 
         matched_tracks, matched_dets = set(), set()
@@ -1134,15 +1485,23 @@ class FaceProcessor:
                 for j in range(4))
             track["misses"] = 0
             track["hits"] += 1
+            track["visible"] = True
             track["template"] = self._grab_template(gray, track["box"])
+            if debug_scores[di] is not None:
+                track["debug_scores"] = debug_scores[di]
+                track["debug_source"] = debug_sources[di]
 
         for ti, track in enumerate(self.tracks):
             if ti not in matched_tracks:
                 track["misses"] += 1
+                if isinstance(self.detector, DualFaceDetector):
+                    track["visible"] = False
+        # 光流已失败且当帧两个模型都无法续上的轨迹直接删除；
+        # 不把没有位移证据的旧框输出为马赛克。
         self.tracks = [t for t in self.tracks if t["misses"] <= self.grace]
 
         for di, det in enumerate(dets):
-            if di in matched_dets:
+            if di in matched_dets or not allow_new[di]:
                 continue
             box = tuple(int(round(v)) for v in det)
             self.tracks.append({
@@ -1150,29 +1509,88 @@ class FaceProcessor:
                 "box": box,
                 "misses": 0,
                 "hits": 1,
+                "visible": True,
                 "template": self._grab_template(gray, box),
+                "debug_scores": debug_scores[di],
+                "debug_source": debug_sources[di],
             })
             self._next_track_id += 1
 
-    def process(self, img, frame_idx):
+    def _candidate_matches_existing_track(self, box):
+        """单模型框只允许续接附近的已确认轨迹，禁止创建新轨迹。"""
+        dcx, dcy = self._center(box)
+        for track in self.tracks:
+            current = track["box"]
+            if self._iou(current, box) >= self.track_iou:
+                return True
+            tcx, tcy = self._center(current)
+            gate = self.track_dist * max(
+                current[2] - current[0], current[3] - current[1], 1)
+            if ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5 <= gate:
+                return True
+        return False
+
+    def process(self, img, frame_idx, raw_debug=False):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         self._track_all(gray)
+        self.last_raw_debug_faces = []
         # F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
         # (YuNet 首帧可能因 DNN 后端初始化开销漏检, 普通帧间隔兜底无效)
         cold_start = frame_idx <= 2
-        need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.tracks or cold_start
+        # 空场景也遵守检测间隔。旧逻辑在没有活动轨迹时每帧推理，导致无人片段
+        # 反而成为最慢路径；现在最多等待 detect_int 帧重新扫描新入镜人脸。
+        # 前两帧仍强制检测，保留模型冷启动保护。
+        need_detect = ((frame_idx - 1) % self.detect_int == 0) or cold_start or self._force_detect
         if need_detect:
+            self._force_detect = False
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
             if isinstance(self.detector, DualFaceDetector):
-                dets = self.detector.detect(img, conf=self.conf, iou_thresh=self.dual_iou)
+                dual_dets = self.detector.detect_with_scores(
+                    img, conf=self.conf, iou_thresh=self.dual_iou,
+                    include_single=bool(self.tracks) or raw_debug,
+                    raw_conf=self.conf / 2.0 if raw_debug else None)
+                self.last_raw_debug_faces = list(self.detector.last_raw_candidates) if raw_debug else []
+                dets = [item["box"] for item in dual_dets]
+                debug_scores = [item["scores"] for item in dual_dets]
+                allow_new = [True] * len(dets)
+                debug_sources = ["D"] * len(dets)
+                # 新人脸必须双模型共识；已确认人脸遇到运动模糊时，
+                # 允许 YOLO/SCRFD 任一模型续轨。这些框 allow_new=False，
+                # 因此不会把单模型误检建成新马赛克。
+                for item in self.detector.last_candidates:
+                    box = item["box"]
+                    if any(self._iou(box, confirmed["box"]) >= self.dual_iou
+                           for confirmed in dual_dets):
+                        continue
+                    if not self._candidate_matches_existing_track(box):
+                        continue
+                    dets.append(box)
+                    debug_scores.append(item["scores"])
+                    allow_new.append(False)
+                    debug_sources.append("S")
             # SCRFD 二次验证: 高conf框直接保留, 低conf框用SCRFD确认(过滤手/玩具误检)
             elif self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
                 dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf)
                 dets = self.scrfd_verifier.verify(dets_with_conf, img)
+                debug_scores = None
+                allow_new = debug_sources = None
+                self.last_raw_debug_faces = []
             else:
                 dets = self.detector.detect(img, conf=self.conf)
-            self._update_tracks(dets, gray)
-        self.last_faces = [track["box"] for track in self.tracks]
+                debug_scores = None
+                allow_new = debug_sources = None
+                self.last_raw_debug_faces = []
+            self._update_tracks(
+                dets, gray, debug_scores,
+                allow_new=allow_new, debug_sources=debug_sources)
+        self.last_faces = [
+            track["box"] for track in self.tracks if track.get("visible", True)]
+        self.last_debug_faces = [
+            {"box": track["box"], "scores": track.get("debug_scores"),
+             "source": track.get("debug_source", "T")}
+            for track in self.tracks
+            if track.get("visible", True) and track.get("debug_scores") is not None
+        ]
         self.prev_gray = gray
         return self.last_faces
 
@@ -1380,13 +1798,15 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
 
 
 def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
-                          scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id, log):
+                          scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
+                          scrfd_landmark_filter, log):
     """按 --face-model 创建单模型或双模型共识检测器。"""
     def make_scrfd():
         return SCRFDFaceDetector(
             model_dir=model_dir, model=scrfd_model, input_size=face_size,
             conf=face_conf, nms_thresh=scrfd_nms, device=scrfd_device,
-            gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
+            gpu_id=scrfd_gpu_id, use_gpu=use_gpu,
+            landmark_filter=scrfd_landmark_filter)
 
     if face_model == "yolo11+yunet":
         detector = DualFaceDetector(
@@ -1406,14 +1826,16 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
             YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
             scrfd, name_a="YOLOv8", name_b=f"SCRFD-{scrfd_model}")
         log(f"  [人脸] YOLOv8+SCRFD-{scrfd_model} 严格双模型共识 "
-            f"(输入{face_size}, SCRFD后端={scrfd.backend})")
+            f"(输入{face_size}, SCRFD五点拓扑={scrfd_landmark_filter}, "
+            f"SCRFD后端={scrfd.backend})")
     elif face_model == "yolo11+scrfd":
         scrfd = make_scrfd()
         detector = DualFaceDetector(
             YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
             scrfd, name_a="YOLO11", name_b=f"SCRFD-{scrfd_model}")
         log(f"  [人脸] YOLO11+SCRFD-{scrfd_model} 严格双模型共识 "
-            f"(输入{face_size}, SCRFD后端={scrfd.backend})")
+            f"(输入{face_size}, SCRFD五点拓扑={scrfd_landmark_filter}, "
+            f"SCRFD后端={scrfd.backend})")
     elif face_model == "scrfd":
         detector = make_scrfd()
         log(f"  [人脸] SCRFD-{scrfd_model} (输入{face_size}, "
@@ -1439,7 +1861,8 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
 
 def _create_scrfd_verifier(enabled, face_model, model_dir, face_size, use_gpu,
                            scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
-                           scrfd_conf, scrfd_iou, scrfd_keep_conf, log):
+                           scrfd_conf, scrfd_iou, scrfd_keep_conf,
+                           scrfd_landmark_filter, log):
     if not enabled:
         return None
     if "scrfd" in face_model:
@@ -1450,7 +1873,8 @@ def _create_scrfd_verifier(enabled, face_model, model_dir, face_size, use_gpu,
             model_dir=model_dir, model=scrfd_model, input_size=face_size,
             conf=scrfd_conf, use_gpu=use_gpu, iou_thresh=scrfd_iou,
             keep_conf=scrfd_keep_conf, nms_thresh=scrfd_nms,
-            device=scrfd_device, gpu_id=scrfd_gpu_id)
+            device=scrfd_device, gpu_id=scrfd_gpu_id,
+            landmark_filter=scrfd_landmark_filter)
         log(f"  [人脸] SCRFD-{scrfd_model} 二次验证 "
             f"(conf={scrfd_conf}, iou={scrfd_iou}, keep_conf={scrfd_keep_conf}, "
             f"后端={verifier.backend})")
@@ -1467,7 +1891,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                   scrfd_nms=0.4, scrfd_gpu_id=0,
-                  face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH):
+                  face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
+                  scrfd_landmark_filter=True, debug=False, raw_debug=False):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -1507,11 +1932,13 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     # 初始化检测器 — 根据 face_model 参数选择
     fd = _create_face_detector(
         face_model, model_dir, face_size, face_conf, use_gpu,
-        scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id, log)
+        scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
+        scrfd_landmark_filter, log)
     scrfd_verifier = _create_scrfd_verifier(
         scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
-        scrfd_conf, scrfd_iou, scrfd_keep_conf, log)
+        scrfd_conf, scrfd_iou, scrfd_keep_conf,
+        scrfd_landmark_filter, log)
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
                               grace=face_grace, box_smooth=face_smooth) if face_on else None
@@ -1712,7 +2139,11 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
 
             faces = []
             if face_on:
-                faces = face_proc.process(img, frame_idx)
+                faces = face_proc.process(img, frame_idx, raw_debug=raw_debug)
+                if faces:
+                    # np.frombuffer(raw_bytes) 是只读视图；只在人脸帧需要打码时
+                    # 才复制为可写数组，空场景仍保持零拷贝。
+                    img = _ensure_writable_frame(img)
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
                     heavy_mosaic(img, int(x1 - FACE_EXPAND * bw),
@@ -1720,6 +2151,10 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                                  int(x2 + FACE_EXPAND * bw),
                                  int(y2 + FACE_EXPAND * bh),
                                  FACE_CELLS, FACE_SIGMA)
+                if debug:
+                    draw_face_debug_scores(img, face_proc.last_debug_faces)
+                    if raw_debug:
+                        draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
                 total_face += len(faces)
 
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
@@ -1777,6 +2212,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         for who, e in pipeline_error:
             log(f"  [流水线错误] {who}: {e}")
 
+    _log_scrfd_timing((fd, scrfd_verifier), log)
     elapsed = time.time() - t0
     # 完整性检查: 超高帧率视频管道可能跟不上下游, 若实际处理帧远低于预期则自动回退文件模式
     # 编码器提前结束时输出已完整生成, 跳过帧数比例检查(避免误判回退文件模式)
@@ -1799,7 +2235,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                    dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                    scrfd_nms=0.4, scrfd_gpu_id=0,
-                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH):
+                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
+                   scrfd_landmark_filter=True, debug=False, raw_debug=False):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1846,11 +2283,13 @@ def _process_files(src, dst, face_on, model_dir, face_size,
 
     fd = _create_face_detector(
         face_model, model_dir, face_size, face_conf, use_gpu,
-        scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id, log)
+        scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
+        scrfd_landmark_filter, log)
     scrfd_verifier = _create_scrfd_verifier(
         scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
-        scrfd_conf, scrfd_iou, scrfd_keep_conf, log)
+        scrfd_conf, scrfd_iou, scrfd_keep_conf,
+        scrfd_landmark_filter, log)
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
                               grace=face_grace, box_smooth=face_smooth) if face_on else None
@@ -1871,12 +2310,16 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                                     crop=fisheye_crop)
         faces = []
         if face_on:
-            faces = face_proc.process(img, i)
+            faces = face_proc.process(img, i, raw_debug=raw_debug)
             for (x1, y1, x2, y2) in faces:
                 bw, bh = x2 - x1, y2 - y1
                 ex1, ey1 = int(x1 - FACE_EXPAND * bw), int(y1 - FACE_EXPAND * bh)
                 ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
                 heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
+            if debug:
+                draw_face_debug_scores(img, face_proc.last_debug_faces)
+                if raw_debug:
+                    draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
             total_face += len(faces)
         cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
@@ -1906,6 +2349,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         return False
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
+    _log_scrfd_timing((fd, scrfd_verifier), log)
     log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face}")
     return True
 
@@ -1920,7 +2364,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                   scrfd_nms=0.4, scrfd_gpu_id=0,
-                  face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH):
+                  face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
+                  scrfd_landmark_filter=True, debug=False, raw_debug=False):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1933,7 +2378,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
                                  dual_iou, scrfd_model, scrfd_device,
                                  scrfd_nms, scrfd_gpu_id,
-                                 face_grace, face_smooth)
+                                 face_grace, face_smooth,
+                                 scrfd_landmark_filter, debug, raw_debug)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -1945,7 +2391,8 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
                           dual_iou, scrfd_model, scrfd_device,
                           scrfd_nms, scrfd_gpu_id,
-                          face_grace, face_smooth)
+                          face_grace, face_smooth,
+                          scrfd_landmark_filter, debug, raw_debug)
 
 
 def expand_inputs(inputs):
@@ -2007,8 +2454,8 @@ def main():
                     help="SCRFD二次验证: YOLO检出后用SCRFD关键点模型确认, 过滤手/玩具误检 "
                          "(高conf框不验证, 低conf框才验证; 要求全部框均由SCRFD确认请使用"
                          "--face-model yolov8+scrfd)")
-    ap.add_argument("--scrfd-model", choices=["2.5g", "10g"], default="10g",
-                    help="SCRFD模型规格(默认10g精度高; 2.5g更快, 模型从--model-dir/当前目录查找)")
+    ap.add_argument("--scrfd-model", choices=["2.5g", "10g"], default="2.5g",
+                    help="SCRFD模型规格(默认2.5g速度快; 10g精度更高, 模型从--model-dir/当前目录查找)")
     ap.add_argument("--scrfd-device", choices=["auto", "cpu", "cuda", "coreml"],
                     default="auto", help="SCRFD推理后端(默认auto: CUDA > CoreML > CPU)")
     ap.add_argument("--scrfd-nms", type=float, default=0.4,
@@ -2018,6 +2465,8 @@ def main():
     ap.add_argument("--scrfd-conf", type=float, default=0.3,
                     help="SCRFD二次验证阈值(默认0.3; 仅--scrfd-verify生效; "
                          "SCRFD主模型/共识模式使用--face-conf)")
+    ap.add_argument("--no-scrfd-landmark-filter", action="store_true",
+                    help="关闭SCRFD五点拓扑过滤(默认开启；仅在极端侧脸被误删时使用)")
     ap.add_argument("--scrfd-iou", type=float, default=0.3,
                     help="YOLO框与SCRFD框匹配的IoU阈值(默认0.3; 降如0.2匹配更宽松)")
     ap.add_argument("--scrfd-keep-conf", type=float, default=0.35,
@@ -2028,6 +2477,11 @@ def main():
                     help="【抽帧频率】跳过间隔(默认1=逐帧; 2=隔1抽1提速2x; 3=每3帧抽1提速3x; 配合--face-int效果叠加)")
     ap.add_argument("--no-pipe", action="store_true",
                     help="禁用管道模式, 强制文件模式(调试或特殊场景; 默认已启用流式管道)")
+    ap.add_argument("--debug", action="store_true",
+                    help="显示双模型分值及来源: D=双模型确认, "
+                         "S=单模型续轨, T=光流/模板跟踪")
+    ap.add_argument("--debug-raw", action="store_true",
+                    help="原始调试：绘制置信度达到 face-conf/2 的 YOLO/SCRFD 候选框（不参与打码）")
     ap.add_argument("--force-h264", action="store_true",
                     help="强制H.264输出(兼容性无敌: 微信/Android/旧播放器都能播; 画质仍近无损高码率)")
     ap.add_argument("--no-face", action="store_true", help="关闭人脸打码")
@@ -2070,7 +2524,10 @@ def main():
                          scrfd_nms=args.scrfd_nms,
                          scrfd_gpu_id=args.scrfd_gpu_id,
                          face_grace=args.face_grace,
-                         face_smooth=args.face_smooth):
+                         face_smooth=args.face_smooth,
+                         scrfd_landmark_filter=not args.no_scrfd_landmark_filter,
+                         debug=args.debug or args.debug_raw,
+                         raw_debug=args.debug_raw):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
