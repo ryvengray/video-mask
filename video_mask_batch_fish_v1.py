@@ -118,6 +118,19 @@ FISHEYE_PRESETS = {
         "k2": 0.03,
         "balance": 0.45,    # 保留更多画面(VR 透视场景不宜裁切过多)
     },
+    "circular180": {
+        # 180° 圆形双鱼眼 (典型 360° 全景相机/头戴广角镜头)
+        # 成像为圆, 黑边填满四角, FOV 极大(~180°), 桶形畸变极强。
+        # 按等距投影估算: f = 圆直径 / π ≈ 0.318 * h; 但代码按 max(w,h) 缩放,
+        # 双鱼眼每目 1920x1456, 故 f_ratio = 1456/π / 1920 ≈ 0.24。
+        # k1/k2 很大且 balance 接近 1.0, 以保留完整圆形视野并尽量拉直中心区域。
+        # 注意: 180° 鱼眼无法被完全拉成矩形透视, 边缘必然残留弧度, 此预设只追求
+        #       中心可用区域足够"人脸可识别"并抑制前景手/畸变物误检。
+        "f_ratio": 0.24,
+        "k1": 1.20,
+        "k2": 0.30,
+        "balance": 0.95,
+    },
 }
 
 
@@ -1142,7 +1155,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   frame_skip, fisheye, fisheye_strength, fisheye_device,
                   fisheye_downscale, fisheye_dual, fisheye_crop, log,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                  dual_iou=0.2):
+                  dual_iou=0.2, dual_mirror=False):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -1409,6 +1422,18 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             faces = []
             if face_on:
                 faces = face_proc.process(img, frame_idx)
+                # 双鱼眼镜像: 一侧检出 → 另一侧同步打码
+                if dual_mirror and fisheye and fisheye_dual != "false":
+                    out_h, out_w = img.shape[:2]
+                    mid = out_w // 2
+                    mirrored = list(faces)
+                    for (x1, y1, x2, y2) in faces:
+                        cx = (x1 + x2) / 2
+                        if cx < mid:
+                            mirrored.append((x1 + mid, y1, x2 + mid, y2))
+                        else:
+                            mirrored.append((x1 - mid, y1, x2 - mid, y2))
+                    faces = mirrored
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
                     heavy_mosaic(img, int(x1 - FACE_EXPAND * bw),
@@ -1416,7 +1441,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                                  int(x2 + FACE_EXPAND * bw),
                                  int(y2 + FACE_EXPAND * bh),
                                  FACE_CELLS, FACE_SIGMA)
-                total_face += len(faces)
+                total_face += 1 if faces else 0
 
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
             # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
@@ -1484,7 +1509,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             # 流式管道提前结束(<30%帧处理完成), 自动回退文件模式
             raise RuntimeError(
                 f"管道提前结束(仅处理{frame_idx}/{total_expected}帧, {actual_ratio:.0%}), 回退文件模式")
-    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}")
+    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧={total_face}")
     return encode.returncode == 0
 
 
@@ -1493,7 +1518,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    frame_skip, fisheye, fisheye_strength, fisheye_device,
                    fisheye_downscale, fisheye_dual, fisheye_crop, log,
                    scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                   dual_iou=0.2):
+                   dual_iou=0.2, dual_mirror=False):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1587,12 +1612,24 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         faces = []
         if face_on:
             faces = face_proc.process(img, i)
+            # 双鱼眼镜像: 一侧检出 → 另一侧同步打码
+            if dual_mirror and fisheye and fisheye_dual != "false":
+                out_h, out_w = img.shape[:2]
+                mid = out_w // 2
+                mirrored = list(faces)
+                for (x1, y1, x2, y2) in faces:
+                    cx = (x1 + x2) / 2
+                    if cx < mid:
+                        mirrored.append((x1 + mid, y1, x2 + mid, y2))
+                    else:
+                        mirrored.append((x1 - mid, y1, x2 - mid, y2))
+                faces = mirrored
             for (x1, y1, x2, y2) in faces:
                 bw, bh = x2 - x1, y2 - y1
                 ex1, ey1 = int(x1 - FACE_EXPAND * bw), int(y1 - FACE_EXPAND * bh)
                 ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
                 heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
-            total_face += len(faces)
+            total_face += 1 if faces else 0
         cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
             log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} elapsed={time.time()-t0:.0f}s")
@@ -1621,7 +1658,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         return False
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
-    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face}")
+    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧={total_face}")
     return True
 
 
@@ -1633,7 +1670,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
                   fisheye_downscale=2, fisheye_dual="auto", fisheye_crop=1.0, log=print,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                  dual_iou=0.2):
+                  dual_iou=0.2, dual_mirror=False):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1644,7 +1681,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  fisheye_device, fisheye_downscale,
                                  fisheye_dual, fisheye_crop, log,
                                  scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                                 dual_iou)
+                                 dual_iou, dual_mirror)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -1654,7 +1691,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           fisheye_device, fisheye_downscale,
                           fisheye_dual, fisheye_crop, log,
                           scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                          dual_iou)
+                          dual_iou, dual_mirror)
 
 
 def expand_inputs(inputs):
@@ -1724,6 +1761,8 @@ def main():
     ap.add_argument("--no-gpu", action="store_true",
                     help="关闭 GPU 加速(CUDA/MPS 均禁用, 强制 CPU)")
     ap.add_argument("--model-dir", default=None, help="人脸模型目录")
+    ap.add_argument("--dual-mirror", action="store_true",
+                    help="双鱼眼镜像打码: 一侧检出的脸同步镜像到另一侧(仅双鱼眼模式生效)")
     ap.add_argument("--keep-tmp", action="store_true", help="保留中间帧")
     args = ap.parse_args()
 
@@ -1754,7 +1793,8 @@ def main():
                          scrfd_conf=args.scrfd_conf,
                          scrfd_iou=args.scrfd_iou,
                          scrfd_keep_conf=args.scrfd_keep_conf,
-                         dual_iou=args.dual_iou):
+                         dual_iou=args.dual_iou,
+                         dual_mirror=args.dual_mirror):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
