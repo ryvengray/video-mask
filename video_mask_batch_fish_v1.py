@@ -1441,7 +1441,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                                  int(x2 + FACE_EXPAND * bw),
                                  int(y2 + FACE_EXPAND * bh),
                                  FACE_CELLS, FACE_SIGMA)
-                total_face += len(faces)
+                total_face += 1 if faces else 0
 
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
             # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
@@ -1509,7 +1509,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             # 流式管道提前结束(<30%帧处理完成), 自动回退文件模式
             raise RuntimeError(
                 f"管道提前结束(仅处理{frame_idx}/{total_expected}帧, {actual_ratio:.0%}), 回退文件模式")
-    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}")
+    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧={total_face}")
     return encode.returncode == 0
 
 
@@ -1629,7 +1629,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                 ex1, ey1 = int(x1 - FACE_EXPAND * bw), int(y1 - FACE_EXPAND * bh)
                 ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
                 heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
-            total_face += len(faces)
+            total_face += 1 if faces else 0
         cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
             log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} elapsed={time.time()-t0:.0f}s")
@@ -1658,7 +1658,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         return False
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
-    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face}")
+    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧={total_face}")
     return True
 
 
