@@ -77,7 +77,6 @@ const manualTaskControl = document.getElementById('manual-task-control');
 if (manualTaskControl?.dataset.s3Configured === 'true') {
   const manualTaskForm = document.getElementById('manual-task-form');
   const manualTaskOpen = document.getElementById('manual-task-open');
-  const manualTaskDetails = document.getElementById('manual-task-details');
   const manualTaskFile = document.getElementById('manual-task-file');
   const manualTaskAlgorithm = document.getElementById('manual-task-algorithm');
   const manualTaskArguments = document.getElementById('manual-task-arguments');
@@ -98,7 +97,7 @@ if (manualTaskControl?.dataset.s3Configured === 'true') {
   }
 
   manualTaskOpen.addEventListener('click', () => {
-    manualTaskDetails.hidden = false;
+    manualTaskControl.hidden = false;
     manualTaskFile.focus();
   });
 
@@ -258,7 +257,7 @@ if (faceReviewControl) {
   }
 
   const claimButton = document.getElementById('face-review-claim');
-  const reviewDetails = document.getElementById('face-review-details');
+  const reviewDetails = faceReviewControl;
   const activeBadge = document.getElementById('face-review-active');
   const message = document.getElementById('face-review-message');
   const player = document.getElementById('face-review-player');
