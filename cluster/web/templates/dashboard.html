@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Video Mask · Operations</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}?v=20260819g">
+  <link rel="stylesheet" href="{{ url_for('static', path='dashboard.css') }}?v=20260819h">
   <style>.face-review-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:10px}.face-review-tab{border:0;border-bottom:2px solid transparent;background:transparent;padding:7px 11px;color:var(--muted);font:500 13px Arial;cursor:pointer}.face-review-tab.active{color:var(--blue);border-bottom-color:var(--blue)}.face-review-frames{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}.face-review-frames figure{margin:0;border:1px solid var(--line);border-radius:5px;overflow:hidden;background:#f8f9fa}.face-review-frames img{display:block;width:100%;height:135px;object-fit:cover;background:#111}.face-review-frames figcaption{padding:4px 7px;color:var(--muted);font-size:11px}</style>
   <style>.play-modal-annotation{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px}.play-modal-annotation[hidden]{display:none}.play-modal-annotation-status{margin-right:auto}.task-log-modal-card{width:min(1100px,100%)}.task-log-modal-content{max-height:65vh;overflow:auto;margin:0 0 14px;padding:12px;background:#202124;color:#e8eaed;border-radius:6px;white-space:pre-wrap;word-break:break-word;font:12px/1.45 Consolas,monospace}</style>
   <style>.task-actions-cell{white-space:nowrap}.task-action-button{border:0;border-radius:4px;padding:4px 7px;margin:1px 4px 1px 0;background:transparent;color:var(--blue);font:500 12px Arial;cursor:pointer}.task-action-button:hover{background:var(--blue-soft)}.task-action-cancel{color:var(--red)}.task-action-cancel:hover{background:var(--red-soft)}.task-action-logs{color:var(--muted)}.task-action-logs:hover{color:var(--ink);background:#f1f3f4}@media(max-width:850px){[id="task-status-filter"]{width:100%;margin-left:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center}[id="task-search-input"]{grid-column:1/-1;width:100%;min-width:0}[id="task-status-filter"] select{min-width:0;width:100%}.annotation-filter{grid-column:1/-1;width:100%;min-width:0;white-space:normal;flex-wrap:wrap}[id="task-status-filter"] .task-search-button{justify-self:start}}@media(max-width:520px){[id="task-status-filter"]{grid-template-columns:1fr}[id="task-status-filter"] label{grid-column:1}[id="task-status-filter"] select{grid-column:1}.annotation-filter{grid-column:1}}</style>
@@ -13,7 +13,7 @@
 <body>
   <header class="topbar">
     <span class="brand-dot"></span><span class="brand">Video Mask</span><span class="subtle">Operations</span>
-    <span class="updated">Auto-refreshes every 60 seconds · {{ updated_at }}</span>
+    <span id="auto-refresh-note" class="updated">Auto-refreshes every 60 seconds · {{ updated_at }}</span><label class="auto-refresh-control" for="auto-refresh-toggle"><span>Auto refresh</span><input id="auto-refresh-toggle" type="checkbox" checked><span class="auto-refresh-switch" aria-hidden="true"></span></label>
   </header>
   <main class="shell">
     <section class="metrics" aria-label="Cluster summary">
@@ -78,6 +78,6 @@
     </div>
   </div>
   <script id="processing-statistics" type="application/json">{{ processing_statistics | tojson }}</script>
-  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260819f"></script>
+  <script src="{{ url_for('static', path='dashboard.js') }}?v=20260819g"></script>
 </body>
 </html>

@@ -164,20 +164,40 @@ const playDownloadLink = document.getElementById('play-modal-download');
 const taskLogModal = document.getElementById('task-log-modal');
 const taskLogNote = document.getElementById('task-log-modal-note');
 const taskLogContent = document.getElementById('task-log-modal-content');
+const autoRefreshToggle = document.getElementById('auto-refresh-toggle');
+const autoRefreshNote = document.getElementById('auto-refresh-note');
 let autoRefreshTimer;
+let autoRefreshEnabled = window.localStorage.getItem('video-mask-auto-refresh') !== 'false';
 let activeFaceReview = null;
 let beginModalAnnotation = () => {};
 let endModalAnnotation = () => {};
 
 function scheduleAutoRefresh() {
   window.clearTimeout(autoRefreshTimer);
-  if (activeFaceReview) return;
+  if (!autoRefreshEnabled || activeFaceReview) return;
   autoRefreshTimer = window.setTimeout(() => window.location.reload(), 60_000);
 }
 
 function pauseAutoRefresh() {
   window.clearTimeout(autoRefreshTimer);
 }
+
+function renderAutoRefreshState() {
+  if (autoRefreshToggle) autoRefreshToggle.checked = autoRefreshEnabled;
+  if (autoRefreshNote) {
+    autoRefreshNote.textContent = `${autoRefreshEnabled ? 'Auto-refreshes every 60 seconds' : 'Auto-refresh paused'} · ${autoRefreshNote.dataset.updatedAt}`;
+  }
+}
+
+if (autoRefreshNote) autoRefreshNote.dataset.updatedAt = autoRefreshNote.textContent.split(' · ').at(-1) || '';
+renderAutoRefreshState();
+autoRefreshToggle?.addEventListener('change', () => {
+  autoRefreshEnabled = autoRefreshToggle.checked;
+  window.localStorage.setItem('video-mask-auto-refresh', String(autoRefreshEnabled));
+  renderAutoRefreshState();
+  if (autoRefreshEnabled) scheduleAutoRefresh();
+  else pauseAutoRefresh();
+});
 
 function openPlayModal(url, kind, name, taskId) {
   playKindBadge.textContent = kind === 'output' ? 'Output' : 'Input';
