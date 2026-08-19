@@ -35,8 +35,11 @@ if (s3IngestControl) {
   const message = document.getElementById('s3-ingest-message');
 
   function renderS3IngestState() {
-    status.className = `badge ${enabled ? 'success' : 'muted'}`;
-    status.textContent = enabled ? 'Enabled' : 'Paused';
+    const label = enabled ? 'S3 ingestion enabled' : 'S3 ingestion paused';
+    status.className = `s3-ingest-status-light ${enabled ? 'enabled' : 'paused'}`;
+    status.setAttribute('aria-label', label);
+    status.title = label;
+    status.textContent = '';
     toggle.textContent = enabled ? 'Pause S3 ingestion' : 'Resume S3 ingestion';
   }
 
