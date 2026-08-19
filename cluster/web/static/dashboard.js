@@ -649,8 +649,8 @@ function ensureTaskActionsColumn() {
     const status = row.querySelector('.badge')?.textContent?.trim();
     const cell = document.createElement('td');
     cell.className = 'task-actions-cell';
-    if (status === 'completed' || ['assigned', 'downloading', 'processing', 'uploading'].includes(status)) {
-      const action = status === 'completed' ? 'restart' : 'cancel';
+    if (['completed', 'failed'].includes(status) || ['assigned', 'downloading', 'processing', 'uploading'].includes(status)) {
+      const action = ['completed', 'failed'].includes(status) ? 'restart' : 'cancel';
       const button = document.createElement('button');
       button.type = 'button';
       button.className = `task-action-button task-action-${action}`;
@@ -680,7 +680,7 @@ taskTable?.addEventListener('click', async event => {
     return;
   }
   const message = taskAction === 'restart'
-    ? 'Restart this completed task? Its existing output will be cleared; its face annotation will be kept.'
+    ? 'Restart this task? Its existing output will be cleared; its face annotation will be kept.'
     : 'Cancel this active task? The Worker will stop it as soon as possible.';
   if (!window.confirm(message)) return;
   button.disabled = true;

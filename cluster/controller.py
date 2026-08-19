@@ -629,12 +629,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     @app.post("/api/dashboard/tasks/{task_id}/restart")
     def dashboard_restart_task(task_id: str) -> dict[str, Any]:
-        """Restart one completed task from the Nginx-protected dashboard."""
+        """Restart one completed or failed task from the Nginx-protected dashboard."""
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
-        if task.get("status") != "completed":
-            raise HTTPException(status_code=409, detail="only completed tasks can be restarted here")
+        if task.get("status") not in {"completed", "failed"}:
+            raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
         return store.restart_task(task_id)
 
     @app.post("/api/dashboard/tasks/{task_id}/cancel")

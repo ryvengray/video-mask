@@ -350,6 +350,23 @@ def test_failed_task_can_be_retried_by_an_admin_action(tmp_path: Path):
     store.close()
 
 
+def test_failed_task_can_also_be_restarted(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    payload = task_payload()
+    payload["max_attempts"] = 1
+    created = store.create_task(payload)
+    store.claim("worker-01", TOKEN)
+    assert store.finish("worker-01", TOKEN, created["task_id"], False, {"error_message": "access denied"})["status"] == "failed"
+
+    restarted = store.restart_task(created["task_id"])
+    assert restarted["status"] == "pending"
+    assert restarted["attempt_count"] == 0
+    assert restarted["restarted_at"] is not None
+    store.close()
+
+
 def test_pending_task_can_be_cancelled_and_restarted(tmp_path: Path):
     store = new_store(tmp_path)
     created = store.create_task(task_payload())
