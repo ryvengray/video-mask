@@ -32,16 +32,12 @@ if (s3IngestControl) {
   let enabled = s3IngestControl.dataset.enabled === 'true';
   const toggle = document.getElementById('s3-ingest-toggle');
   const status = document.getElementById('s3-ingest-status');
-  const note = document.getElementById('s3-ingest-note');
   const message = document.getElementById('s3-ingest-message');
 
   function renderS3IngestState() {
     status.className = `badge ${enabled ? 'success' : 'muted'}`;
     status.textContent = enabled ? 'Enabled' : 'Paused';
     toggle.textContent = enabled ? 'Pause S3 ingestion' : 'Resume S3 ingestion';
-    note.textContent = enabled
-      ? 'New source videos are discovered automatically'
-      : 'Scanning is paused; existing queued tasks continue normally';
   }
 
   if (configured) {

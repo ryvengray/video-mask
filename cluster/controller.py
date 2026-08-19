@@ -7,6 +7,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -20,9 +21,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 try:
     from fastapi import FastAPI, Header, HTTPException, Request
@@ -103,6 +106,78 @@ def statistics_window(start_value: str | None, end_value: str | None) -> tuple[f
 
 def datetime_local(timestamp: float) -> str:
     return dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%dT%H:%M")
+
+
+def _xlsx_column_name(index: int) -> str:
+    """Return the Excel column name for a zero-based column index."""
+    name = ""
+    while True:
+        index, remainder = divmod(index, 26)
+        name = chr(65 + remainder) + name
+        if index == 0:
+            return name
+        index -= 1
+
+
+def _xlsx_cell(reference: str, value: Any) -> str:
+    """Render a value as a dependency-free inline-string Excel cell."""
+    if value is None:
+        return ""
+    text = escape(str(value), {'"': "&quot;", "'": "&apos;"})
+    return f'<c r="{reference}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def tasks_xlsx(headers: list[str], rows: list[list[Any]]) -> bytes:
+    """Build a small, readable XLSX workbook without an optional Excel library."""
+    sheet_rows: list[str] = []
+    for row_number, row in enumerate([headers, *rows], start=1):
+        cells = [
+            _xlsx_cell(f"{_xlsx_column_name(column)}{row_number}", value)
+            for column, value in enumerate(row)
+        ]
+        sheet_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+    last_column = _xlsx_column_name(len(headers) - 1)
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="A1:{last_column}{len(rows) + 1}"/><sheetData>{"".join(sheet_rows)}</sheetData>'
+        '</worksheet>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Tasks" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    relationships = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook_relationships = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", relationships)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_relationships)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet)
+    return output.getvalue()
 
 
 class WorkerRequest(BaseModel):
@@ -857,6 +932,74 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "limit": page_size,
             "offset": page_offset,
         }
+
+    @app.get("/api/dashboard/tasks/export.xlsx")
+    def export_dashboard_tasks(request: Request, task_status: str | None = None, q: str = ""):
+        """Export every task matching the dashboard's current filters."""
+        selected_task_status = task_status.strip() if task_status else ""
+        if selected_task_status and selected_task_status not in TASK_FILTER_STATUSES:
+            raise HTTPException(status_code=400, detail="unknown task status filter")
+        selected_statuses = (selected_task_status,) if selected_task_status else None
+        selected_face_annotations = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("face_annotation") if value.strip()
+        ))
+        if set(selected_face_annotations) - set(FACE_ANNOTATION_FILTERS):
+            raise HTTPException(status_code=400, detail="unknown face annotation filter")
+        selected_search = q.strip()[:200] or None
+        total = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None)
+        tasks = store.list_tasks(max(1, total), 0, selected_statuses, selected_search,
+                                 selected_face_annotations or None)
+
+        def timestamp(value: Any) -> str:
+            try:
+                return dt.datetime.fromtimestamp(float(value)).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            except (TypeError, ValueError, OverflowError):
+                return ""
+
+        def json_value(value: Any) -> str:
+            return "" if value is None else json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+        headers = [
+            "Task ID", "Status", "Source URL", "Source file/key", "Source size (bytes)",
+            "Source SHA256", "Source duration (seconds)", "Algorithm", "Algorithm parameters (JSON)",
+            "Output upload URL", "Output file/key", "Attempt count", "Max attempts", "Assigned worker ID",
+            "Worker name", "Worker slot", "Progress (JSON)", "Processing seconds", "Task lifetime (seconds)",
+            "Output SHA256", "Output size (bytes)", "Output duration (seconds)", "Error message", "Created at",
+            "Started at", "Restarted at", "Finished at", "Face annotation",
+            "Face annotated at", "Face review owner", "Face review lease until", "Updated at",
+        ]
+        rows: list[list[Any]] = []
+        for task in tasks:
+            worker_id = str(task.get("assigned_worker_id") or "")
+            worker_name, marker, worker_slot = worker_id.rpartition("-slot-")
+            if not (marker and worker_name and worker_slot.isdigit()):
+                worker_name, worker_slot = worker_id, ""
+            annotation = task.get("face_annotation")
+            progress = task.get("progress") or {}
+            started, finished = task.get("started_at"), task.get("finished_at")
+            lifetime = (float(finished) - float(started)
+                        if isinstance(started, (int, float)) and isinstance(finished, (int, float)) else "")
+            rows.append([
+                task.get("task_id"), task.get("status"), task.get("source_url"), task.get("source_object_key"),
+                task.get("source_size_bytes"), task.get("source_sha256"), task.get("source_duration_seconds"),
+                task.get("algorithm"), json_value(task.get("arguments")), task.get("output_upload_url"),
+                task.get("output_object_key"), task.get("attempt_count"), task.get("max_attempts"),
+                worker_id, worker_name, worker_slot, json_value(progress),
+                progress.get("processing_seconds", progress.get("elapsed_seconds")), lifetime,
+                task.get("output_sha256"), progress.get("output_bytes"), task.get("output_duration_seconds"),
+                task.get("error_message"), timestamp(task.get("created_at")),
+                timestamp(task.get("started_at")), timestamp(task.get("restarted_at")), timestamp(task.get("finished_at")),
+                "Has face" if annotation == 1 else "No face" if annotation == 0 else "Unlabelled",
+                timestamp(task.get("face_annotated_at")), task.get("face_review_owner"),
+                timestamp(task.get("face_review_lease_until")), timestamp(task.get("updated_at")),
+            ])
+        workbook = tasks_xlsx(headers, rows)
+        filename = f"tasks-{dt.datetime.now().astimezone():%Y%m%d-%H%M%S}.xlsx"
+        return StreamingResponse(
+            iter([workbook]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.get("/api/workers")
     def list_workers(limit: int = 100, authorization: str | None = Header(default=None)):
