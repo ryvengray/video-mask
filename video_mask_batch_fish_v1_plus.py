@@ -72,6 +72,10 @@ SCRFD_VERIFIER_MAX_SCORE_DROP = 0.02  # 复核时10g相对候选模型允许的�
 SCRFD_VERIFIER_CONF = 0.30          # 10g复核内部阈值；不改变主模型建候选阈值
 SCRFD_LANDMARK_RISK_THRESHOLD = 0.35  # 五点软风险达到该值时触发10g，不直接拒绝
 SCRFD_REJECT_COOLDOWN = 5           # 10g拒绝后，同位置候选暂停复核的帧数
+STEREO_LOW_CONF = 0.30              # 另一目参与左右互证的最低本地候选分数
+STEREO_HIGH_MARGIN = 0.05           # 已确认侧至少有一个模型高于主阈值的增量
+STEREO_X_DISPARITY_GATE = 0.16      # 未标定时左右归一化横向视差容差
+STEREO_Y_GATE = 0.08                # 左右归一化纵坐标容差
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
 FACE_GRACE = 3               # 单张脸允许漏掉的检测周期数
 FACE_BOX_SMOOTH = 0.65       # 检测框EMA中本次检测权重(越低越稳, 越高越跟手)
@@ -115,7 +119,7 @@ def _ensure_writable_frame(img):
 
 
 def draw_face_debug_scores(img, debug_faces):
-    """绘制模型分值：D=双模型、V=10g确认、S=单模型续轨、T=跟踪、H=单帧保活。"""
+    """绘制模型分值：D=双模型、V=10g、X=左右互证、S/T/H=轨迹稳定。"""
     h, w = img.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.45, min(0.85, min(w, h) / 1100.0))
@@ -139,7 +143,7 @@ def draw_face_debug_scores(img, debug_faces):
         cv2.rectangle(img, (tx, top), (min(w - 1, tx + tw + 8), bottom), (0, 0, 0), -1)
         colors = {"D": (0, 255, 0), "V": (255, 0, 255),
                   "S": (255, 180, 0), "T": (0, 200, 255),
-                  "H": (0, 165, 255)}
+                  "H": (0, 165, 255), "X": (255, 255, 0)}
         color = colors.get(item.get("source"), (0, 200, 255))
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(img, text, (tx + 4, ty), font, scale, color, thickness, cv2.LINE_AA)
@@ -221,6 +225,12 @@ FISHEYE_PRESETS = {
 }
 
 
+def _is_dual_fisheye(width, height, dual="auto"):
+    if dual == "auto":
+        return width >= 2 * height
+    return dual == "true" or dual is True
+
+
 def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="auto", crop=1.0):
     """对单帧做鱼眼去畸变, 返回矫正后的图像。
 
@@ -244,11 +254,8 @@ def fisheye_undistort(img, strength=1.0, device="generic", downscale=2, dual="au
     h, w = img.shape[:2]
 
     # 双鱼眼模式判定: 显式指定或按宽高比自动检测
-    if dual == "auto":
-        # 宽>=2倍高 视为双鱼眼拼接(典型 Pico4 双目 3840x1456 = 2.64:1)
-        is_dual = (w >= 2 * h)
-    else:
-        is_dual = (dual == "true" or dual is True)
+    # 宽>=2倍高 视为双鱼眼拼接(典型 Pico4 双目 3840x1456 = 2.64:1)
+    is_dual = _is_dual_fisheye(w, h, dual)
 
     if is_dual and w >= 2:
         # 双鱼眼拼接(如 Pico4 3840x1456 = 两个 1920x1456 左右并排):
@@ -484,6 +491,25 @@ class YOLOFaceDetector:
         dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
         self._model(dummy, imgsz=self.yolo_size, device=self.device,
                     conf=0.5, verbose=False)
+        self._init_timing("YOLOv8")
+
+    def _init_timing(self, label):
+        """初始化正式视频帧的模型耗时统计(不包含预热)。"""
+        self.timing_label = label
+        self._timing = {"calls": 0, "total": 0.0}
+
+    def _record_timing(self, elapsed):
+        self._timing["calls"] += 1
+        self._timing["total"] += max(0.0, float(elapsed))
+
+    def timing_stats(self):
+        calls = self._timing["calls"]
+        total = self._timing["total"]
+        return {
+            "calls": calls,
+            "total_seconds": total,
+            "average_ms": total * 1000.0 / calls if calls else 0.0,
+        }
 
     @staticmethod
     def _find_model(model_dir):
@@ -531,6 +557,7 @@ class YOLOFaceDetector:
         if img is None or img.size == 0:
             return []
 
+        started = time.perf_counter()
         # stream=True: 生成器模式, 减少结果对象包装开销
         results = self._model(img, imgsz=self.yolo_size, conf=conf,
                               device=self.device, verbose=False, stream=True)
@@ -560,6 +587,7 @@ class YOLOFaceDetector:
                     continue  # 长宽比异常, 细长物(手/手臂)误检
                 c = float(box.conf[0]) if box.conf is not None else 0.0
                 out.append(((x1, y1, x2, y2), c))
+        self._record_timing(time.perf_counter() - started)
         return out
 
 
@@ -609,6 +637,7 @@ class YOLO11FaceDetector(YOLOFaceDetector):
         dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
         self._model(dummy, imgsz=self.yolo_size, device=self.device,
                     conf=0.5, verbose=False)
+        self._init_timing("YOLO11")
 
     @staticmethod
     def _find_yolo11_model(model_dir):
@@ -672,6 +701,7 @@ class YOLOv8MFaceDetector(YOLOFaceDetector):
         dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
         self._model(dummy, imgsz=self.yolo_size, device=self.device,
                     conf=0.5, verbose=False)
+        self._init_timing("YOLOv8m")
 
     @staticmethod
     def _find_model_m(model_dir):
@@ -717,6 +747,13 @@ class DualFaceDetector:
         self.last_raw_candidates = []
         self.last_verified_count = 0
         self.last_score_rejected_count = 0
+        self._stereo_split_enabled = False
+        self._stereo_low_conf = STEREO_LOW_CONF
+
+    def enable_stereo_split(self, enabled=True, low_conf=STEREO_LOW_CONF):
+        """启用左右双鱼眼独立检测及同帧软互证。"""
+        self._stereo_split_enabled = bool(enabled)
+        self._stereo_low_conf = max(0.0, float(low_conf))
 
     @staticmethod
     def _iou(a, b):
@@ -756,13 +793,14 @@ class DualFaceDetector:
         return any(self._iou(box, old_box) >= iou_thresh
                    for old_box in existing_boxes)
 
-    def _in_reject_cooldown(self, box, frame_idx):
+    def _in_reject_cooldown(self, box, frame_idx, view_key=None):
         if frame_idx is None or self._reject_cooldown <= 0:
             return False
         self._rejected_candidates = [
             item for item in self._rejected_candidates
             if item["until"] >= frame_idx]
-        return any(self._iou(box, item["box"]) >= self._verify_iou
+        return any(item.get("view") == view_key
+                   and self._iou(box, item["box"]) >= self._verify_iou
                    for item in self._rejected_candidates)
 
     def _dual_score_consistent(self, item):
@@ -816,9 +854,208 @@ class DualFaceDetector:
                 and float(scores[0][1]) > 0.0
                 and float(scores[1][1]) > 0.0)
 
+    @staticmethod
+    def _offset_box(box, dx):
+        return (box[0] + dx, box[1], box[2] + dx, box[3])
+
+    def _offset_items(self, items, dx):
+        shifted = []
+        for item in items:
+            copied = dict(item)
+            copied["box"] = self._offset_box(item["box"], dx)
+            shifted.append(copied)
+        return shifted
+
+    @staticmethod
+    def _item_peak_score(item):
+        values = [float(score) for _, score in (item.get("scores") or ())
+                  if score is not None]
+        return max(values, default=0.0)
+
+    @staticmethod
+    def _normalized_box(box, eye_w, height):
+        cx = (box[0] + box[2]) * 0.5 / max(eye_w, 1)
+        cy = (box[1] + box[3]) * 0.5 / max(height, 1)
+        size = max(box[2] - box[0], box[3] - box[1], 1)
+        return cx, cy, size
+
+    def _stereo_pair_cost(self, left_box, right_box, eye_w, height,
+                          expected_disparity=0.0, calibrated=False):
+        lx, ly, ls = self._normalized_box(left_box, eye_w, height)
+        rx, ry, rs = self._normalized_box(right_box, eye_w, height)
+        x_gate = 0.10 if calibrated else STEREO_X_DISPARITY_GATE
+        dx_error = abs((lx - rx) - expected_disparity)
+        dy = abs(ly - ry)
+        ratio = ls / max(rs, 1)
+        if (dx_error > x_gate or dy > STEREO_Y_GATE
+                or ratio < 0.45 or ratio > 2.20):
+            return None
+        return dx_error / x_gate + dy / STEREO_Y_GATE + abs(1.0 - ratio)
+
+    def _match_stereo_items(self, left_items, right_items, eye_w, height,
+                            expected_disparity=0.0, calibrated=False):
+        pairs = []
+        for li, left in enumerate(left_items):
+            for ri, right in enumerate(right_items):
+                cost = self._stereo_pair_cost(
+                    left["box"], right["box"], eye_w, height,
+                    expected_disparity, calibrated)
+                if cost is not None:
+                    pairs.append((cost, li, ri))
+        pairs.sort()
+        used_left, used_right, matched = set(), set(), []
+        for _, li, ri in pairs:
+            if li in used_left or ri in used_right:
+                continue
+            used_left.add(li)
+            used_right.add(ri)
+            matched.append((li, ri))
+        return matched
+
+    def _cluster_stereo_raw(self, raw_items, confirmed, iou_thresh):
+        """合并同一目内YOLO/SCRFD的低分框，保留本地模型分数。"""
+        clusters = []
+        for raw in raw_items:
+            score = raw.get("score")
+            if score is None or float(score) < self._stereo_low_conf:
+                continue
+            if any(self._iou(raw["box"], item["box"]) >= iou_thresh
+                   for item in confirmed):
+                continue
+            target = next((cluster for cluster in clusters
+                           if self._iou(raw["box"], cluster["box"]) >= 0.30),
+                          None)
+            if target is None:
+                target = {"box": raw["box"], "best": float(score),
+                          "model_scores": {}}
+                clusters.append(target)
+            if float(score) > target["best"]:
+                target["box"] = raw["box"]
+                target["best"] = float(score)
+            model = raw.get("model", "candidate")
+            target["model_scores"][model] = max(
+                float(score), target["model_scores"].get(model, 0.0))
+        return [{
+            "box": cluster["box"],
+            "scores": tuple(cluster["model_scores"].items()),
+            "landmark_risk": 0.0,
+            "source": "C",
+        } for cluster in clusters]
+
+    def _stereo_supported_results(self, left_confirmed, right_confirmed,
+                                  left_raw, right_raw, eye_w, height,
+                                  conf, iou_thresh):
+        # 先用两侧都已确认的人脸估计本帧平均视差；没有可靠配对时
+        # 使用接近零视差的宽门限，适配Pico4相邻双目。
+        confirmed_pairs = self._match_stereo_items(
+            left_confirmed, right_confirmed, eye_w, height)
+        disparities = []
+        for li, ri in confirmed_pairs:
+            lx, _, _ = self._normalized_box(
+                left_confirmed[li]["box"], eye_w, height)
+            rx, _, _ = self._normalized_box(
+                right_confirmed[ri]["box"], eye_w, height)
+            disparities.append(lx - rx)
+        calibrated = bool(disparities)
+        expected = float(np.median(disparities)) if disparities else 0.0
+        paired_left = {li for li, _ in confirmed_pairs}
+        paired_right = {ri for _, ri in confirmed_pairs}
+
+        left_low = self._cluster_stereo_raw(
+            left_raw, left_confirmed, iou_thresh)
+        right_low = self._cluster_stereo_raw(
+            right_raw, right_confirmed, iou_thresh)
+        high_cutoff = float(conf) + STEREO_HIGH_MARGIN
+        high_left = [item for i, item in enumerate(left_confirmed)
+                     if i not in paired_left
+                     and self._item_peak_score(item) >= high_cutoff]
+        high_right = [item for i, item in enumerate(right_confirmed)
+                      if i not in paired_right
+                      and self._item_peak_score(item) >= high_cutoff]
+
+        right_support = []
+        for hi, ci in self._match_stereo_items(
+                high_left, right_low, eye_w, height, expected, calibrated):
+            candidate = dict(right_low[ci])
+            candidate["source"] = "X"
+            candidate["scores"] = tuple(candidate["scores"]) + (
+                ("Stereo-L", self._item_peak_score(high_left[hi])),)
+            right_support.append(candidate)
+
+        left_support = []
+        for ci, hi in self._match_stereo_items(
+                left_low, high_right, eye_w, height, expected, calibrated):
+            candidate = dict(left_low[ci])
+            candidate["source"] = "X"
+            candidate["scores"] = tuple(candidate["scores"]) + (
+                ("Stereo-R", self._item_peak_score(high_right[hi])),)
+            left_support.append(candidate)
+        return left_support, right_support
+
+    def _detect_stereo_with_scores(self, img, conf=FACE_CONF, iou_thresh=0.2,
+                                   include_single=False, raw_conf=None,
+                                   existing_boxes=None, frame_idx=None):
+        height, width = img.shape[:2]
+        mid = width // 2
+        if mid < 2:
+            return self._detect_single_view_with_scores(
+                img, conf, iou_thresh, include_single, raw_conf,
+                existing_boxes, frame_idx)
+        left_img = np.ascontiguousarray(img[:, :mid])
+        right_img = np.ascontiguousarray(img[:, mid:])
+        left_existing, right_existing = [], []
+        for box in existing_boxes or []:
+            if (box[0] + box[2]) * 0.5 < mid:
+                left_existing.append(box)
+            else:
+                right_existing.append(self._offset_box(box, -mid))
+        query_raw = (self._stereo_low_conf if raw_conf is None
+                     else min(float(raw_conf), self._stereo_low_conf))
+
+        left_result = self._detect_single_view_with_scores(
+            left_img, conf, iou_thresh, include_single, query_raw,
+            left_existing, frame_idx, view_key="L")
+        left_candidates = list(self.last_candidates)
+        left_raw = list(self.last_raw_candidates)
+        left_verified = self.last_verified_count
+        left_rejected = self.last_score_rejected_count
+
+        right_result = self._detect_single_view_with_scores(
+            right_img, conf, iou_thresh, include_single, query_raw,
+            right_existing, frame_idx, view_key="R")
+        right_candidates = list(self.last_candidates)
+        right_raw = list(self.last_raw_candidates)
+        right_verified = self.last_verified_count
+        right_rejected = self.last_score_rejected_count
+
+        left_support, right_support = self._stereo_supported_results(
+            left_result, right_result, left_raw, right_raw,
+            mid, height, conf, iou_thresh)
+        self.last_candidates = (left_candidates
+                                + self._offset_items(right_candidates, mid))
+        self.last_raw_candidates = (left_raw
+                                    + self._offset_items(right_raw, mid))
+        self.last_verified_count = left_verified + right_verified
+        self.last_score_rejected_count = left_rejected + right_rejected
+        return (left_result + left_support
+                + self._offset_items(right_result + right_support, mid))
+
     def detect_with_scores(self, img, conf=FACE_CONF, iou_thresh=0.2,
                            include_single=False, raw_conf=None,
                            existing_boxes=None, frame_idx=None):
+        if self._stereo_split_enabled and img.shape[1] >= 2 * img.shape[0]:
+            return self._detect_stereo_with_scores(
+                img, conf, iou_thresh, include_single, raw_conf,
+                existing_boxes, frame_idx)
+        return self._detect_single_view_with_scores(
+            img, conf, iou_thresh, include_single, raw_conf,
+            existing_boxes, frame_idx)
+
+    def _detect_single_view_with_scores(self, img, conf=FACE_CONF,
+                                        iou_thresh=0.2,
+                                        include_single=False, raw_conf=None,
+                                        existing_boxes=None, frame_idx=None,
+                                        view_key=None):
         """返回已确认框；单模型结果只是候选，不能直接创建轨迹。"""
         query_conf = conf if raw_conf is None else min(float(conf), float(raw_conf))
         dets_a_all = self._detect_with_details(self._det_a, img, query_conf)
@@ -918,7 +1155,8 @@ class DualFaceDetector:
 
         active_verify = [
             item for item in verify_candidates
-            if not self._in_reject_cooldown(item["box"], frame_idx)]
+            if not self._in_reject_cooldown(
+                item["box"], frame_idx, view_key=view_key)]
         if not active_verify:
             return kept
         # 复核器只在已有候选框的局部位置做 IoU 匹配，因此可以使用比
@@ -946,6 +1184,7 @@ class DualFaceDetector:
                 self._rejected_candidates.append({
                     "box": item["box"],
                     "until": frame_idx + self._reject_cooldown,
+                    "view": view_key,
                 })
         return kept
 
@@ -1049,6 +1288,7 @@ class SCRFDFaceDetector:
                 model_path, options, providers=["CPUExecutionProvider"])
             self._sess.run(self._output_names, {self._input_name: dummy})
         self.backend = self._sess.get_providers()[0]
+        self.timing_label = f"SCRFD-{self.model}"
         # 仅统计正式视频帧；模型加载和上面的预热不计入运行时性能数据。
         self._timing = {
             "calls": 0,
@@ -1375,6 +1615,7 @@ class SCRFDVerifier(SCRFDFaceDetector):
                          conf=conf, nms_thresh=nms_thresh, device=device,
                          gpu_id=gpu_id, use_gpu=use_gpu,
                          landmark_filter=landmark_filter)
+        self.timing_label = f"SCRFD-{self.model}(复核)"
         self._iou_thresh = iou_thresh
         self._keep_conf = keep_conf
 
@@ -1415,6 +1656,57 @@ class SCRFDVerifier(SCRFDFaceDetector):
         inter = (ix2 - ix1) * (iy2 - iy1)
         ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
         return inter / ua if ua > 0 else 0.0
+
+
+def _model_timing_snapshot(detectors):
+    """递归收集双模型中的各个实际模型计时快照。"""
+    pending = list(detectors)
+    seen = set()
+    snapshot = {}
+    while pending:
+        detector = pending.pop(0)
+        if detector is None or id(detector) in seen:
+            continue
+        seen.add(id(detector))
+        if isinstance(detector, DualFaceDetector):
+            pending.extend([detector._det_a, detector._det_b,
+                            detector._verifier])
+            continue
+        timing = getattr(detector, "timing_stats", None)
+        if timing is None:
+            continue
+        stats = timing()
+        label = getattr(detector, "timing_label", detector.__class__.__name__)
+        # 同一标签理论上不应出现两次；若出现(例如两个同规格模型)，
+        # 用序号区分，避免日志覆盖统计。
+        key = label
+        suffix = 2
+        while key in snapshot:
+            key = f"{label}#{suffix}"
+            suffix += 1
+        snapshot[key] = {
+            "calls": int(stats.get("calls", 0)),
+            "total_seconds": float(stats.get("total_seconds", 0.0)),
+            "average_ms": float(stats.get("average_ms", 0.0)),
+        }
+    return snapshot
+
+
+def _format_model_timing(detectors, previous=None):
+    """格式化本次日志周期和累计的模型调用次数/耗时。"""
+    current = _model_timing_snapshot(detectors)
+    previous = previous or {}
+    parts = []
+    for label, stats in current.items():
+        old = previous.get(label, {})
+        delta_calls = stats["calls"] - int(old.get("calls", 0))
+        delta_seconds = stats["total_seconds"] - float(old.get("total_seconds", 0.0))
+        parts.append(
+            f"{label}: 本段{delta_calls}次/{delta_seconds * 1000.0:.1f}ms, "
+            f"累计{stats['calls']}次/{stats['total_seconds']:.3f}s, "
+            f"均值{stats['average_ms']:.1f}ms"
+        )
+    return " | ".join(parts) if parts else "模型: 无调用", current
 
 
 def _log_scrfd_timing(detectors, log):
@@ -2388,6 +2680,13 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         face_model, model_dir, face_size, face_conf, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_landmark_filter, log)
+    stereo_split = (_is_dual_fisheye(w, h, fisheye_dual)
+                    and isinstance(fd, DualFaceDetector))
+    if stereo_split:
+        fd.enable_stereo_split(True)
+        log(f"  [双鱼眼] 左右独立检测 + 低分互证 "
+            f"(每目输入={face_size}, 低分候选>={fd._stereo_low_conf:.2f}, "
+            f"高分增量={STEREO_HIGH_MARGIN:.2f})")
     scrfd_verifier = _create_scrfd_verifier(
         scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
@@ -2579,6 +2878,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     encoder_finished_early = False
     _PIPE_TIMEOUT = 5  # 秒, 队列超时阈值
     frame_buffer = []
+    timing_snapshot = _model_timing_snapshot((fd, scrfd_verifier))
 
     def _enqueue_image(image):
         nonlocal encoder_finished_early
@@ -2650,8 +2950,10 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                     break
 
             if frame_idx % 50 == 0:
+                model_timing, timing_snapshot = _format_model_timing(
+                    (fd, scrfd_verifier), timing_snapshot)
                 log(f"    [{frame_idx}] 人脸={len(faces)} "
-                    f"elapsed={time.time()-t0:.0f}s")
+                    f"elapsed={time.time()-t0:.0f}s | {model_timing}")
         if not encoder_finished_early:
             for item in frame_buffer:
                 if not _enqueue_image(item["image"]):
@@ -2697,6 +2999,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         for who, e in pipeline_error:
             log(f"  [流水线错误] {who}: {e}")
 
+    final_model_timing, _ = _format_model_timing((fd, scrfd_verifier))
+    log(f"  [模型性能汇总] {final_model_timing}")
     _log_scrfd_timing((fd, scrfd_verifier), log)
     elapsed = time.time() - t0
     # 完整性检查: 超高帧率视频管道可能跟不上下游, 若实际处理帧远低于预期则自动回退文件模式
@@ -2771,6 +3075,13 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         face_model, model_dir, face_size, face_conf, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_landmark_filter, log)
+    stereo_split = (_is_dual_fisheye(w, h, fisheye_dual)
+                    and isinstance(fd, DualFaceDetector))
+    if stereo_split:
+        fd.enable_stereo_split(True)
+        log(f"  [双鱼眼] 左右独立检测 + 低分互证 "
+            f"(每目输入={face_size}, 低分候选>={fd._stereo_low_conf:.2f}, "
+            f"高分增量={STEREO_HIGH_MARGIN:.2f})")
     scrfd_verifier = _create_scrfd_verifier(
         scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
@@ -2794,6 +3105,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
     total_face = 0
     frame_buffer = []
+    timing_snapshot = _model_timing_snapshot((fd, scrfd_verifier))
 
     for i, fn in enumerate(frames, 1):
         img = cv2.imread(os.path.join(fin, fn))
@@ -2828,7 +3140,10 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                 os.path.join(fout, oldest["filename"]), oldest["image"],
                 [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
-            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} elapsed={time.time()-t0:.0f}s")
+            model_timing, timing_snapshot = _format_model_timing(
+                (fd, scrfd_verifier), timing_snapshot)
+            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} "
+                f"elapsed={time.time()-t0:.0f}s | {model_timing}")
 
     for item in frame_buffer:
         cv2.imwrite(
@@ -2859,6 +3174,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         return False
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
+    final_model_timing, _ = _format_model_timing((fd, scrfd_verifier))
+    log(f"  [模型性能汇总] {final_model_timing}")
     _log_scrfd_timing((fd, scrfd_verifier), log)
     log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face}")
     return True
