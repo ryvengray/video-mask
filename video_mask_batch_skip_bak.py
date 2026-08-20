@@ -8,7 +8,7 @@ video_mask_batch.py — 视频批量打码（人脸 + 信用卡/银行卡），�
   检测间隔+光流跟踪(每3帧检测1次, 中间帧LK跟踪)
 信用卡/银行卡:
   OWLv2 深度学习零样本检测(默认, 高准确率, 任意颜色/遮挡) + LK 光流跟踪
-  可选几何法(--card-detector geo, 快但准确率一般, 适合边缘完整的卡)
+  可选几何法(--card---detector geo, 快但准确率一般, 适合边缘完整的卡)
 
 加速:
   管道模式(ffmpeg rawvideo → Python → ffmpeg, 无磁盘I/O)

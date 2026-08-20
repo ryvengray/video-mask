@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+scrfd = [
+  "onnxruntime>=1.16,<2",
+]
 cards = [
   "pillow>=9.0",
   "torch>=2.0",

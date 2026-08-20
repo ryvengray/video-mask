@@ -1,2 +1,4 @@
 # OWLv2 高精度银行卡检测
+# 注意: OWLv2 的 image_processor 运行时依赖 scipy, 必须在 [cards] 之外显式安装
 -e .[cards]
+scipy>=1.9
