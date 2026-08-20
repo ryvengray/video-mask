@@ -64,6 +64,10 @@ FACE_DETECT_INT = 5           # 常态每5帧检测一次；变化期临时逐�
 FACE_EMPTY_DETECT_INT = 5     # 无人场景每5帧扫描一次，避免空场景浪费推理
 FACE_BACKFILL = 5             # 双模型确认后，最多回补此前5帧的单模型候选
 FACE_BURST = 5                # 检测人数变化后，接下来5帧逐帧检测
+SCRFD_ADAPTIVE_VERIFY_MARGIN = 0.15  # 新候选进入10g复核区间的分数增量
+SCRFD_ADAPTIVE_VERIFY_IOU = 0.3     # 10g复核框与候选框的最低IoU
+SCRFD_LANDMARK_RISK_THRESHOLD = 0.35  # 五点软风险达到该值时触发10g，不直接拒绝
+SCRFD_REJECT_COOLDOWN = 5           # 10g拒绝后，同位置候选暂停复核的帧数
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
 FACE_GRACE = 3               # 单张脸允许漏掉的检测周期数
 FACE_BOX_SMOOTH = 0.65       # 检测框EMA中本次检测权重(越低越稳, 越高越跟手)
@@ -107,7 +111,7 @@ def _ensure_writable_frame(img):
 
 
 def draw_face_debug_scores(img, debug_faces):
-    """绘制模型分值：D=双模型、S=单模型续轨、T=跟踪。"""
+    """绘制模型分值：D=双模型、V=10g确认、S=单模型续轨、T=跟踪。"""
     h, w = img.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.45, min(0.85, min(w, h) / 1100.0))
@@ -129,7 +133,8 @@ def draw_face_debug_scores(img, debug_faces):
         top = max(0, ty - th - 5)
         bottom = min(h - 1, ty + base + 5)
         cv2.rectangle(img, (tx, top), (min(w - 1, tx + tw + 8), bottom), (0, 0, 0), -1)
-        colors = {"D": (0, 255, 0), "S": (255, 180, 0), "T": (0, 200, 255)}
+        colors = {"D": (0, 255, 0), "V": (255, 0, 255),
+                  "S": (255, 180, 0), "T": (0, 200, 255)}
         color = colors.get(item.get("source"), (0, 200, 255))
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(img, text, (tx + 4, ty), font, scale, color, thickness, cv2.LINE_AA)
@@ -685,14 +690,27 @@ class DualFaceDetector:
     此时双方不一致, 不打码, 宁可漏打不误打)。
     支持任意两个检测器组合: YOLO11+YuNet, YOLOv8+YOLO11 等。
     """
-    def __init__(self, det_a, det_b, name_a="A", name_b="B"):
+    def __init__(self, det_a, det_b, name_a="A", name_b="B",
+                 verifier=None, verify_margin=SCRFD_ADAPTIVE_VERIFY_MARGIN,
+                 verify_iou=SCRFD_ADAPTIVE_VERIFY_IOU,
+                 landmark_risk_threshold=SCRFD_LANDMARK_RISK_THRESHOLD,
+                 reject_cooldown=SCRFD_REJECT_COOLDOWN):
         self._det_a = det_a
         self._det_b = det_b
         self._name_a = name_a
         self._name_b = name_b
         self._name = f"{name_a}+{name_b}"
+        # 可选的高精度复核器。只用于新出现的中等置信度候选，
+        # 不参与常规双模型检测，避免把10g变成逐帧主模型。
+        self._verifier = verifier
+        self._verify_margin = max(0.0, float(verify_margin))
+        self._verify_iou = float(verify_iou)
+        self._landmark_risk_threshold = float(landmark_risk_threshold)
+        self._reject_cooldown = max(0, int(reject_cooldown))
+        self._rejected_candidates = []
         self.last_candidates = []
         self.last_raw_candidates = []
+        self.last_verified_count = 0
 
     @staticmethod
     def _iou(a, b):
@@ -714,58 +732,144 @@ class DualFaceDetector:
             return detector.detect_with_conf(img, conf=conf)
         return [(box, None) for box in detector.detect(img, conf=conf)]
 
+    def _detect_with_details(self, detector, img, conf):
+        pairs = self._detect_with_conf(detector, img, conf)
+        details = getattr(detector, "last_detection_details", ())
+        enriched = []
+        for box, score in pairs:
+            risk = 0.0
+            for detail in details:
+                if self._iou(box, detail["box"]) >= 0.999:
+                    risk = float(detail.get("landmark_risk", 0.0))
+                    break
+            enriched.append({"box": box, "score": score,
+                             "landmark_risk": risk})
+        return enriched
+
+    def _is_tracked(self, box, existing_boxes, iou_thresh):
+        return any(self._iou(box, old_box) >= iou_thresh
+                   for old_box in existing_boxes)
+
+    def _in_reject_cooldown(self, box, frame_idx):
+        if frame_idx is None or self._reject_cooldown <= 0:
+            return False
+        self._rejected_candidates = [
+            item for item in self._rejected_candidates
+            if item["until"] >= frame_idx]
+        return any(self._iou(box, item["box"]) >= self._verify_iou
+                   for item in self._rejected_candidates)
+
     def detect_with_scores(self, img, conf=FACE_CONF, iou_thresh=0.2,
-                           include_single=False, raw_conf=None):
-        """返回共识框及两个模型各自分值，供 debug 模式区分检测/跟踪。"""
+                           include_single=False, raw_conf=None,
+                           existing_boxes=None, frame_idx=None):
+        """返回已确认框；单模型结果只是候选，不能直接创建轨迹。"""
         query_conf = conf if raw_conf is None else min(float(conf), float(raw_conf))
-        dets_a_all = self._detect_with_conf(self._det_a, img, query_conf)
-        dets_a = [(box, score) for box, score in dets_a_all
-                  if score is None or score >= conf]
-        if not dets_a_all and not include_single:
-            self.last_candidates = []
-            return []
-        dets_b_all = self._detect_with_conf(self._det_b, img, query_conf)
-        dets_b = [(box, score) for box, score in dets_b_all
-                  if score is None or score >= conf]
+        dets_a_all = self._detect_with_details(self._det_a, img, query_conf)
+        dets_b_all = self._detect_with_details(self._det_b, img, query_conf)
+        dets_a = [item for item in dets_a_all
+                  if item["score"] is None or item["score"] >= conf]
+        dets_b = [item for item in dets_b_all
+                  if item["score"] is None or item["score"] >= conf]
         self.last_raw_candidates = [
-            {"box": box, "model": self._name_a, "score": score,
-             "formal": score is None or score >= conf}
-            for box, score in dets_a_all
+            {"box": item["box"], "model": self._name_a,
+             "score": item["score"],
+             "formal": item["score"] is None or item["score"] >= conf}
+            for item in dets_a_all
         ] + [
-            {"box": box, "model": self._name_b, "score": score,
-             "formal": score is None or score >= conf}
-            for box, score in dets_b_all
+            {"box": item["box"], "model": self._name_b,
+             "score": item["score"],
+             "formal": item["score"] is None or item["score"] >= conf}
+            for item in dets_b_all
         ]
-        # 单模型结果不能创建新轨迹，但可以在镜头移动/运动模糊时
-        # 续上已经由双模型确认过的轨迹。
-        self.last_candidates = [] if not include_single else [
-            {"box": box, "scores": ((self._name_a, score), (self._name_b, None))}
-            for box, score in dets_a
-        ] + ([
-            {"box": box, "scores": ((self._name_a, None), (self._name_b, score))}
-            for box, score in dets_b
-        ] if include_single else [])
-        if not dets_a or not dets_b:
-            return []
+
         # 贪心匹配: 对每个 A 框找最佳 IoU 匹配的 B 框
         consensus = []
-        used = set()
-        for da, conf_a in dets_a:
+        used_a, used_b = set(), set()
+        for ai, da in enumerate(dets_a):
             best_iou, best_j = 0, -1
-            for j, (db, _) in enumerate(dets_b):
-                if j in used:
+            for j, db in enumerate(dets_b):
+                if j in used_b:
                     continue
-                score = self._iou(da, db)
+                score = self._iou(da["box"], db["box"])
                 if score > best_iou:
                     best_iou, best_j = score, j
             if best_iou >= iou_thresh and best_j >= 0:
-                _, conf_b = dets_b[best_j]
+                db = dets_b[best_j]
                 consensus.append({
-                    "box": da,
-                    "scores": ((self._name_a, conf_a), (self._name_b, conf_b)),
+                    "box": da["box"],
+                    "scores": ((self._name_a, da["score"]),
+                               (self._name_b, db["score"])),
+                    "landmark_risk": max(da["landmark_risk"],
+                                         db["landmark_risk"]),
+                    "source": "D",
                 })
-                used.add(best_j)
-        return consensus
+                used_a.add(ai)
+                used_b.add(best_j)
+
+        singles = ([{
+            "box": item["box"],
+            "scores": ((self._name_a, item["score"]), (self._name_b, None)),
+            "landmark_risk": item["landmark_risk"], "source": "C",
+        } for ai, item in enumerate(dets_a) if ai not in used_a] + [{
+            "box": item["box"],
+            "scores": ((self._name_a, None), (self._name_b, item["score"])),
+            "landmark_risk": item["landmark_risk"], "source": "C",
+        } for bi, item in enumerate(dets_b) if bi not in used_b])
+        self.last_candidates = list(singles) if include_single else []
+
+        # 已确认轨迹可由双模型或任一主模型续接；只有新人脸候选才需要
+        # 做分数/五点软风险判断并按需调用10g。
+        self.last_verified_count = 0
+        existing_boxes = existing_boxes or []
+        kept = []
+        verify_candidates = []
+        verify_high = float(conf) + self._verify_margin
+        for item in consensus:
+            if self._is_tracked(item["box"], existing_boxes, iou_thresh):
+                kept.append(item)
+                continue
+            scores = [float(score) for _, score in item["scores"]
+                      if score is not None]
+            medium_conf = bool(scores) and min(scores) < verify_high
+            risky_landmarks = (item["landmark_risk"]
+                               >= self._landmark_risk_threshold)
+            if self._verifier is not None and (medium_conf or risky_landmarks):
+                verify_candidates.append(item)
+            else:
+                kept.append(item)
+
+        if self._verifier is not None:
+            # YOLO或2.5g单独检出的新人脸也可成为候选；必须由10g匹配后
+            # 才能创建confirmed轨迹。已有轨迹的单模型框仍由上层续轨。
+            verify_candidates.extend(
+                item for item in singles
+                if not self._is_tracked(item["box"], existing_boxes, iou_thresh))
+        if not verify_candidates:
+            return kept
+
+        active_verify = [
+            item for item in verify_candidates
+            if not self._in_reject_cooldown(item["box"], frame_idx)]
+        if not active_verify:
+            return kept
+        verified = self._detect_with_conf(self._verifier, img, float(conf))
+        self.last_verified_count = len(active_verify)
+        for item in active_verify:
+            matches = [(self._iou(item["box"], box), box, score)
+                       for box, score in verified]
+            best = max(matches, default=(0.0, None, None), key=lambda row: row[0])
+            if best[0] >= self._verify_iou:
+                confirmed = dict(item)
+                confirmed["source"] = "V"
+                confirmed["scores"] = tuple(item["scores"]) + (
+                    ("SCRFD-10g", best[2]),)
+                kept.append(confirmed)
+            elif frame_idx is not None and self._reject_cooldown > 0:
+                self._rejected_candidates.append({
+                    "box": item["box"],
+                    "until": frame_idx + self._reject_cooldown,
+                })
+        return kept
 
 
 class SCRFDFaceDetector:
@@ -806,6 +910,7 @@ class SCRFDFaceDetector:
         self.model = model
         self.model_path = model_path
         self.landmark_filter = bool(landmark_filter)
+        self.last_detection_details = []
         self._center_cache = {}
 
         requested = device.lower()
@@ -999,10 +1104,11 @@ class SCRFDFaceDetector:
         if left_eye[0] >= right_eye[0] or left_mouth[0] >= right_mouth[0]:
             return False
 
-        # 强侧脸时双眼或嘴角的 x 投影可能接近，因此下限只排除点位倒置。
+        # 强侧脸时双眼的x投影可能几乎重合；这里只排除完全坍缩的回归，
+        # 可疑但仍有顺序的侧脸交给下面的软风险和10g复核。
         eye_span = float(right_eye[0] - left_eye[0]) / width
         mouth_span = float(right_mouth[0] - left_mouth[0]) / width
-        if not (0.04 <= eye_span <= 0.75 and 0.03 <= mouth_span <= 0.75):
+        if not (0.01 <= eye_span <= 0.75 and 0.03 <= mouth_span <= 0.75):
             return False
 
         eye_y = float(left_eye[1] + right_eye[1]) / 2.0
@@ -1038,6 +1144,47 @@ class SCRFDFaceDetector:
         return True
 
     @staticmethod
+    def _landmark_soft_risk(box, kps):
+        """返回0~1的五点软风险；只触发复核，不直接删除候选。
+
+        基础拓扑过滤负责排除明显不可能的人脸。这里识别的是仍能通过
+        基础过滤、但鼻点/五官比例比较可疑的候选。真实强侧脸也可能得到
+        较高风险，因此风险只能交给10g复核，不能作为硬拒绝条件。
+        """
+        x1, y1, x2, y2 = [float(v) for v in box]
+        width, height = x2 - x1, y2 - y1
+        points = np.asarray(kps, dtype=np.float32)
+        if width <= 0 or height <= 0 or points.shape != (5, 2):
+            return 1.0
+
+        left_eye, right_eye, nose, left_mouth, right_mouth = points
+        eye_center_x = float(left_eye[0] + right_eye[0]) / 2.0
+        mouth_center_x = float(left_mouth[0] + right_mouth[0]) / 2.0
+        corridor_margin = 0.08 * width
+        corridor_left = min(eye_center_x, mouth_center_x) - corridor_margin
+        corridor_right = max(eye_center_x, mouth_center_x) + corridor_margin
+        nose_x = float(nose[0])
+        outside = max(corridor_left - nose_x, nose_x - corridor_right, 0.0) / width
+        # 当前手部样例约偏出0.09个框宽；0.12以上视为满风险。
+        nose_risk = min(1.0, outside / 0.12)
+
+        eye_span = abs(float(right_eye[0] - left_eye[0])) / width
+        mouth_span = abs(float(right_mouth[0] - left_mouth[0])) / width
+        span_max = max(eye_span, mouth_span, 1e-6)
+        span_balance = min(eye_span, mouth_span) / span_max
+        span_risk = max(0.0, min(1.0, (0.35 - span_balance) / 0.35))
+
+        eye_y = float(left_eye[1] + right_eye[1]) / 2.0
+        mouth_y = float(left_mouth[1] + right_mouth[1]) / 2.0
+        vertical_span = max(mouth_y - eye_y, 1e-6)
+        nose_ratio = (float(nose[1]) - eye_y) / vertical_span
+        vertical_risk = min(1.0, abs(nose_ratio - 0.5) / 0.55)
+
+        return float(min(1.0, 0.70 * nose_risk
+                         + 0.20 * span_risk
+                         + 0.10 * vertical_risk))
+
+    @staticmethod
     def _nms(dets, threshold):
         x1, y1, x2, y2 = dets[:, 0], dets[:, 1], dets[:, 2], dets[:, 3]
         areas = (x2 - x1 + 1) * (y2 - y1 + 1)
@@ -1062,6 +1209,7 @@ class SCRFDFaceDetector:
 
     def detect_with_conf(self, img, conf=None):
         """返回 [((x1,y1,x2,y2), score), ...]。"""
+        self.last_detection_details = []
         if img is None or img.size == 0:
             return []
         preprocess_started = time.perf_counter()
@@ -1120,8 +1268,16 @@ class SCRFDFaceDetector:
         if self.landmark_filter:
             valid = [self._landmarks_plausible(row[:4], kps)
                      for row, kps in zip(dets, kpss)]
-            dets = dets[np.asarray(valid, dtype=bool)]
-        result = [(tuple(row[:4]), float(row[4])) for row in dets]
+            valid = np.asarray(valid, dtype=bool)
+            dets = dets[valid]
+            kpss = kpss[valid]
+        self.last_detection_details = [
+            {"box": tuple(row[:4]), "score": float(row[4]),
+             "landmark_risk": self._landmark_soft_risk(row[:4], kps)}
+            for row, kps in zip(dets, kpss)
+        ]
+        result = [(item["box"], item["score"])
+                  for item in self.last_detection_details]
         postprocess_finished = time.perf_counter()
         self._record_timing(
             preprocess_finished - preprocess_started,
@@ -1193,7 +1349,7 @@ def _log_scrfd_timing(detectors, log):
             continue
         seen.add(id(detector))
         if isinstance(detector, DualFaceDetector):
-            pending.extend([detector._det_a, detector._det_b])
+            pending.extend([detector._det_a, detector._det_b, detector._verifier])
             continue
         if not isinstance(detector, SCRFDFaceDetector):
             continue
@@ -1550,6 +1706,7 @@ class FaceProcessor:
             self.tracks.append({
                 "id": self._next_track_id,
                 "box": box,
+                "confirmed": True,
                 "misses": 0,
                 "hits": 1,
                 "visible": True,
@@ -1666,12 +1823,15 @@ class FaceProcessor:
                     img, conf=self.conf, iou_thresh=self.dual_iou,
                     include_single=(bool(self.tracks) or raw_debug
                                     or self.backfill_frames > 0),
-                    raw_conf=self.conf / 2.0 if raw_debug else None)
+                    raw_conf=self.conf / 2.0 if raw_debug else None,
+                    existing_boxes=[track["box"] for track in self.tracks
+                                    if track.get("confirmed", True)],
+                    frame_idx=frame_idx)
                 self.last_raw_debug_faces = list(self.detector.last_raw_candidates) if raw_debug else []
                 dets = [item["box"] for item in dual_dets]
                 debug_scores = [item["scores"] for item in dual_dets]
                 allow_new = [True] * len(dets)
-                debug_sources = ["D"] * len(dets)
+                debug_sources = [item.get("source", "D") for item in dual_dets]
                 self._update_backfill_candidates(
                     frame_idx, dual_dets, self.detector.last_candidates)
                 detection_count = len(dual_dets)
@@ -1712,12 +1872,14 @@ class FaceProcessor:
                 self._burst_remaining = self.burst_frames
             self._last_detection_count = detection_count
         self.last_faces = [
-            track["box"] for track in self.tracks if track.get("visible", True)]
+            track["box"] for track in self.tracks
+            if track.get("confirmed", True) and track.get("visible", True)]
         self.last_debug_faces = [
             {"box": track["box"], "scores": track.get("debug_scores"),
              "source": track.get("debug_source", "T")}
             for track in self.tracks
-            if track.get("visible", True) and track.get("debug_scores") is not None
+            if (track.get("confirmed", True) and track.get("visible", True)
+                and track.get("debug_scores") is not None)
         ]
         self.prev_gray = gray
         return self.last_faces
@@ -1929,12 +2091,26 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
                           scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
                           scrfd_landmark_filter, log):
     """按 --face-model 创建单模型或双模型共识检测器。"""
-    def make_scrfd():
+    def make_scrfd(model_name=scrfd_model):
         return SCRFDFaceDetector(
-            model_dir=model_dir, model=scrfd_model, input_size=face_size,
+            model_dir=model_dir, model=model_name, input_size=face_size,
             conf=face_conf, nms_thresh=scrfd_nms, device=scrfd_device,
             gpu_id=scrfd_gpu_id, use_gpu=use_gpu,
             landmark_filter=scrfd_landmark_filter)
+
+    def make_adaptive_verifier():
+        # 2.5g主检时，10g只在中等置信度新人脸上按需调用。
+        if scrfd_model != "2.5g":
+            return None
+        try:
+            verifier = make_scrfd("10g")
+            log(f"  [人脸] SCRFD-10g 按需复核已启用 "
+                f"(分数区间={face_conf:.2f}~{face_conf + SCRFD_ADAPTIVE_VERIFY_MARGIN:.2f}, "
+                f"IoU={SCRFD_ADAPTIVE_VERIFY_IOU:.2f})")
+            return verifier
+        except Exception as exc:
+            log(f"  [警告] SCRFD-10g 按需复核初始化失败: {exc}; 继续使用主模型")
+            return None
 
     if face_model == "yolo11+yunet":
         detector = DualFaceDetector(
@@ -1950,17 +2126,21 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
         log(f"  [人脸] YOLOv8+YOLO11 双模型共识 (输入{face_size})")
     elif face_model == "yolov8+scrfd":
         scrfd = make_scrfd()
+        verifier = make_adaptive_verifier()
         detector = DualFaceDetector(
             YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
-            scrfd, name_a="YOLOv8", name_b=f"SCRFD-{scrfd_model}")
+            scrfd, name_a="YOLOv8", name_b=f"SCRFD-{scrfd_model}",
+            verifier=verifier)
         log(f"  [人脸] YOLOv8+SCRFD-{scrfd_model} 严格双模型共识 "
             f"(输入{face_size}, SCRFD五点拓扑={scrfd_landmark_filter}, "
             f"SCRFD后端={scrfd.backend})")
     elif face_model == "yolo11+scrfd":
         scrfd = make_scrfd()
+        verifier = make_adaptive_verifier()
         detector = DualFaceDetector(
             YOLO11FaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
-            scrfd, name_a="YOLO11", name_b=f"SCRFD-{scrfd_model}")
+            scrfd, name_a="YOLO11", name_b=f"SCRFD-{scrfd_model}",
+            verifier=verifier)
         log(f"  [人脸] YOLO11+SCRFD-{scrfd_model} 严格双模型共识 "
             f"(输入{face_size}, SCRFD五点拓扑={scrfd_landmark_filter}, "
             f"SCRFD后端={scrfd.backend})")
