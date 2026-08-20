@@ -61,6 +61,7 @@ MANUAL_UPLOAD_MAX_BYTES = 20 * 1024 * 1024 * 1024
 FRAME_PREVIEW_HEIGHT = 240
 FRAME_PREVIEW_PER_MINUTE = 2
 FRAME_PREVIEW_MAX_IMAGES = 24
+PLAYBACK_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 def frame_preview_timestamps(task_id: str, duration_seconds: float) -> list[float]:
@@ -654,10 +655,19 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             f'inline; filename="{ascii_filename}"; '
             f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
         )
+        # The dashboard sits behind Nginx.  Its normal proxy buffering is a
+        # good default for HTML/API responses, but it delays small byte-range
+        # reads that HTML5 players use while starting and seeking.  Tell the
+        # proxy to relay this response as it arrives instead.
+        response_headers["X-Accel-Buffering"] = "no"
 
         def stream_video():
             try:
-                while chunk := upstream.read(1024 * 1024):
+                # Do not wait for a whole MiB before returning the first data
+                # to the browser.  At a 4 MiB/s path that alone adds 250 ms to
+                # every range response, which makes seeking and startup look
+                # like buffering even when the transfer rate is adequate.
+                while chunk := upstream.read(PLAYBACK_STREAM_CHUNK_BYTES):
                     yield chunk
             finally:
                 upstream.close()
