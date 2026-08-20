@@ -906,9 +906,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return store.get_algorithm_defaults()
 
     @app.put("/api/admin/algorithm-defaults")
-    def set_algorithm_defaults(request: AlgorithmDefaultsRequest,
-                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        require_admin(authorization)
+    def set_algorithm_defaults(request: AlgorithmDefaultsRequest) -> dict[str, Any]:
+        # Dashboard access is protected by the same outer proxy authentication
+        # as the UI control, so this browser-facing endpoint has no token prompt.
         return store.set_algorithm_defaults(request.algorithm, request.arguments)
 
     @app.put("/api/admin/s3-ingest")
