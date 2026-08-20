@@ -67,7 +67,7 @@ async function loadTasks(projectId) {
             <h3>任务: ${escapeHtml(t.task_id)}</h3>
             <p>状态: <span class="status-badge status-${t.status}">${t.status}</span></p>
             <div class="actions">
-                ${t.status === "pending" ? `<button class="btn-primary" onclick="syncTask(${t.id})">同步视频</button>` : ""}
+                ${["pending", "error"].includes(t.status) ? `<button class="btn-primary" onclick="syncTask(${t.id})">${t.status === "error" ? "重新同步" : "同步视频"}</button>` : ""}
                 ${t.status === "ready" ? `<button class="btn-primary" onclick="openAudit(${t.id})">审核</button>` : ""}
             </div>
         </div>
@@ -75,9 +75,14 @@ async function loadTasks(projectId) {
 }
 
 async function syncTask(taskId) {
-    await API.post(`/api/tasks/${taskId}/sync`, {});
-    await loadTasks(currentProject);
-    alert("视频同步完成");
+    try {
+        await API.post(`/api/tasks/${taskId}/sync`, {});
+        await loadTasks(currentProject);
+        alert("视频同步完成");
+    } catch (error) {
+        await loadTasks(currentProject);
+        alert(`视频同步失败: ${error.message}`);
+    }
 }
 
 document.getElementById("create-project-btn").addEventListener("click", () => {

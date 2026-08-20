@@ -59,14 +59,17 @@ const panels = {
   workers: document.getElementById('panel-workers'),
   statistics: document.getElementById('panel-statistics'),
   settings: document.getElementById('panel-settings'),
+  cost: document.getElementById('panel-cost'),
 };
+const costFrame = document.getElementById('cost-monitor-frame');
 function activate(name) {
   tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.tab === name));
   Object.entries(panels).forEach(([key, panel]) => panel.classList.toggle('active', key === name));
+  if (name === 'cost' && costFrame && !costFrame.getAttribute('src')) costFrame.src = costFrame.dataset.src;
   if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
 }
 tabs.forEach(tab => tab.addEventListener('click', () => activate(tab.dataset.tab)));
-activate(['tasks', 'workers', 'statistics', 'settings'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'tasks');
+activate(['tasks', 'workers', 'statistics', 'settings', 'cost'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'tasks');
 const workerFilter = document.getElementById('worker-status-filter');
 workerFilter?.addEventListener('change', () => {
   const selected = workerFilter.value;
@@ -319,6 +322,99 @@ document.addEventListener('keydown', event => {
 });
 scheduleAutoRefresh();
 const taskTable = document.querySelector('.task-table');
+
+function copyTaskId(value, button) {
+  const fallback = () => {
+    const input = document.createElement('textarea');
+    input.value = value;
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    document.body.append(input);
+    input.select();
+    document.execCommand('copy');
+    input.remove();
+  };
+  const copied = navigator.clipboard?.writeText
+    ? navigator.clipboard.writeText(value).catch(fallback)
+    : Promise.resolve().then(fallback);
+  copied.then(() => {
+    const original = button.textContent;
+    button.textContent = 'Copied';
+    window.setTimeout(() => { button.textContent = original; }, 1200);
+  }).catch(() => window.alert('Unable to copy the task ID.'));
+}
+
+function taskFilename(path) {
+  return path.split('/').filter(Boolean).at(-1) || 'video.mp4';
+}
+
+async function downloadTaskFile(button) {
+  const {taskId, file, filePath} = button.dataset;
+  if (!taskId || !file) return;
+  button.disabled = true;
+  try {
+    const response = await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/play-url?file=${encodeURIComponent(file)}&download=true`,
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    const link = document.createElement('a');
+    link.href = payload.url;
+    link.download = taskFilename(filePath || '');
+    document.body.append(link);
+    link.click();
+    link.remove();
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : 'Unable to download this file.');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function enhanceTaskIdentifiersAndFiles() {
+  if (!taskTable) return;
+  taskTable.querySelectorAll('td.task-id').forEach(cell => {
+    if (cell.dataset.enhanced === 'true') return;
+    const taskId = cell.textContent.trim();
+    if (!taskId) return;
+    cell.dataset.enhanced = 'true';
+    cell.title = taskId;
+    cell.replaceChildren();
+    const display = document.createElement('span');
+    display.className = 'task-id-display';
+    display.textContent = taskId.length > 12 ? `${taskId.slice(0, 12)}…` : taskId;
+    display.title = taskId;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'task-id-copy';
+    copy.title = 'Copy full task ID';
+    copy.setAttribute('aria-label', 'Copy full task ID');
+    copy.textContent = '⧉';
+    copy.addEventListener('click', () => copyTaskId(taskId, copy));
+    cell.append(display, copy);
+  });
+  taskTable.querySelectorAll('.file-play[data-task-id]').forEach(fileButton => {
+    if (fileButton.dataset.enhanced === 'true') return;
+    const filePath = fileButton.textContent.trim();
+    if (!filePath || filePath === '-') return;
+    fileButton.dataset.enhanced = 'true';
+    fileButton.title = filePath;
+    const download = document.createElement('button');
+    download.type = 'button';
+    download.className = 'task-file-download';
+    download.dataset.taskDownload = 'true';
+    download.dataset.taskId = fileButton.dataset.taskId;
+    download.dataset.file = fileButton.dataset.file;
+    download.dataset.filePath = filePath;
+    download.title = `Download ${filePath}`;
+    download.setAttribute('aria-label', `Download ${filePath}`);
+    download.textContent = '⤓';
+    download.addEventListener('click', () => downloadTaskFile(download));
+    fileButton.after(download);
+  });
+}
+
+enhanceTaskIdentifiersAndFiles();
 
 const faceReviewControl = document.getElementById('face-review-control');
 if (faceReviewControl) {

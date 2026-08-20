@@ -634,7 +634,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return FileResponse(image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
     @app.get("/api/tasks/{task_id}/play-url")
-    def get_task_play_url(task_id: str, file: str = "input") -> dict[str, str]:
+    def get_task_play_url(task_id: str, file: str = "input", download: bool = False) -> dict[str, str]:
         # Keep the signed S3 URL on the Controller. The browser requests this
         # relative URL through Nginx, so S3 sees the Controller as the client.
         if file not in {"input", "output"}:
@@ -644,10 +644,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=404, detail="task does not exist")
         if not s3_ingestor:
             raise HTTPException(status_code=409, detail="playback URLs are only available for S3 tasks")
-        return {"url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/play?file={file}"}
+        suffix = "&download=true" if download else ""
+        return {"url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/play?file={file}{suffix}"}
 
     @app.get("/api/tasks/{task_id}/play", name="proxy_task_playback")
-    def proxy_task_playback(request: Request, task_id: str, file: str = "input"):
+    def proxy_task_playback(request: Request, task_id: str, file: str = "input", download: bool = False):
         """Stream an S3 video through the Controller while preserving seek support."""
         task = store.task(task_id)
         if task is None:
@@ -673,8 +674,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         filename = task_playback_filename(task, file)
         ascii_filename = filename.encode("ascii", "ignore").decode("ascii") or "video.mp4"
         ascii_filename = ascii_filename.replace('"', "_").replace("\\", "_")
+        disposition = "attachment" if download else "inline"
         response_headers["Content-Disposition"] = (
-            f'inline; filename="{ascii_filename}"; '
+            f'{disposition}; filename="{ascii_filename}"; '
             f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
         )
         # The dashboard sits behind Nginx.  Its normal proxy buffering is a
