@@ -48,14 +48,14 @@ async function loadProjects() {
 
 async function openProject(projectId) {
     currentProject = projectId;
-    document.getElementById("view-projects").classList.add("hidden");
+    document.querySelector(".projects-section").classList.add("hidden");
     document.getElementById("tasks-section").classList.remove("hidden");
     await loadTasks(projectId);
 }
 
 document.getElementById("back-to-projects").addEventListener("click", () => {
     document.getElementById("tasks-section").classList.add("hidden");
-    document.getElementById("view-projects").classList.remove("hidden");
+    document.querySelector(".projects-section").classList.remove("hidden");
     currentProject = null;
 });
 

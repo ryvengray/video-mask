@@ -353,22 +353,27 @@ class ClusterStore:
         return self.task(task_id) or {}
 
     @synchronized
-    def restart_task(self, task_id: str) -> dict[str, Any]:
-        """Queue a terminal task again, including a completed task on request."""
+    def restart_task(self, task_id: str, algorithm: str | None = None,
+                     arguments: list[str] | None = None) -> dict[str, Any]:
+        """Queue a terminal task again, optionally with updated algorithm settings."""
         current = self.task(task_id)
         if current is None:
             raise ValueError("task does not exist")
         if current["status"] not in TERMINAL:
             raise ValueError("only completed, failed, or cancelled tasks can be restarted")
+        if (algorithm is None) != (arguments is None):
+            raise ValueError("algorithm and arguments must be updated together")
         stamp = now()
         self.conn.execute("DELETE FROM task_logs WHERE task_id=?", (task_id,))
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
               error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
-              face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
+              face_review_owner=NULL, face_review_lease_until=NULL,
+              algorithm=COALESCE(?, algorithm), arguments_json=COALESCE(?, arguments_json),
+              updated_at=?
             WHERE task_id=?
-        """, (stamp, stamp, task_id))
+        """, (stamp, algorithm, json.dumps(arguments) if arguments is not None else None, stamp, task_id))
         self.conn.commit()
         return self.task(task_id) or {}
 

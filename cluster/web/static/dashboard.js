@@ -261,6 +261,7 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
     closePlayModal();
     closeTaskLogModal();
+    closeTaskRestartModal();
   }
 });
 scheduleAutoRefresh();
@@ -691,6 +692,107 @@ function ensureTaskActionsColumn() {
 }
 
 ensureTaskActionsColumn();
+let taskRestartModal;
+let taskRestartForm;
+let taskRestartId;
+let taskRestartAlgorithm;
+let taskRestartArguments;
+let taskRestartMessage;
+
+function ensureTaskRestartModal() {
+  if (taskRestartModal) return;
+  document.body.insertAdjacentHTML('beforeend', `
+    <div id="task-restart-modal" class="play-modal" hidden>
+      <div class="play-modal-backdrop" data-task-restart-close></div>
+      <div class="play-modal-card" role="dialog" aria-modal="true" aria-labelledby="task-restart-modal-title">
+        <div class="play-modal-head"><h3 id="task-restart-modal-title">Restart task</h3><button class="play-modal-close" type="button" data-task-restart-close aria-label="Close">&times;</button></div>
+        <p class="play-modal-note">The existing output will be cleared; face annotation will be kept. Edit the algorithm settings for this run if needed.</p>
+        <form id="task-restart-form" style="display:grid;gap:12px">
+          <input id="task-restart-id" type="hidden">
+          <label style="display:grid;gap:5px;color:var(--muted);font-size:12px">Algorithm file name<input id="task-restart-algorithm" type="text" required style="width:100%;border:1px solid var(--line);border-radius:4px;padding:8px;font:13px Consolas,monospace"></label>
+          <label style="display:grid;gap:5px;color:var(--muted);font-size:12px">Algorithm parameters (JSON array)<textarea id="task-restart-arguments" required style="width:100%;min-height:92px;resize:vertical;border:1px solid var(--line);border-radius:4px;padding:8px;font:13px Consolas,monospace"></textarea></label>
+          <p id="task-restart-message" style="min-height:18px;margin:0;color:var(--red);font-size:12px" aria-live="polite"></p>
+          <div class="play-modal-actions"><button class="play-btn play-btn-open" type="submit">Restart task</button><button class="play-btn" type="button" data-task-restart-close>Cancel</button></div>
+        </form>
+      </div>
+    </div>`);
+  taskRestartModal = document.getElementById('task-restart-modal');
+  taskRestartForm = document.getElementById('task-restart-form');
+  taskRestartId = document.getElementById('task-restart-id');
+  taskRestartAlgorithm = document.getElementById('task-restart-algorithm');
+  taskRestartArguments = document.getElementById('task-restart-arguments');
+  taskRestartMessage = document.getElementById('task-restart-message');
+  taskRestartModal.querySelectorAll('[data-task-restart-close]').forEach(element =>
+    element.addEventListener('click', closeTaskRestartModal));
+  taskRestartForm.addEventListener('submit', submitTaskRestart);
+}
+
+function closeTaskRestartModal() {
+  if (!taskRestartModal || taskRestartModal.hidden) return;
+  taskRestartModal.hidden = true;
+  scheduleAutoRefresh();
+}
+
+async function openTaskRestartModal(taskId) {
+  ensureTaskRestartModal();
+  taskRestartId.value = taskId;
+  taskRestartMessage.textContent = 'Loading current algorithm settings…';
+  taskRestartForm.querySelectorAll('input, textarea, button[type="submit"]').forEach(control => {
+    control.disabled = true;
+  });
+  taskRestartModal.hidden = false;
+  pauseAutoRefresh();
+  try {
+    const response = await fetch(`/api/dashboard/tasks/${encodeURIComponent(taskId)}/restart-config`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    taskRestartAlgorithm.value = payload.algorithm || '';
+    taskRestartArguments.value = JSON.stringify(payload.arguments || [], null, 2);
+    taskRestartMessage.textContent = '';
+    taskRestartAlgorithm.focus();
+  } catch (error) {
+    taskRestartMessage.textContent = error instanceof Error ? error.message : 'Unable to load this task.';
+  } finally {
+    taskRestartForm.querySelectorAll('input, textarea, button[type="submit"]').forEach(control => {
+      control.disabled = false;
+    });
+  }
+}
+
+async function submitTaskRestart(event) {
+  event.preventDefault();
+  let argumentsValue;
+  try {
+    argumentsValue = JSON.parse(taskRestartArguments.value);
+    if (!Array.isArray(argumentsValue) || !argumentsValue.every(value => typeof value === 'string')) {
+      throw new Error('not a string array');
+    }
+  } catch (_) {
+    taskRestartMessage.textContent = 'Algorithm parameters must be a JSON array of strings.';
+    return;
+  }
+  const algorithm = taskRestartAlgorithm.value.trim();
+  if (!algorithm) {
+    taskRestartMessage.textContent = 'Algorithm file name is required.';
+    return;
+  }
+  const controls = taskRestartForm.querySelectorAll('input, textarea, button');
+  controls.forEach(control => { control.disabled = true; });
+  taskRestartMessage.textContent = 'Restarting…';
+  try {
+    const response = await fetch(`/api/dashboard/tasks/${encodeURIComponent(taskRestartId.value)}/restart`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({algorithm, arguments: argumentsValue}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    window.location.reload();
+  } catch (error) {
+    taskRestartMessage.textContent = error instanceof Error ? error.message : 'Unable to restart this task.';
+    controls.forEach(control => { control.disabled = false; });
+  }
+}
 taskTable?.addEventListener('click', async event => {
   const button = event.target.closest('[data-task-action]');
   if (!button) return;
@@ -699,9 +801,16 @@ taskTable?.addEventListener('click', async event => {
     openTaskLogModal(taskId);
     return;
   }
-  const message = taskAction === 'restart'
-    ? 'Restart this task? Its existing output will be cleared; its face annotation will be kept.'
-    : 'Cancel this active task? The Worker will stop it as soon as possible.';
+  if (taskAction === 'restart') {
+    button.disabled = true;
+    try {
+      await openTaskRestartModal(taskId);
+    } finally {
+      button.disabled = false;
+    }
+    return;
+  }
+  const message = 'Cancel this active task? The Worker will stop it as soon as possible.';
   if (!window.confirm(message)) return;
   button.disabled = true;
   try {

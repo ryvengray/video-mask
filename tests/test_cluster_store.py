@@ -367,6 +367,22 @@ def test_failed_task_can_also_be_restarted(tmp_path: Path):
     store.close()
 
 
+def test_restart_task_can_update_algorithm_and_arguments(tmp_path: Path):
+    store = new_store(tmp_path)
+    created = store.create_task(task_payload())
+    store.cancel_task(created["task_id"])
+
+    restarted = store.restart_task(
+        created["task_id"], algorithm="video_mask_batch_experiment.py",
+        arguments=["--face-model", "yolo11", "--frame-skip", "2"],
+    )
+
+    assert restarted["status"] == "pending"
+    assert restarted["algorithm"] == "video_mask_batch_experiment.py"
+    assert restarted["arguments"] == ["--face-model", "yolo11", "--frame-skip", "2"]
+    store.close()
+
+
 def test_pending_task_can_be_cancelled_and_restarted(tmp_path: Path):
     store = new_store(tmp_path)
     created = store.create_task(task_payload())

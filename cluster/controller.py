@@ -251,6 +251,11 @@ class AlgorithmDefaultsRequest(BaseModel):
     arguments: list[str] = Field(default_factory=list)
 
 
+class TaskRestartRequest(BaseModel):
+    algorithm: str = Field(min_length=1, max_length=255)
+    arguments: list[str] = Field(default_factory=list)
+
+
 class FaceReviewRequest(BaseModel):
     reviewer_id: str = Field(min_length=16, max_length=128)
 
@@ -718,14 +723,30 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/dashboard/tasks/{task_id}/restart")
-    def dashboard_restart_task(task_id: str) -> dict[str, Any]:
+    def dashboard_restart_task(task_id: str, request: TaskRestartRequest) -> dict[str, Any]:
         """Restart one completed or failed task from the Nginx-protected dashboard."""
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
         if task.get("status") not in {"completed", "failed"}:
             raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
-        return store.restart_task(task_id)
+        algorithm = request.algorithm.strip()
+        if not algorithm or Path(algorithm).name != algorithm:
+            raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
+        if (len(request.arguments) > 128
+                or not all(isinstance(value, str) and len(value) <= 4096 for value in request.arguments)):
+            raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of at most 128 strings")
+        return store.restart_task(task_id, algorithm=algorithm, arguments=request.arguments)
+
+    @app.get("/api/dashboard/tasks/{task_id}/restart-config")
+    def dashboard_task_restart_config(task_id: str) -> dict[str, Any]:
+        """Return the editable algorithm settings for a dashboard restart."""
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if task.get("status") not in {"completed", "failed"}:
+            raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
+        return {"algorithm": task["algorithm"], "arguments": task["arguments"]}
 
     @app.post("/api/dashboard/tasks/{task_id}/cancel")
     def dashboard_cancel_task(task_id: str) -> dict[str, Any]:
