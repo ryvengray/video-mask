@@ -28,9 +28,17 @@ def _controller_headers() -> dict[str, str]:
     headers: dict[str, str] = {}
     token = CONTROLLER_TOKEN.strip()
     if token:
-        headers["Authorization"] = (
-            token if token.lower().startswith("bearer ") else f"Bearer {token}"
+        authorization = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+        # HTTP Basic authentication and Controller admin authentication both
+        # use the Authorization header.  When the Controller is behind an
+        # auth_basic Nginx proxy, carry the Bearer value separately; Nginx
+        # restores it only for the upstream Controller request.
+        header_name = (
+            "X-Video-Mask-Authorization"
+            if CONTROLLER_AUTH_USER and CONTROLLER_AUTH_PASS
+            else "Authorization"
         )
+        headers[header_name] = authorization
     return headers
 
 

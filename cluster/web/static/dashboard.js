@@ -859,7 +859,7 @@ function ensureTaskRestartModal() {
         <form id="task-restart-form" style="display:grid;gap:12px">
           <input id="task-restart-id" type="hidden">
           <label style="display:grid;gap:5px;color:var(--muted);font-size:12px">Algorithm file name<input id="task-restart-algorithm" type="text" required style="width:100%;border:1px solid var(--line);border-radius:4px;padding:8px;font:13px Consolas,monospace"></label>
-          <label style="display:grid;gap:5px;color:var(--muted);font-size:12px">Algorithm parameters (JSON array)<textarea id="task-restart-arguments" required style="width:100%;min-height:92px;resize:vertical;border:1px solid var(--line);border-radius:4px;padding:8px;font:13px Consolas,monospace"></textarea></label>
+          <label style="display:grid;gap:5px;color:var(--muted);font-size:12px">Algorithm parameters (JSON array or command line)<textarea id="task-restart-arguments" required placeholder="--fisheye --fisheye-device pico4 --face-size 640" style="width:100%;min-height:92px;resize:vertical;border:1px solid var(--line);border-radius:4px;padding:8px;font:13px Consolas,monospace"></textarea></label>
           <p id="task-restart-message" style="min-height:18px;margin:0;color:var(--red);font-size:12px" aria-live="polite"></p>
           <div class="play-modal-actions"><button class="play-btn play-btn-open" type="submit">Restart task</button><button class="play-btn" type="button" data-task-restart-close>Cancel</button></div>
         </form>
@@ -885,7 +885,7 @@ function closeTaskRestartModal() {
 async function openTaskRestartModal(taskId) {
   ensureTaskRestartModal();
   taskRestartId.value = taskId;
-  taskRestartMessage.textContent = 'Loading current algorithm settings…';
+  taskRestartMessage.textContent = 'Loading current Settings defaults…';
   taskRestartForm.querySelectorAll('input, textarea, button[type="submit"]').forEach(control => {
     control.disabled = true;
   });
@@ -912,12 +912,9 @@ async function submitTaskRestart(event) {
   event.preventDefault();
   let argumentsValue;
   try {
-    argumentsValue = JSON.parse(taskRestartArguments.value);
-    if (!Array.isArray(argumentsValue) || !argumentsValue.every(value => typeof value === 'string')) {
-      throw new Error('not a string array');
-    }
+    argumentsValue = parseAlgorithmArguments(taskRestartArguments.value);
   } catch (_) {
-    taskRestartMessage.textContent = 'Algorithm parameters must be a JSON array of strings.';
+    taskRestartMessage.textContent = 'Algorithm parameters must be a JSON array or command-line string.';
     return;
   }
   const algorithm = taskRestartAlgorithm.value.trim();
