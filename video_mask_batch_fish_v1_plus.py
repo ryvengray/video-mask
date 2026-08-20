@@ -64,8 +64,12 @@ FACE_DETECT_INT = 5           # 常态每5帧检测一次；变化期临时逐�
 FACE_EMPTY_DETECT_INT = 5     # 无人场景每5帧扫描一次，避免空场景浪费推理
 FACE_BACKFILL = 5             # 双模型确认后，最多回补此前5帧的单模型候选
 FACE_BURST = 5                # 检测人数变化后，接下来5帧逐帧检测
+FACE_ACTIVE_HOLD = 10         # 已出现人脸后，轨迹短暂丢失仍保持主动扫描的帧数
+FACE_VISIBLE_HOLD = 2         # 已确认轨迹允许用上一可靠框保活的连续帧数
 SCRFD_ADAPTIVE_VERIFY_MARGIN = 0.15  # 新候选进入10g复核区间的分数增量
-SCRFD_ADAPTIVE_VERIFY_IOU = 0.3     # 10g复核框与候选框的最低IoU
+SCRFD_ADAPTIVE_VERIFY_IOU = 0.25     # 10g复核框与候选框的最低IoU
+SCRFD_VERIFIER_MAX_SCORE_DROP = 0.02  # 复核时10g相对候选模型允许的最大分差
+SCRFD_VERIFIER_CONF = 0.30          # 10g复核内部阈值；不改变主模型建候选阈值
 SCRFD_LANDMARK_RISK_THRESHOLD = 0.35  # 五点软风险达到该值时触发10g，不直接拒绝
 SCRFD_REJECT_COOLDOWN = 5           # 10g拒绝后，同位置候选暂停复核的帧数
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
@@ -111,7 +115,7 @@ def _ensure_writable_frame(img):
 
 
 def draw_face_debug_scores(img, debug_faces):
-    """绘制模型分值：D=双模型、V=10g确认、S=单模型续轨、T=跟踪。"""
+    """绘制模型分值：D=双模型、V=10g确认、S=单模型续轨、T=跟踪、H=单帧保活。"""
     h, w = img.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.45, min(0.85, min(w, h) / 1100.0))
@@ -134,7 +138,8 @@ def draw_face_debug_scores(img, debug_faces):
         bottom = min(h - 1, ty + base + 5)
         cv2.rectangle(img, (tx, top), (min(w - 1, tx + tw + 8), bottom), (0, 0, 0), -1)
         colors = {"D": (0, 255, 0), "V": (255, 0, 255),
-                  "S": (255, 180, 0), "T": (0, 200, 255)}
+                  "S": (255, 180, 0), "T": (0, 200, 255),
+                  "H": (0, 165, 255)}
         color = colors.get(item.get("source"), (0, 200, 255))
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(img, text, (tx + 4, ty), font, scale, color, thickness, cv2.LINE_AA)
@@ -711,6 +716,7 @@ class DualFaceDetector:
         self.last_candidates = []
         self.last_raw_candidates = []
         self.last_verified_count = 0
+        self.last_score_rejected_count = 0
 
     @staticmethod
     def _iou(a, b):
@@ -758,6 +764,57 @@ class DualFaceDetector:
             if item["until"] >= frame_idx]
         return any(self._iou(box, item["box"]) >= self._verify_iou
                    for item in self._rejected_candidates)
+
+    def _dual_score_consistent(self, item):
+        """YOLOv8+SCRFD-10g新人脸的分数一致性检查。
+
+        仅用于两模型都检出的新人脸；已有轨迹在调用处先直接续接。
+        其他模型组合和2.5g主检路径不改变原有逻辑。
+        """
+        if (not self._name_a.upper().startswith("YOLOV8")
+                or "SCRFD-10G" not in self._name_b.upper()):
+            return True
+        scores = item.get("scores") or ()
+        if len(scores) < 2 or scores[0][1] is None or scores[1][1] is None:
+            return True
+        yolo_score = float(scores[0][1])
+        scrfd_score = float(scores[1][1])
+        return scrfd_score + 1e-6 >= (
+            yolo_score - SCRFD_VERIFIER_MAX_SCORE_DROP)
+
+    def _verifier_score_consistent(self, item, verifier_score):
+        """检查新人脸候选与SCRFD-10g复核分数是否一致。"""
+        if verifier_score is None:
+            return True
+        scores = item.get("scores") or ()
+        if len(scores) < 2:
+            return True
+
+        reference_score = None
+        # 只要使用SCRFD-2.5g且它有分数，10g就必须对比2.5g；
+        # 同时覆盖“2.5g单模型候选”和“YOLOv8+2.5g共识后复核”。
+        if ("SCRFD-2.5G" in self._name_b.upper()
+                and scores[1][1] is not None):
+            reference_score = scores[1][1]
+        # YOLOv8 单独候选、10g 复核：10g 对比 YOLOv8。
+        elif (self._name_a.upper().startswith("YOLOV8")
+              and scores[0][1] is not None and scores[1][1] is None):
+            reference_score = scores[0][1]
+        if reference_score is None:
+            return True
+        return float(verifier_score) + 1e-6 >= (
+            float(reference_score) - SCRFD_VERIFIER_MAX_SCORE_DROP)
+
+    def _has_required_primary_scores(self, item):
+        """2.5g组合的新轨迹必须同时得到YOLOv8和2.5g有效分数。"""
+        if "SCRFD-2.5G" not in self._name_b.upper():
+            return True
+        scores = item.get("scores") or ()
+        return (len(scores) >= 2
+                and scores[0][1] is not None
+                and scores[1][1] is not None
+                and float(scores[0][1]) > 0.0
+                and float(scores[1][1]) > 0.0)
 
     def detect_with_scores(self, img, conf=FACE_CONF, iou_thresh=0.2,
                            include_single=False, raw_conf=None,
@@ -820,6 +877,7 @@ class DualFaceDetector:
         # 已确认轨迹可由双模型或任一主模型续接；只有新人脸候选才需要
         # 做分数/五点软风险判断并按需调用10g。
         self.last_verified_count = 0
+        self.last_score_rejected_count = 0
         existing_boxes = existing_boxes or []
         kept = []
         verify_candidates = []
@@ -827,6 +885,12 @@ class DualFaceDetector:
         for item in consensus:
             if self._is_tracked(item["box"], existing_boxes, iou_thresh):
                 kept.append(item)
+                continue
+            if not self._has_required_primary_scores(item):
+                self.last_score_rejected_count += 1
+                continue
+            if not self._dual_score_consistent(item):
+                self.last_score_rejected_count += 1
                 continue
             scores = [float(score) for _, score in item["scores"]
                       if score is not None]
@@ -839,11 +903,16 @@ class DualFaceDetector:
                 kept.append(item)
 
         if self._verifier is not None:
-            # YOLO或2.5g单独检出的新人脸也可成为候选；必须由10g匹配后
-            # 才能创建confirmed轨迹。已有轨迹的单模型框仍由上层续轨。
-            verify_candidates.extend(
-                item for item in singles
-                if not self._is_tracked(item["box"], existing_boxes, iou_thresh))
+            # 2.5g模式下，新人脸必须先由YOLOv8+2.5g共同检出；10g
+            # 只能复核双模型候选，不能替代其中任意一个创建新轨迹。
+            # 已有轨迹的单模型框仍由上层续轨，避免正常人脸闪动。
+            for item in singles:
+                if self._is_tracked(item["box"], existing_boxes, iou_thresh):
+                    continue
+                if not self._has_required_primary_scores(item):
+                    self.last_score_rejected_count += 1
+                    continue
+                verify_candidates.append(item)
         if not verify_candidates:
             return kept
 
@@ -852,13 +921,22 @@ class DualFaceDetector:
             if not self._in_reject_cooldown(item["box"], frame_idx)]
         if not active_verify:
             return kept
-        verified = self._detect_with_conf(self._verifier, img, float(conf))
+        # 复核器只在已有候选框的局部位置做 IoU 匹配，因此可以使用比
+        # 主模型更低的召回阈值，捞回鱼眼/小脸的 0.30~0.45 分数；
+        # 主模型 conf 仍保持不变，不会因此直接创建低分新轨迹。
+        verified = self._detect_with_conf(
+            self._verifier, img, min(float(conf), SCRFD_VERIFIER_CONF))
         self.last_verified_count = len(active_verify)
         for item in active_verify:
             matches = [(self._iou(item["box"], box), box, score)
                        for box, score in verified]
             best = max(matches, default=(0.0, None, None), key=lambda row: row[0])
-            if best[0] >= self._verify_iou:
+            # YOLOv8 单模型候选与 SCRFD-2.5g 单模型候选都要和10g
+            # 做分数一致性检查；其他模型组合不改变原有复核逻辑。
+            score_ok = self._verifier_score_consistent(item, best[2])
+            if not score_ok:
+                self.last_score_rejected_count += 1
+            if best[0] >= self._verify_iou and score_ok:
                 confirmed = dict(item)
                 confirmed["source"] = "V"
                 confirmed["scores"] = tuple(item["scores"]) + (
@@ -1381,6 +1459,7 @@ class FaceProcessor:
     - F2 位移阈值兜底: dx/dy > 0.3×box_size 判定跟踪跑飞, 回退到旧框
       (避免框瞬移导致原人脸位置那 1 帧没被打码)
     - LK 失败时使用 face-detect 同款 NCC+PSR 模板匹配桥接快速运动
+    - 已确认轨迹短时断点在检测恢复后利用帧缓存插值补码，不盲目复用旧框
     - F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
       导致视频开头几帧没打码(YuNet DNN 后端初始化可能首帧漏检)
     """
@@ -1388,13 +1467,18 @@ class FaceProcessor:
                  empty_detect_int=FACE_EMPTY_DETECT_INT, grace=FACE_GRACE,
                  conf=FACE_CONF, scrfd_verifier=None, dual_iou=0.2,
                  box_smooth=FACE_BOX_SMOOTH, track_iou=0.2, track_dist=1.5,
-                 backfill_frames=FACE_BACKFILL, burst_frames=FACE_BURST):
+                 backfill_frames=FACE_BACKFILL, burst_frames=FACE_BURST,
+                 active_hold=FACE_ACTIVE_HOLD,
+                 visible_hold=FACE_VISIBLE_HOLD):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.empty_detect_int = max(1, empty_detect_int)
         self.backfill_frames = (max(0, int(backfill_frames))
                                 if isinstance(detector, DualFaceDetector) else 0)
         self.burst_frames = max(0, int(burst_frames))
+        self.active_hold = max(0, int(active_hold))
+        self._active_hold_remaining = 0
+        self.visible_hold = max(0, int(visible_hold))
         self.conf = conf
         self.grace = max(0, int(grace))  # 单条轨迹允许漏掉的检测周期数
         self.box_smooth = min(1.0, max(0.05, float(box_smooth)))
@@ -1590,7 +1674,7 @@ class FaceProcessor:
         return (x0 + (loc[0] + small_tmpl.shape[1] / 2) * down,
                 y0 + (loc[1] + small_tmpl.shape[0] / 2) * down)
 
-    def _track_all(self, gray):
+    def _track_all(self, gray, frame_idx=None):
         """先把所有存量轨迹推进到当前帧，再与本帧检测框关联。"""
         if self.prev_gray is None:
             return
@@ -1620,7 +1704,11 @@ class FaceProcessor:
                 else:
                     track["box"] = new_box
                     track["visible"] = True
+                    track["visibility_misses"] = 0
                     track["debug_source"] = "T"
+                    if frame_idx is not None:
+                        track["last_visible_frame"] = frame_idx
+                        track["last_visible_box"] = track["box"]
                     active_tracks.append(track)
                     continue
             hit = self._match_template(gray, track)
@@ -1631,18 +1719,23 @@ class FaceProcessor:
                     old_box[0] + dx, old_box[1] + dy,
                     old_box[2] + dx, old_box[3] + dy))
                 track["visible"] = True
+                track["visibility_misses"] = 0
                 track["debug_source"] = "T"
+                if frame_idx is not None:
+                    track["last_visible_frame"] = frame_idx
+                    track["last_visible_box"] = track["box"]
                 active_tracks.append(track)
                 continue
-            # 无可靠位移时不绘制旧框（不再使用 H）。仅把轨迹作为
-            # 当帧单模型检测的关联先验，检测成功后才恢复绘制。
+            # 无可靠位移时先不直接复用旧框；交给后面的检测关联逻辑。
+            # 如果当帧检测也漏掉，_update_tracks() 会按 visible_hold
+            # 给已确认轨迹短暂保活，避免只闪一帧。
             track["visible"] = False
             active_tracks.append(track)
             self._force_detect = True
         self.tracks = active_tracks
 
     def _update_tracks(self, dets, gray, debug_scores=None,
-                       allow_new=None, debug_sources=None):
+                       allow_new=None, debug_sources=None, frame_idx=None):
         """按 IoU/中心距离匹配；未匹配轨迹分别保活，不再整帧清空。"""
         if debug_scores is None:
             debug_scores = [None] * len(dets)
@@ -1676,6 +1769,9 @@ class FaceProcessor:
             matched_tracks.add(ti)
             matched_dets.add(di)
             track = self.tracks[ti]
+            was_visible = track.get("visible", True)
+            previous_visible_frame = track.get("last_visible_frame")
+            previous_visible_box = track.get("last_visible_box", track["box"])
             predicted = track["box"]
             detected = dets[di]
             alpha = self.box_smooth
@@ -1685,7 +1781,25 @@ class FaceProcessor:
             track["misses"] = 0
             track["hits"] += 1
             track["visible"] = True
+            track["visibility_misses"] = 0
             track["template"] = self._grab_template(gray, track["box"])
+            if (frame_idx is not None and not was_visible
+                    and previous_visible_frame is not None
+                    and frame_idx > previous_visible_frame + 1
+                    and self.backfill_frames > 0
+                    and frame_idx - previous_visible_frame - 1 <= self.backfill_frames):
+                # 只补“已确认轨迹”的短断点。起点从第一帧缺失帧开始，
+                # 使用断点前最后一个可靠框；终点使用恢复后的平滑框。
+                self.last_backfill_events.append({
+                    "start_frame": previous_visible_frame + 1,
+                    "start_box": previous_visible_box,
+                    "end_frame": frame_idx,
+                    "end_box": track["box"],
+                    "kind": "track_gap",
+                })
+            if frame_idx is not None:
+                track["last_visible_frame"] = frame_idx
+                track["last_visible_box"] = track["box"]
             if debug_scores[di] is not None:
                 track["debug_scores"] = debug_scores[di]
                 track["debug_source"] = debug_sources[di]
@@ -1694,7 +1808,14 @@ class FaceProcessor:
             if ti not in matched_tracks:
                 track["misses"] += 1
                 if isinstance(self.detector, DualFaceDetector):
-                    track["visible"] = False
+                    track["visibility_misses"] = (
+                        track.get("visibility_misses", 0) + 1)
+                    # 只给已确认轨迹一帧保活，降低偶发检测抖动造成的闪屏；
+                    # 连续丢失超过门限后仍隐藏旧框并等待重新确认。
+                    track["visible"] = (
+                        track["visibility_misses"] <= self.visible_hold)
+                    if track["visible"]:
+                        track["debug_source"] = "H"
         # 光流已失败且当帧两个模型都无法续上的轨迹直接删除；
         # 不把没有位移证据的旧框输出为马赛克。
         self.tracks = [t for t in self.tracks if t["misses"] <= self.grace]
@@ -1710,6 +1831,9 @@ class FaceProcessor:
                 "misses": 0,
                 "hits": 1,
                 "visible": True,
+                "visibility_misses": 0,
+                "last_visible_frame": frame_idx,
+                "last_visible_box": box,
                 "template": self._grab_template(gray, box),
                 "debug_scores": debug_scores[di],
                 "debug_source": debug_sources[di],
@@ -1801,15 +1925,23 @@ class FaceProcessor:
 
     def process(self, img, frame_idx, raw_debug=False):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        self._track_all(gray)
+        had_confirmed_tracks = any(
+            track.get("confirmed", True) for track in self.tracks)
+        if had_confirmed_tracks:
+            # 轨迹在本帧检测前即使暂时不可见，也说明场景不是空场景；
+            # 保持主动扫描，避免丢轨后退回每5帧一次的空场景节奏。
+            self._active_hold_remaining = self.active_hold
+        self._track_all(gray, frame_idx=frame_idx)
         self.last_raw_debug_faces = []
         self.last_backfill_events = []
         # F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
         # (YuNet 首帧可能因 DNN 后端初始化开销漏检, 普通帧间隔兜底无效)
         cold_start = frame_idx <= 2
-        # 有轨迹时默认逐帧检测；无轨迹时降低扫描频率。跟踪失败会设置
-        # _force_detect，当前帧立即重检，不会误入无人场景等待周期。
-        interval = self.detect_int if self.tracks else self.empty_detect_int
+        # 有轨迹时按 --face-int 周期检测；中间帧由光流/模板跟踪。
+        # 快速运动、跟踪失败或人数变化会设置 _force_detect/_burst_remaining，
+        # 临时切换为逐帧检测，不会误入无人场景等待周期。
+        active_scene = bool(self.tracks) or self._active_hold_remaining > 0
+        interval = self.detect_int if active_scene else self.empty_detect_int
         need_detect = (((frame_idx - 1) % interval == 0)
                        or cold_start or self._force_detect
                        or self._burst_remaining > 0)
@@ -1865,12 +1997,19 @@ class FaceProcessor:
                 self.last_raw_debug_faces = []
             self._update_tracks(
                 dets, gray, debug_scores,
-                allow_new=allow_new, debug_sources=debug_sources)
+                allow_new=allow_new, debug_sources=debug_sources,
+                frame_idx=frame_idx)
             if (self._last_detection_count is not None
                     and detection_count != self._last_detection_count
                     and self._burst_remaining == 0):
                 self._burst_remaining = self.burst_frames
             self._last_detection_count = detection_count
+            if detection_count or getattr(self.detector, "last_candidates", None):
+                self._active_hold_remaining = self.active_hold
+            elif not self.tracks and self._active_hold_remaining > 0:
+                self._active_hold_remaining -= 1
+        elif not self.tracks and self._active_hold_remaining > 0:
+            self._active_hold_remaining -= 1
         self.last_faces = [
             track["box"] for track in self.tracks
             if track.get("confirmed", True) and track.get("visible", True)]
@@ -2106,7 +2245,10 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
             verifier = make_scrfd("10g")
             log(f"  [人脸] SCRFD-10g 按需复核已启用 "
                 f"(分数区间={face_conf:.2f}~{face_conf + SCRFD_ADAPTIVE_VERIFY_MARGIN:.2f}, "
-                f"IoU={SCRFD_ADAPTIVE_VERIFY_IOU:.2f})")
+                f"复核conf={min(face_conf, SCRFD_VERIFIER_CONF):.2f}, "
+                f"IoU={SCRFD_ADAPTIVE_VERIFY_IOU:.2f}, "
+                f"新轨迹要求YOLOv8+2.5g均有效, "
+                f"2.5g→10g最大分差={SCRFD_VERIFIER_MAX_SCORE_DROP:.2f})")
             return verifier
         except Exception as exc:
             log(f"  [警告] SCRFD-10g 按需复核初始化失败: {exc}; 继续使用主模型")
@@ -2133,7 +2275,10 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
             verifier=verifier)
         log(f"  [人脸] YOLOv8+SCRFD-{scrfd_model} 严格双模型共识 "
             f"(输入{face_size}, SCRFD五点拓扑={scrfd_landmark_filter}, "
-            f"SCRFD后端={scrfd.backend})")
+            f"SCRFD后端={scrfd.backend}"
+            + (f", YOLOv8→10g最大分差={SCRFD_VERIFIER_MAX_SCORE_DROP:.2f}"
+               if scrfd_model == "10g" else "")
+            + ")")
     elif face_model == "yolo11+scrfd":
         scrfd = make_scrfd()
         verifier = make_adaptive_verifier()
@@ -2260,6 +2405,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             f"无人扫描间隔={face_proc.empty_detect_int}, "
             f"向前补码={face_proc.backfill_frames}帧, "
             f"变化突检={face_proc.burst_frames}帧, "
+            f"丢轨主动扫描保持={face_proc.active_hold}帧, "
+            f"单帧保活={face_proc.visible_hold}帧, "
             f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
     backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
 
@@ -2641,6 +2788,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
             f"无人扫描间隔={face_proc.empty_detect_int}, "
             f"向前补码={face_proc.backfill_frames}帧, "
             f"变化突检={face_proc.burst_frames}帧, "
+            f"丢轨主动扫描保持={face_proc.active_hold}帧, "
+            f"单帧保活={face_proc.visible_hold}帧, "
             f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
     backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
     total_face = 0
