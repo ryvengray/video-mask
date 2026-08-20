@@ -10,7 +10,7 @@ if [ ! -f .env ]; then
     echo "Please edit .env to set your CONTROLLER_URL"
 fi
 
-docker-compose up --build -d
+docker compose up --build -d
 
 echo ""
 echo "Video Audit is running at http://localhost:8080"
