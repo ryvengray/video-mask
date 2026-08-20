@@ -6,9 +6,78 @@
       - python3-venv
       - python3-pip
       - curl
+      - ffmpeg
+      - rsync
       - unzip
     state: present
     update_cache: true
+
+- name: Validate Nginx dashboard authentication configuration
+  ansible.builtin.assert:
+    that:
+      - video_mask_nginx_basic_auth_user | default('') | length > 0
+      - video_mask_nginx_basic_auth_password | default('') | length >= 16
+    fail_msg: Nginx dashboard proxy requires a username and a Basic Auth password of at least 16 characters.
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Install Nginx for the public dashboard proxy
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Remove the default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Install dashboard Basic Auth credentials
+  ansible.builtin.copy:
+    dest: /etc/nginx/.htpasswd-video-mask
+    content: "{{ video_mask_nginx_basic_auth_user }}:{{ video_mask_nginx_basic_auth_password | password_hash('sha512', video_mask_nginx_basic_auth_user | hash('sha256') | truncate(16, true, '')) }}\n"
+    owner: root
+    group: www-data
+    mode: '0640'
+  no_log: true
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Install Nginx dashboard proxy site
+  ansible.builtin.template:
+    src: video-mask-dashboard-nginx.conf.j2
+    dest: /etc/nginx/sites-available/video-mask-dashboard
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Enable Nginx dashboard proxy site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/video-mask-dashboard
+    dest: /etc/nginx/sites-enabled/video-mask-dashboard
+    state: link
+  notify: Reload Nginx
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Validate Nginx dashboard proxy configuration
+  ansible.builtin.command: nginx -t
+  changed_when: false
+  when: video_mask_nginx_enabled | default(false) | bool
+
+- name: Remove Nginx dashboard proxy site when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/nginx/sites-enabled/video-mask-dashboard
+    - /etc/nginx/sites-available/video-mask-dashboard
+    - /etc/nginx/.htpasswd-video-mask
+  notify: Reload Nginx
+  when: not (video_mask_nginx_enabled | default(false) | bool)
 
 - name: Validate S3 configuration when S3 storage mode is selected
   ansible.builtin.assert:
@@ -16,6 +85,7 @@
       - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_source_bucket | default('') | length > 0)
       - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_output_bucket | default('') | length > 0)
       - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_source_region | default('') | length > 0)
+      - video_mask_storage_mode | default('local') != 's3' or (video_mask_s3_output_region | default(video_mask_s3_source_region, true) | length > 0)
     fail_msg: S3 mode requires source bucket, output bucket, and source region settings.
 
 - name: Check whether AWS CLI v2 is installed
@@ -50,6 +120,32 @@
     virtualenv: "{{ video_mask_app_dir }}/.venv"
     virtualenv_command: python3 -m venv
 
+- name: Validate EC2 autoscaling configuration
+  ansible.builtin.assert:
+    that:
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_host_slots | default({}) | length > 0)
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_check_seconds | default(60) | int >= 5)
+      - not (video_mask_autoscale_enabled | default(false) | bool) or (video_mask_autoscale_idle_shutdown_seconds | default(1800) | int >= 60)
+    fail_msg: Autoscaling requires at least one Worker private-IP-to-slot-capacity entry and safe timing values.
+
+- name: Check Controller-local autoscaling dependencies
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ video_mask_autoscale_pool_file | default('/opt/dataai-ec2/data/ec2_host_pool.yaml') }}"
+    - "{{ video_mask_autoscale_pool_refresh_command | default('/opt/dataai-ec2/bin/ec2_pool.sh') }}"
+    - "{{ video_mask_autoscale_start_command | default('/opt/dataai-ec2/bin/start_ec2.sh') }}"
+    - "{{ video_mask_autoscale_stop_command | default('/opt/dataai-ec2/bin/stop_ec2.sh') }}"
+  register: video_mask_autoscale_dependencies
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Require Controller-local autoscaling dependencies
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "Required autoscaling file is missing on the Controller: {{ item.stat.path }}"
+  loop: "{{ video_mask_autoscale_dependencies.results | default([]) }}"
+  when: video_mask_autoscale_enabled | default(false) | bool
+
 - name: Create controller state directory
   ansible.builtin.file:
     path: /var/lib/video-mask-controller
@@ -57,6 +153,39 @@
     owner: ubuntu
     group: ubuntu
     mode: '0750'
+
+- name: Create autoscaler state directory
+  ansible.builtin.file:
+    path: /var/lib/video-mask-autoscaler
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Create autoscaler event log directory
+  ansible.builtin.file:
+    path: "{{ (video_mask_autoscale_event_log | default('/var/log/video-mask-autoscaler/events.log')) | dirname }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Install autoscaler event log rotation
+  ansible.builtin.template:
+    src: video-mask-autoscaler.logrotate.j2
+    dest: /etc/logrotate.d/video-mask-autoscaler
+    owner: root
+    group: root
+    mode: '0644'
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Remove autoscaler event log rotation when disabled
+  ansible.builtin.file:
+    path: /etc/logrotate.d/video-mask-autoscaler
+    state: absent
+  when: not (video_mask_autoscale_enabled | default(false) | bool)
 
 - name: Install controller environment file
   ansible.builtin.template:
@@ -77,6 +206,50 @@
   notify:
     - Reload systemd controller
     - Restart video-mask controller
+
+- name: Allow autoscaler to run approved EC2 operations scripts
+  ansible.builtin.template:
+    src: video-mask-autoscaler.sudoers.j2
+    dest: /etc/sudoers.d/video-mask-autoscaler
+    owner: root
+    group: root
+    mode: '0440'
+    validate: visudo -cf %s
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Remove autoscaler sudo permission when autoscaling is disabled
+  ansible.builtin.file:
+    path: /etc/sudoers.d/video-mask-autoscaler
+    state: absent
+  when: not (video_mask_autoscale_enabled | default(false) | bool)
+
+- name: Install autoscaler systemd service
+  ansible.builtin.template:
+    src: video-mask-autoscaler.service.j2
+    dest: /etc/systemd/system/video-mask-autoscaler.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - Reload systemd controller
+    - Restart video-mask autoscaler
+  when: video_mask_autoscale_enabled | default(false) | bool
+
+- name: Disable autoscaler when not configured
+  ansible.builtin.systemd:
+    name: video-mask-autoscaler
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: not (video_mask_autoscale_enabled | default(false) | bool)
+
+- name: Enable autoscaler service
+  ansible.builtin.systemd:
+    name: video-mask-autoscaler
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: video_mask_autoscale_enabled | default(false) | bool
 
 - name: Enable controller service
   ansible.builtin.systemd:

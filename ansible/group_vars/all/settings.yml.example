@@ -1,16 +1,26 @@
-# Every deployed machine checks out and runs source mode. Store the source
-# repository Deploy Key only in ansible-vault; never commit it in this file.
-video_mask_repo: git@github.com:ryvengray/video-mask.git
+# Only the Controller checks out source mode, using the public GitHub HTTPS URL.
+# Worker hosts receive an rsync distribution and never clone the repository.
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
-video_mask_source_deploy_key_path: /home/ubuntu/.ssh/video-mask-source
-video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
+# Source directory on the machine executing Ansible (normally this Controller).
+# Worker deployment rsyncs from here and excludes .git, Ansible configuration,
+# virtualenvs, tests, and common secret-file patterns.
+video_mask_worker_source_dir: "{{ playbook_dir }}/.."
 # Use the Controller private VPC address for remote Workers. No HTTPS is
 # required on the private network; restrict TCP 8080 to the Worker security group.
 video_mask_controller_url: http://10.0.0.10:8080
 # Store these secrets with ansible-vault, never commit real values.
 video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
 video_mask_worker_token: "{{ vault_video_mask_worker_token }}"
+
+# Optional public HTTP dashboard proxy. Keep Controller port 8080 restricted
+# to Workers/VPN in its AWS security group; Nginx exposes port 80 instead.
+video_mask_nginx_enabled: false
+video_mask_nginx_server_name: _
+video_mask_nginx_basic_auth_user: admin
+video_mask_nginx_basic_auth_password: "{{ vault_video_mask_nginx_basic_auth_password }}"
+video_mask_dashboard_upload_max_size: 20g
 # Per physical Worker machine. Each slot is a separate Worker identity and
 # processes one task at a time. Start with 2; benchmark before increasing.
 video_mask_worker_slots: 1
@@ -25,8 +35,42 @@ video_mask_s3_source_prefix: source/inbox/
 video_mask_s3_source_region: ''
 video_mask_s3_output_bucket: ''
 video_mask_s3_output_prefix: outputs/
-# The named AWS CLI/Boto3 profile exists only on the Controller under
-# /home/ubuntu/.aws. Do not put AK/SK into this repository or settings file.
-video_mask_s3_profile: s3-test
+# Leave blank to use video_mask_s3_source_region. Set this when output is a
+# Bucket in another Region, so PUT URLs are signed against its endpoint.
+video_mask_s3_output_region: ''
+# Leave empty when the Controller EC2 instance uses an IAM Role. Set a named
+# profile only when it already exists on the Controller under /home/ubuntu/.aws.
+# Do not put AK/SK into this repository or settings file.
+video_mask_s3_profile: ''
 video_mask_s3_poll_seconds: 60
 video_mask_s3_presign_seconds: 86400
+# Optional Controller-side EC2 autoscaling. It is disabled by default and can
+# manage only the explicitly listed private IPs in the operations pool file.
+video_mask_autoscale_enabled: false
+# Controller-local API address used by the autoscaler. Keep this loopback URL
+# when autoscaler and Controller share the same machine.
+video_mask_autoscale_controller_url: http://127.0.0.1:8080
+video_mask_autoscale_pool_file: /opt/dataai-ec2/data/ec2_host_pool.yaml
+video_mask_autoscale_pool_refresh_command: /opt/dataai-ec2/bin/ec2_pool.sh
+video_mask_autoscale_pool_refresh_timeout_seconds: 120
+video_mask_autoscale_start_command: /opt/dataai-ec2/bin/start_ec2.sh
+video_mask_autoscale_stop_command: /opt/dataai-ec2/bin/stop_ec2.sh
+# Physical Worker capacity and autoscaler allowlist. Required for accurate
+# expansion after a stopped machine's slots have been retired from Controller.
+video_mask_autoscale_host_slots: {}
+video_mask_autoscale_check_seconds: 60
+# Wait for an existing ready Worker to claim a newly queued task before
+# starting an EC2 instance.  Workers poll at 10 seconds by default.
+video_mask_autoscale_pending_grace_seconds: 60
+video_mask_autoscale_idle_shutdown_seconds: 1800
+video_mask_autoscale_min_running_hosts: 0
+video_mask_autoscale_max_start_per_check: 1
+video_mask_autoscale_max_stop_per_check: 1
+# Avoid repeating start requests while EC2 boots and Worker slots register.
+video_mask_autoscale_start_grace_seconds: 900
+# A stop script may wait for AWS to finish. Record the submitted request and
+# do not repeat it while the pool still says running.
+video_mask_autoscale_stop_grace_seconds: 1800
+video_mask_autoscale_command_timeout_seconds: 900
+# Event-only audit log; routine autoscaler polls remain in journald.
+video_mask_autoscale_event_log: /var/log/video-mask-autoscaler/events.log

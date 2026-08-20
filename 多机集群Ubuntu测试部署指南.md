@@ -1,6 +1,6 @@
 # 多机视频打码集群：Ubuntu 单机测试部署指南
 
-本指南用于当前测试：**一台 Ubuntu GPU 服务器同时运行 Controller 和一个 Worker**。
+本指南先完成：**一台 Ubuntu GPU 服务器同时运行 Controller 和一个 Worker** 的测试；随后可按第 5.1 节用 Ansible 和 `terraform-host.pem` 添加独立 Worker。
 
 ```text
 Controller（127.0.0.1:8080）
@@ -13,7 +13,31 @@ Controller（127.0.0.1:8080）
 
 这次测试不使用 S3，不会扫描或改动现有的 `/home/ubuntu/sources/`、`/home/ubuntu/outputs/`。先只处理一个短视频，验证 Controller、Worker、GPU、任务领取和输出上传（本地复制）完整链路。
 
-## 0. 前提：确认服务器已拿到集群代码
+## 0. 新 Ubuntu Controller（同时作为 Ansible 控制机）一键启动
+
+以下命令在新的 Ubuntu Controller 上、以 `ubuntu` 用户执行。请把 `CONTROLLER_PRIVATE_IP` 替换为此机器可被 Worker 访问的 VPC 私网 IP；不要填写 `127.0.0.1`，否则远程 Worker 无法领取任务。
+
+```bash
+git clone https://github.com/ryvengray/video-mask.git /home/ubuntu/video-mask
+cd /home/ubuntu/video-mask
+git pull --ff-only
+
+bash scripts/bootstrap_cluster_controller.sh \
+  --controller-url http://CONTROLLER_PRIVATE_IP:8080
+```
+
+脚本会安装 Ansible 和 Controller 依赖、生成随机 Controller/Worker Token、创建本机 Controller inventory，并启动 `video-mask-controller.service`。它不会部署本机 Worker；后续远程 Worker 使用第 5.1 节的 `terraform-host.pem` 流程添加。
+
+首次启动完成后验证：
+
+```bash
+curl http://127.0.0.1:8080/healthz
+sudo systemctl status video-mask-controller --no-pager
+```
+
+脚本依赖 Ubuntu/Debian 的 `apt`，并固定以 `ubuntu` 用户运行服务；请使用 Ubuntu AMI，不支持 Amazon Linux 的 `ec2-user` 运行环境。
+
+### 手动部署前提：确认服务器已拿到集群代码
 
 当前集群代码必须已经提交并推送到仓库后，服务器才能拉取。进入项目后检查：
 
@@ -102,7 +126,16 @@ gpu_workers:
 
 保存 `nano`：按 `Ctrl+O`、回车，再按 `Ctrl+X`。
 
+这是 Controller 与首个 Worker 同机的测试 inventory。新增独立机器时，不要保留
+`ansible_connection: local`；请使用第 5.1 节的远程 Worker 配置。
+
 ## 4. 配置本地测试参数和 Token
+
+`terraform-host.pem` 仅用于 Ansible SSH 登录。Worker 不拉取 Git 仓库：运行代码由执行 Ansible 的 Controller 通过 rsync 推送，因此 Worker 不需要 GitHub 凭证。Controller 使用公开 GitHub HTTPS 地址更新代码。
+
+```bash
+git -C /home/ubuntu/video-mask remote set-url origin https://github.com/ryvengray/video-mask.git
+```
 
 先生成两个随机 Token：
 
@@ -142,13 +175,13 @@ S3 Bucket、Region、跨账号 Role ARN 和输出 Bucket 的配置先保持为�
 
 ```bash
 cd /home/ubuntu/video-mask
-ansible-playbook -i ansible/inventory.yml ansible/site.yml --syntax-check
+ansible-playbook -i ansible/inventory.yml ansible/site.yml --syntax-check --ask-vault-pass
 ```
 
 开始部署：
 
 ```bash
-ansible-playbook -i ansible/inventory.yml ansible/site.yml -K
+ansible-playbook -i ansible/inventory.yml ansible/site.yml -K --ask-vault-pass
 ```
 
 `-K` 会询问当前 Ubuntu 用户的 sudo 密码。部署过程会：
@@ -160,6 +193,48 @@ ansible-playbook -i ansible/inventory.yml ansible/site.yml -K
 → 在控制器预注册 worker-01
 → 启动 video-mask-worker.service
 ```
+
+### 5.1 使用 `terraform-host.pem` 新增远程 Worker
+
+以下操作在**运行 Ansible 的控制机**上执行；私钥必须位于这台机器，不能只存在于新 Worker 上。先限制私钥权限并验证 SSH 与免密 sudo：
+
+```bash
+chmod 600 /absolute/path/to/terraform-host.pem
+ssh -i /absolute/path/to/terraform-host.pem ubuntu@WORKER_PUBLIC_OR_PRIVATE_IP \
+  'sudo -n true && echo "SSH and passwordless sudo are ready"'
+```
+
+将 `inventory.yml` 的 `gpu_workers` 改为（Controller 仍保留为 `ansible_connection: local`）：
+
+```yaml
+gpu_workers:
+  vars:
+    ansible_user: ubuntu
+    # 此路径属于运行 Ansible 的控制机。
+    ansible_ssh_private_key_file: /absolute/path/to/terraform-host.pem
+  hosts:
+    worker-02:
+      ansible_host: WORKER_PUBLIC_OR_PRIVATE_IP
+      video_mask_worker_id: worker-02
+      video_mask_worker_slots: 1
+```
+
+先检查连通性和 playbook，再只部署这台新 Worker：
+
+```bash
+cd /home/ubuntu/video-mask
+ansible -i ansible/inventory.yml gpu_workers -m ping --limit worker-02 --ask-vault-pass
+ansible-playbook -i ansible/inventory.yml ansible/site.yml --syntax-check --ask-vault-pass
+ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit worker-02 --ask-vault-pass
+```
+
+若 `ubuntu` 用户没有免密 sudo，最后一条加 `-K`。也可以不在 inventory 保存私钥路径，而在两条 Ansible 命令末尾追加：
+
+```bash
+--private-key /absolute/path/to/terraform-host.pem
+```
+
+新 Worker 的安全组必须允许控制机到 Worker 的 TCP 22；同时 Worker 必须能访问 `video_mask_controller_url` 的 TCP 8080。私钥仅用于部署，Worker 运行时仍通过 HTTP 主动向 Controller 领取任务。
 
 ## 6. 验证服务
 
@@ -208,7 +283,8 @@ http://127.0.0.1:8080/
 
 ```bash
 # 在你的本地电脑执行
-ssh -L 8080:127.0.0.1:8080 ubuntu@43.166.162.143
+ssh -i /absolute/path/to/terraform-host.pem \
+  -L 8080:127.0.0.1:8080 ubuntu@43.166.162.143
 ```
 
 然后在本地浏览器打开：
@@ -249,7 +325,13 @@ sudo systemctl start video-mask-worker
 确认 `group_vars/all/settings.yml` 中的 `video_mask_worker_token` 未修改，并重新执行：
 
 ```bash
-ansible-playbook -i ansible/inventory.yml ansible/site.yml -K
+ansible-playbook -i ansible/inventory.yml ansible/site.yml -K --ask-vault-pass
+```
+
+远程 Worker 则将命令限制到对应主机，并使用 inventory 中的私钥配置（或追加 `--private-key`）：
+
+```bash
+ansible-playbook -i ansible/inventory.yml ansible/site.yml --limit worker-02 --ask-vault-pass
 ```
 
 ### Controller 端口 8080 已被占用

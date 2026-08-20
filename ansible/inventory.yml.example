@@ -6,6 +6,9 @@ controller:
 gpu_workers:
   vars:
     ansible_user: ubuntu
+    # Path on the machine running Ansible.  Use an absolute path to the
+    # Terraform-created SSH private key when adding a remote Worker.
+    # ansible_ssh_private_key_file: /absolute/path/to/terraform-host.pem
     # Password SSH option: keep actual values only in group_vars/all/vault.yml.
     # ansible_password: "{{ vault_video_mask_worker_ssh_password }}"
     # ansible_become_password: "{{ vault_video_mask_worker_sudo_password }}"

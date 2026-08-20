@@ -1,13 +1,13 @@
 # 源码模式 Controller 部署指南
 
-本文用于在客户的 Controller 机器上部署视频打码集群。Controller 与 Worker 都从私有 `video-mask` 源码仓库运行；Controller 同时作为 Ansible 控制端，通过 SSH 初始化和升级 Worker。
+本文用于在客户的 Controller 机器上部署视频打码集群。Controller 从公开的 `video-mask` GitHub HTTPS 仓库运行；Controller 同时作为 Ansible 控制端，通过 SSH 将运行代码 rsync 到 Worker 并初始化、升级 Worker。Worker 不保存 Git 仓库或 GitHub 凭证。
 
 ## 1. 网络与机器要求
 
 - Controller：Ubuntu 24.04，建议 2 核 CPU、4 GB 内存起。
 - Worker：Ubuntu 24.04 x86_64，NVIDIA GPU Worker 建议 T4 及以上，驱动需预先由云镜像或云厂商安装。
 - Controller 和 Worker 使用私网通信；Worker 可访问 Controller 的 TCP `8080`。
-- Controller 需要能访问 GitHub，Worker 需要能访问 GitHub、PyPI、PyTorch 下载源和 Hugging Face（首次下载模型时）。
+- Controller 需要能访问 GitHub；Worker 首次部署需要访问 Ubuntu 软件源、PyPI、PyTorch 下载源和 Hugging Face（首次下载模型时），不需要访问 GitHub。
 
 Controller 私网 IP 可通过下面命令查看：
 
@@ -15,49 +15,17 @@ Controller 私网 IP 可通过下面命令查看：
 hostname -I
 ```
 
-## 2. 创建共享源码只读 Deploy Key（一次性）
-
-这把 Key 用于 Controller 和所有 Worker 读取私有源码仓库。它只授权 `ryvengray/video-mask`，不要勾选 GitHub 写权限。
-
-在受信任机器生成：
-
-```bash
-ssh-keygen -t ed25519 \
-  -f ~/.ssh/video-mask-source \
-  -C "video-mask-cluster-source-readonly" \
-  -N ""
-
-cat ~/.ssh/video-mask-source.pub
-```
-
-在 GitHub 的 `ryvengray/video-mask` 仓库中进入 `Settings` → `Deploy keys` → `Add deploy key`，粘贴公钥，**不要**勾选 `Allow write access`。
-
-将私钥安全传到 Controller，保存为：
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-# 将私钥内容保存到 ~/.ssh/video-mask-source 后执行：
-chmod 600 ~/.ssh/video-mask-source
-
-ssh -i ~/.ssh/video-mask-source -o IdentitiesOnly=yes -T git@github.com
-```
-
-看到 GitHub 认证成功但不提供 shell 即为正常。
-
-## 3. 在 Controller 安装工具并 clone 源码
+## 2. 在 Controller 安装工具并 clone 源码
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ansible git
-
-GIT_SSH_COMMAND="ssh -i ~/.ssh/video-mask-source -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-  git clone git@github.com:ryvengray/video-mask.git ~/video-mask
+sudo apt-get install -y ansible git rsync
+git clone https://github.com/ryvengray/video-mask.git ~/video-mask
 
 cd ~/video-mask/ansible
 ```
 
-## 4. 配置 Ansible
+## 3. 配置 Ansible
 
 创建客户本机配置，这些文件已经被 `.gitignore` 忽略，不能提交：
 
@@ -71,11 +39,6 @@ ansible-vault create group_vars/all/vault.yml
 Vault 密码是本地加密密码，请保存到密码管理器。创建 Vault 后填写：
 
 ```yaml
-vault_video_mask_source_deploy_key: |
-  -----BEGIN OPENSSH PRIVATE KEY-----
-  粘贴 ~/.ssh/video-mask-source 的完整私钥内容
-  -----END OPENSSH PRIVATE KEY-----
-
 vault_video_mask_admin_token: 替换为至少32位随机Token
 vault_video_mask_worker_token: 替换为至少32位随机Token
 ```
@@ -103,11 +66,9 @@ gpu_workers:
 编辑 `group_vars/all/settings.yml`，至少替换 Controller 私网 IP：
 
 ```yaml
-video_mask_repo: git@github.com:ryvengray/video-mask.git
+video_mask_repo: https://github.com/ryvengray/video-mask.git
 video_mask_ref: main
 video_mask_app_dir: /home/ubuntu/video-mask
-video_mask_source_deploy_key_path: /home/ubuntu/.ssh/video-mask-source
-video_mask_source_deploy_key: "{{ vault_video_mask_source_deploy_key }}"
 
 video_mask_controller_url: http://Controller私网IP:8080
 video_mask_admin_token: "{{ vault_video_mask_admin_token }}"
@@ -118,7 +79,7 @@ video_mask_local_source_dir: /home/ubuntu/cluster_test_sources
 video_mask_local_output_dir: /home/ubuntu/cluster_test_outputs
 ```
 
-## 5. 启动 Controller
+## 4. 启动 Controller
 
 先检查变量与本机连接：
 
@@ -336,7 +297,7 @@ sudo -u ubuntu -H aws configure --profile s3-test
 sudo -u ubuntu -H aws sts get-caller-identity --profile s3-test
 ```
 
-所用 IAM 身份至少需要：源桶 `s3:ListBucket`、`s3:GetObject`；结果桶 `s3:ListBucket`、`s3:GetObject`（用于跳过已有结果）、`s3:PutObject`。AK/SK 只保存在 Controller 的 `/home/ubuntu/.aws/`，不要写入 Git、Ansible inventory 或 Vault 以外的明文文件。
+所用 IAM 身份至少需要：源桶 `s3:ListBucket`、`s3:GetObject`；结果桶 `s3:ListBucket`、`s3:GetObject`（用于跳过已有结果）、`s3:PutObject`、`s3:AbortMultipartUpload`。AK/SK 只保存在 Controller 的 `/home/ubuntu/.aws/`，不要写入 Git、Ansible inventory 或 Vault 以外的明文文件。
 
 编辑 `ansible/group_vars/all/settings.yml`：
 
@@ -360,7 +321,7 @@ ansible-playbook -i inventory.yml site.yml \
   --limit controller -K --ask-vault-pass
 ```
 
-首次健康检查会扫描源桶；之后 Controller 每 60 秒扫描一次，或有 Worker 领取任务时按周期扫描一次：
+Controller 启动后会立即扫描源桶，并在后台每 60 秒扫描一次；Worker 领取任务和健康检查也会触发一次受周期限制的补充扫描：
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz
@@ -368,7 +329,21 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 返回中的 `s3_ingested` 是本次新创建任务数。结果对象会上传至 `s3://processed-video-685538570851-us-east-2-an/outputs/`，保留源视频的子目录，并加上 `masked_` 前缀。数据库已记录的同一对象版本、或结果桶已存在的输出，会自动跳过。
 
-预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。当前上传方式是单次 S3 `PutObject`，单个结果文件应小于 5 GiB；更大的文件需要后续增加 multipart upload。
+### 手动执行一次 S3 扫描
+
+即使在 Controller 页面暂停了自动 S3 ingestion，也可用以下接口只扫描一次；它不会重新开启后台自动扫描，也不需要 Admin Token：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/admin/s3-ingest/scan
+```
+
+返回中的 `created` 是本次新创建的任务数，`enabled` 表示自动扫描是否仍开启：
+
+```json
+{"configured": true, "enabled": false, "created": 3}
+```
+
+预签名 URL 默认在任务领取后有效 24 小时，可设置到最多 7 天。结果小于等于 5 GiB 使用单次 S3 `PutObject`；更大的结果会自动使用 Multipart Upload，按 64 MiB 分片上传。Controller 为每一片签发短期 URL 并完成合并，Worker 不持有 AWS 凭证；失败或取消时会 Abort 未完成上传。
 
 若修复 IAM 权限、网络或算法配置后需要重新执行一个已失败的任务，使用管理员 Token 将其重新放回队列（重置该任务的重试次数）：
 
@@ -414,8 +389,9 @@ video_mask_ref: main
 # 更新 Controller
 ansible-playbook -i inventory.yml site.yml --limit controller -K --ask-vault-pass
 
-# 更新所有 Worker
-ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pass
+# 更新所有 Worker；代码变更后显式重启各 slot，使新的算法脚本生效
+ansible-playbook -i inventory.yml site.yml --limit gpu_workers -K --ask-vault-pass \
+  --extra-vars video_mask_restart_worker=true
 ```
 
 更新 Worker 后，可确认新服务参数已生效：
@@ -430,9 +406,13 @@ ssh ubuntu@Worker私网IP 'sudo systemctl status "video-mask-worker@slot-*" --no
 
 命令缺少 `--ask-vault-pass`。所有 Ansible 命令均应带上该参数。
 
-### `Permission denied (publickey)`
+### `git clone` 或 `git pull` 失败
 
-检查 `~/.ssh/video-mask-source`、GitHub `video-mask` 仓库 Deploy Key 与 Vault 中的 `vault_video_mask_source_deploy_key` 是否为同一把私钥。
+确认 Controller 能访问 `https://github.com`，并检查仓库 remote：
+
+```bash
+git -C ~/video-mask remote set-url origin https://github.com/ryvengray/video-mask.git
+```
 
 ### `nvidia-smi` 不可用
 

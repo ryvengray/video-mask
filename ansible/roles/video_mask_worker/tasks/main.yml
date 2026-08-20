@@ -1,12 +1,77 @@
 ---
+- name: Validate Worker source distribution on the Ansible controller
+  ansible.builtin.stat:
+    path: "{{ video_mask_worker_source_dir | default(playbook_dir ~ '/..') }}/{{ item }}"
+  loop:
+    - cluster/worker_agent.py
+    - scripts/bootstrap_server.sh
+    - video_mask_batch_fish_v1.py
+    - pyproject.toml
+  register: video_mask_worker_source_files
+  delegate_to: localhost
+  become: false
+
+- name: Require a complete Worker source distribution
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "Worker distribution source is incomplete: {{ item.item }}"
+  loop: "{{ video_mask_worker_source_files.results }}"
+
 - name: Install Worker Python prerequisites
   ansible.builtin.apt:
     name:
       - python3
       - python3-venv
       - python3-pip
+      - logrotate
+      - rsync
     state: present
     update_cache: true
+    # Newly started EC2 instances can still be running cloud-init's apt
+    # update. Wait for its lock instead of failing deployment or removing it.
+    lock_timeout: 600
+    update_cache_retries: 5
+    update_cache_retry_max_delay: 12
+
+- name: Create Worker application directory
+  ansible.builtin.file:
+    path: "{{ video_mask_app_dir }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
+
+- name: Synchronize Worker runtime source from the Ansible controller
+  ansible.posix.synchronize:
+    src: "{{ video_mask_worker_source_dir | default(playbook_dir ~ '/..') }}/"
+    dest: "{{ video_mask_app_dir }}/"
+    mode: push
+    archive: true
+    compress: true
+    delete: false
+    rsync_opts:
+      - '--exclude=.git/'
+      - '--exclude=.venv/'
+      - '--exclude=ansible/'
+      - '--exclude=tests/'
+      - '--exclude=.task_manager/'
+      - '--exclude=__pycache__/'
+      - '--exclude=*.pyc'
+      - '--exclude=.env'
+      - '--exclude=.env.*'
+      - '--exclude=*.pem'
+      - '--exclude=.DS_Store'
+  become: false
+
+- name: Remove legacy Git repository metadata from Worker
+  ansible.builtin.file:
+    path: "{{ video_mask_app_dir }}/.git"
+    state: absent
+
+- name: Remove legacy GitHub SSH key from Worker
+  ansible.builtin.file:
+    path: /home/ubuntu/.ssh/video-mask-source
+    state: absent
 
 - name: Validate Worker slot count
   ansible.builtin.assert:
@@ -33,6 +98,21 @@
   ansible.builtin.command:
     cmd: bash scripts/bootstrap_server.sh --cuda --face-only
     chdir: "{{ video_mask_app_dir }}"
+  register: video_mask_bootstrap
+  changed_when: video_mask_bootstrap.rc == 75
+  failed_when: video_mask_bootstrap.rc not in [0, 75]
+
+- name: Reboot Worker after NVIDIA driver installation
+  ansible.builtin.reboot:
+    msg: Rebooting after NVIDIA driver installation for Video Mask Worker
+    reboot_timeout: 900
+  when: video_mask_bootstrap.rc == 75
+
+- name: Complete Worker bootstrap after NVIDIA driver reboot
+  ansible.builtin.command:
+    cmd: bash scripts/bootstrap_server.sh --cuda --face-only
+    chdir: "{{ video_mask_app_dir }}"
+  when: video_mask_bootstrap.rc == 75
   changed_when: false
 
 - name: Create Worker slot runtime directories
@@ -51,6 +131,22 @@
     owner: ubuntu
     group: ubuntu
     mode: '0750'
+
+- name: Create Worker persistent log directory
+  ansible.builtin.file:
+    path: /var/log/video-mask-worker
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0750'
+
+- name: Install Worker log rotation policy
+  ansible.builtin.template:
+    src: video-mask-worker.logrotate.j2
+    dest: /etc/logrotate.d/video-mask-worker
+    owner: root
+    group: root
+    mode: '0644'
 
 - name: Install Worker slot environment files
   ansible.builtin.template:
@@ -88,6 +184,18 @@
     (item.path | basename | regex_replace('^video-mask-worker@slot-([0-9]+)\\.service$', '\\1') | int)
     > (video_mask_worker_slots | default(1) | int)
 
+- name: Retire disabled excess Worker slots from the controller
+  ansible.builtin.uri:
+    url: "{{ video_mask_controller_url }}/api/admin/workers/{{ video_mask_worker_id | default(inventory_hostname) }}-slot-{{ item }}/retire"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ video_mask_admin_token }}"
+    status_code: 200
+  loop: "{{ range((video_mask_worker_slots | default(1) | int) + 1, 17) | list }}"
+  # A running/busy slot is deliberately rejected by the Controller. Do not
+  # hide it just because a playbook reduced the desired slot count.
+  no_log: true
+
 - name: Install Worker slot systemd service template
   ansible.builtin.template:
     src: video-mask-worker.service.j2
@@ -106,3 +214,10 @@
     state: started
     daemon_reload: true
   loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
+
+- name: Restart Worker slots after a requested source update
+  ansible.builtin.systemd:
+    name: "video-mask-worker@slot-{{ item }}"
+    state: restarted
+  loop: "{{ range(1, (video_mask_worker_slots | default(1) | int) + 1) | list }}"
+  when: video_mask_restart_worker | default(false) | bool

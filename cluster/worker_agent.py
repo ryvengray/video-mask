@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -19,9 +21,12 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "640",
-                "--face-int", "5", "--frame-skip", "3", "--face-model", "yolov8"]
+DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
+                "--face-int", "5", "--face-conf", "0.4", "--frame-skip", "1",
+                "--face-model", "yolov8+yolo11", "--dual-iou", "0.4",
+                ]
 DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
+SINGLE_PUT_MAX_BYTES = 5 * 1024 * 1024 * 1024
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -57,6 +62,7 @@ class Worker:
         self.work_dir = args.work_dir.resolve()
         self.completed_output_dir = args.completed_output_dir.resolve()
         self.algorithm = args.algorithm.resolve()
+        self.algorithm_dir = self.algorithm.parent
         self.python = args.python
         self.poll_seconds = args.poll_seconds
         self.extra_args = args.extra_arg or DEFAULT_ARGS
@@ -71,7 +77,8 @@ class Worker:
         """Describe this process so the Controller dashboard can identify it."""
         hostname = socket.gethostname()
         info: dict[str, Any] = {
-            "algorithm": DEFAULT_ALGORITHM,
+            "algorithm": self.algorithm.name,
+            "default_algorithm": self.algorithm.name,
             "pid": os.getpid(),
             "hostname": hostname,
         }
@@ -98,12 +105,26 @@ class Worker:
     def report(self, task_id: str, status: str, **progress: Any) -> None:
         self.api(f"/api/tasks/{task_id}/progress", self.payload(status=status, progress=progress))
 
-    def busy_heartbeat(self, stop: threading.Event, capabilities: dict[str, Any]) -> None:
+    def report_logs(self, task_id: str, lines: list[str]) -> None:
+        """Mirror algorithm output to the Controller in small, non-fatal batches."""
+        if not lines:
+            return
+        try:
+            self.api(f"/api/tasks/{task_id}/logs", self.payload(lines=lines))
+        except Exception as exc:
+            # Never fail video processing merely because the dashboard log
+            # mirror is temporarily unavailable; the local service log remains.
+            print(f"[{task_id}] Controller log mirror failed: {exc}", file=sys.stderr, flush=True)
+
+    def busy_heartbeat(self, stop: threading.Event, capabilities: dict[str, Any],
+                       cancel_requested: threading.Event) -> None:
         """Keep long downloads/encodes leased to this Worker."""
         while not stop.wait(15):
             try:
-                self.api(f"/api/workers/{self.worker_id}/heartbeat",
-                         self.payload(status="busy", capabilities=capabilities))
+                response = self.api(f"/api/workers/{self.worker_id}/heartbeat",
+                                    self.payload(status="busy", capabilities=capabilities))
+                if response.get("cancel_requested"):
+                    cancel_requested.set()
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 print(f"Worker heartbeat failed: {exc}", file=sys.stderr, flush=True)
 
@@ -132,13 +153,98 @@ class Worker:
         # curl streams the file from disk.  Do not use read_bytes() here: long
         # videos must never be loaded into a Worker's RAM for upload.
         result = subprocess.run(
-            ["curl", "--fail", "--silent", "--show-error", "--upload-file", str(source), url],
+            ["curl", "--fail-with-body", "--silent", "--show-error", "--upload-file", str(source), url],
             text=True, capture_output=True, check=False,
         )
         if result.returncode != 0:
-            raise RuntimeError("output upload failed: " + result.stderr[-1000:])
+            diagnostic = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+            raise RuntimeError("output upload failed: " + diagnostic[-3000:])
 
-    def algorithm_command(self, source: Path, output_dir: Path, arguments: list[str]) -> list[str]:
+    @staticmethod
+    def upload_part(url: str, source: Path, offset: int, size: int) -> str:
+        """Stream one byte range to a pre-signed S3 UploadPart URL."""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https":
+            raise RuntimeError("multipart upload URL must use HTTPS")
+        target = urllib.parse.urlunparse(("", "", parsed.path or "/", parsed.params, parsed.query, ""))
+        connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
+        try:
+            connection.putrequest("PUT", target, skip_host=True)
+            connection.putheader("Host", parsed.netloc)
+            connection.putheader("Content-Length", str(size))
+            connection.endheaders()
+            with source.open("rb") as handle:
+                handle.seek(offset)
+                remaining = size
+                while remaining:
+                    block = handle.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise RuntimeError("output file changed during multipart upload")
+                    connection.send(block)
+                    remaining -= len(block)
+            response = connection.getresponse()
+            body = response.read().decode("utf-8", errors="replace")
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"multipart part upload failed: HTTP {response.status} {body[-2000:]}")
+            etag = response.getheader("ETag")
+            if not etag:
+                raise RuntimeError("multipart part upload response did not include an ETag")
+            return etag
+        finally:
+            connection.close()
+
+    def upload_multipart(self, task: dict[str, Any], source: Path,
+                         cancel_requested: threading.Event) -> None:
+        task_id = str(task["task_id"])
+        started = self.api(f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/start", self.payload())
+        upload_id, part_size = str(started["upload_id"]), int(started["part_size"])
+        size = source.stat().st_size
+        parts: list[dict[str, Any]] = []
+        completed = False
+        try:
+            for part_number, offset in enumerate(range(0, size, part_size), start=1):
+                if cancel_requested.is_set():
+                    raise RuntimeError("cancelled by administrator")
+                length = min(part_size, size - offset)
+                for attempt in range(1, 4):
+                    try:
+                        signed = self.api(
+                            f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/part-url",
+                            self.payload(upload_id=upload_id, part_number=part_number),
+                        )
+                        etag = self.upload_part(str(signed["upload_part_url"]), source, offset, length)
+                        break
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        print(f"[{task_id}] multipart part {part_number} failed; retrying", file=sys.stderr, flush=True)
+                parts.append({"part_number": part_number, "etag": etag})
+                self.report(task_id, "uploading", phase="multipart_uploading",
+                            uploaded_bytes=min(offset + length, size), output_bytes=size,
+                            multipart_part=part_number)
+            self.api(f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/complete",
+                     self.payload(upload_id=upload_id, parts=parts))
+            completed = True
+        finally:
+            if not completed:
+                try:
+                    self.api(f"/api/workers/{self.worker_id}/tasks/{task_id}/multipart/abort",
+                             self.payload(upload_id=upload_id))
+                except Exception as exc:
+                    print(f"[{task_id}] failed to abort multipart upload: {exc}", file=sys.stderr, flush=True)
+
+    def algorithm_path_for_task(self, task: dict[str, Any]) -> Path:
+        """Resolve the Controller-selected algorithm without allowing path traversal."""
+        name = str(task.get("algorithm") or self.algorithm.name).strip()
+        if not name or Path(name).name != name:
+            raise RuntimeError("task algorithm must be a filename in the Worker source directory")
+        candidate = (self.algorithm_dir / name).resolve()
+        if candidate.parent != self.algorithm_dir:
+            raise RuntimeError("task algorithm is outside the Worker source directory")
+        return candidate
+
+    def algorithm_command(self, algorithm: Path, source: Path, output_dir: Path,
+                          arguments: list[str]) -> list[str]:
         """Build an invocation for either a development script or a release binary.
 
         The normal source deployment supplies a ``.py`` algorithm and therefore
@@ -147,13 +253,15 @@ class Worker:
         as a Python script makes an otherwise valid Worker fail at task claim time.
         """
         shared = [str(source), "--out-dir", str(output_dir), *arguments]
-        if self.algorithm.suffix.lower() == ".py":
-            return [self.python, "-u", str(self.algorithm), *shared]
-        if not self.algorithm.is_file():
-            raise RuntimeError(f"algorithm executable does not exist: {self.algorithm}")
-        if not os.access(self.algorithm, os.X_OK):
-            raise RuntimeError(f"algorithm executable is not executable: {self.algorithm}")
-        return [str(self.algorithm), *shared]
+        if algorithm.suffix.lower() == ".py":
+            if not algorithm.is_file():
+                raise RuntimeError(f"algorithm script does not exist: {algorithm.name}")
+            return [self.python, "-u", str(algorithm), *shared]
+        if not algorithm.is_file():
+            raise RuntimeError(f"algorithm executable does not exist: {algorithm.name}")
+        if not os.access(algorithm, os.X_OK):
+            raise RuntimeError(f"algorithm executable is not executable: {algorithm.name}")
+        return [str(algorithm), *shared]
 
     def persist_output(self, output: Path, task_id: str) -> Path:
         """Keep a completed result after the task work directory is cleaned."""
@@ -172,10 +280,14 @@ class Worker:
         output_dir = directory / "output"
         output_dir.mkdir(exist_ok=True)
         heartbeat_stop = threading.Event()
+        cancel_requested = threading.Event()
         heartbeat = threading.Thread(target=self.busy_heartbeat,
-                                     args=(heartbeat_stop, self.capabilities()), daemon=True)
+                                     args=(heartbeat_stop, self.capabilities(), cancel_requested), daemon=True)
         heartbeat.start()
         phase = "initializing"
+        output: Path | None = None
+        elapsed: float | None = None
+        processing_started_at: float | None = None
         try:
             phase = "downloading"
             self.report(task_id, "downloading", phase="downloading")
@@ -183,21 +295,52 @@ class Worker:
             if task.get("source_sha256") and sha256(source) != task["source_sha256"]:
                 raise RuntimeError("downloaded source checksum does not match task")
             phase = "processing"
-            self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size)
-            command = self.algorithm_command(
-                source, output_dir, task.get("arguments") or self.extra_args
-            )
+            processing_started_at = time.time()
+            self.report(task_id, "processing", phase="processing", source_bytes=source.stat().st_size,
+                        processing_started_at=processing_started_at)
+            algorithm = self.algorithm_path_for_task(task)
+            print(f"[{task_id}] Controller selected algorithm: {algorithm.name}", flush=True)
+            command = self.algorithm_command(algorithm, source, output_dir, task.get("arguments") or self.extra_args)
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                                       text=True, bufsize=1, start_new_session=True,
+                                       env={**os.environ, "PYTHONUNBUFFERED": "1"})
+
+            cancel_monitor_stop = threading.Event()
+
+            def stop_cancelled_process() -> None:
+                while not cancel_monitor_stop.wait(0.5):
+                    if cancel_requested.is_set() and process.poll() is None:
+                        print(f"[{task_id}] cancellation requested; stopping algorithm", flush=True)
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        return
+
+            cancel_monitor = threading.Thread(target=stop_cancelled_process, daemon=True)
+            cancel_monitor.start()
             tail: list[str] = []
+            log_batch: list[str] = []
+            last_log_upload = time.monotonic()
             assert process.stdout is not None
             for line in process.stdout:
                 line = line.rstrip()
                 if line:
                     print(f"[{task_id}] {line}", flush=True)
                     tail = (tail + [line])[-20:]
-            if process.wait() != 0:
+                    log_batch.append(line)
+                    if len(log_batch) >= 20 or time.monotonic() - last_log_upload >= 5:
+                        self.report_logs(task_id, log_batch)
+                        log_batch = []
+                        last_log_upload = time.monotonic()
+            exit_code = process.wait()
+            self.report_logs(task_id, log_batch)
+            cancel_monitor_stop.set()
+            cancel_monitor.join(timeout=1)
+            if cancel_requested.is_set():
+                raise RuntimeError("cancelled by administrator")
+            if exit_code != 0:
                 raise RuntimeError("algorithm failed: " + " | ".join(tail)[-1500:])
             candidates = sorted(output_dir.glob("masked_*.mp4"))
             if not candidates:
@@ -208,7 +351,39 @@ class Worker:
             if output_url:
                 phase = "uploading"
                 self.report(task_id, "uploading", phase="uploading", elapsed_seconds=elapsed)
-                self.upload(output_url, output)
+                if output.stat().st_size > SINGLE_PUT_MAX_BYTES:
+                    self.upload_multipart(task, output, cancel_requested)
+                else:
+                    try:
+                        self.upload(output_url, output)
+                    except RuntimeError as first_upload_error:
+                        # Long-running tasks may reach S3 after their original PUT
+                        # URL expires. Refresh only the output URL: the completed
+                        # video stays local, so no download or inference is repeated.
+                        print(f"[{task_id}] upload failed; requesting a fresh upload URL", flush=True)
+                        try:
+                            refreshed = self.api(
+                                f"/api/workers/{self.worker_id}/tasks/{task_id}/upload-url", self.payload()
+                            )
+                        except Exception as refresh_error:
+                            raise RuntimeError(
+                                "output upload failed and the refreshed URL request failed; "
+                                f"first error: {first_upload_error}; refresh error: {refresh_error}"
+                            ) from refresh_error
+                        refreshed_url = str(refreshed.get("output_upload_url") or "")
+                        if not refreshed_url:
+                            raise RuntimeError(
+                                "output upload failed and Controller did not provide a refreshed URL: "
+                                + str(first_upload_error)
+                            ) from first_upload_error
+                        self.report(task_id, "uploading", phase="uploading_retry", elapsed_seconds=elapsed,
+                                    upload_retry_reason=str(first_upload_error)[-500:])
+                        try:
+                            self.upload(refreshed_url, output)
+                        except RuntimeError as retry_error:
+                            raise RuntimeError(
+                                "output upload failed after refreshed URL: " + str(retry_error)
+                            ) from retry_error
                 completed_output = output
                 # Do not save a sensitive presigned URL in the Controller database.
                 output_location = task.get("output_object_key") or "uploaded"
@@ -219,14 +394,39 @@ class Worker:
                 output_location = str(completed_output)
             self.api(f"/api/tasks/{task_id}/complete", self.payload(
                 output_sha256=sha256(completed_output), output_duration_seconds=duration(completed_output),
-                progress={"output_bytes": completed_output.stat().st_size, "elapsed_seconds": elapsed,
-                          "output_location": output_location},
+                progress={
+                    "input_filename": source.name,
+                    "input_bytes": source.stat().st_size,
+                    "output_filename": completed_output.name,
+                    "output_bytes": completed_output.stat().st_size,
+                    "processing_started_at": processing_started_at,
+                    "processing_seconds": elapsed,
+                    # Retain the existing field for older Controller databases/API consumers.
+                    "elapsed_seconds": elapsed,
+                    "output_location": output_location,
+                },
             ))
         except Exception as exc:
             message = f"{phase}: {exc}"
             print(f"[{task_id}] ERROR: {message}", file=sys.stderr, flush=True)
+            failure_progress: dict[str, Any] = {
+                "input_filename": source.name,
+                "input_bytes": source.stat().st_size if source.exists() else None,
+            }
+            if elapsed is not None:
+                failure_progress.update({"processing_seconds": elapsed, "elapsed_seconds": elapsed})
+            if processing_started_at is not None:
+                failure_progress["processing_started_at"] = processing_started_at
+            if output is not None and output.exists():
+                failure_progress.update({
+                    "output_filename": output.name,
+                    "output_bytes": output.stat().st_size,
+                    "output_duration_seconds": duration(output),
+                })
             try:
-                self.api(f"/api/tasks/{task_id}/fail", self.payload(error_message=message[:3000]))
+                self.api(f"/api/tasks/{task_id}/fail", self.payload(
+                    error_message=message[:3000], progress=failure_progress,
+                ))
             except Exception as report_error:
                 print(f"[{task_id}] failed to report error: {report_error}", file=sys.stderr, flush=True)
         finally:
