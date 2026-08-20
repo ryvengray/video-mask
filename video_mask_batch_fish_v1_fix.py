@@ -1,62 +1,39 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+video_mask_batch_fish_v1.py — 视频批量打码（仅人脸），精简版
 
 人脸:
   YuNet(默认, 仅 OpenCV 依赖) / YOLOv8-nano(极速, 需 ultralytics)
   → LK 光流跟踪
   检测间隔+光流跟踪(每5帧检测1次, 中间帧LK跟踪)
-信用卡/银行卡:
-  YOLOv8n 自训练检测(需先跑 train_card_yolov8.py 训练, 最准最快) + LK 光流跟踪
-  关键帧检测间隔(--card-key-int, 默认10帧) + 输入尺寸(--card-size, 默认640)
-宠物(猫/狗/鸟):
-  YOLOv8n COCO 预训练(15=cat, 16=dog, 14=bird) + LK 光流跟踪
-  检测间隔(--pet-int, 默认5帧) + 复用 ultralytics 依赖
-文字(字幕/标题/屏幕叠加文字):
-  PaddleOCR PP-OCRv4 DBNet 检测(零训练, 首次自动下载模型) + LK 光流跟踪
-  检测间隔(--text-int, 默认5帧) + 全打码(不OCR识别内容, 只取框)
 
 加速:
   管道模式(ffmpeg rawvideo → Python → ffmpeg, 无磁盘I/O)
   硬件编码(macOS VideoToolbox / NVENC / QSV, 自动检测)
-  MPS GPU 加速(Apple Silicon YOLOv8)
-  关键帧检测 + 光流跟踪(人脸+卡+宠物+文字)
+  关键帧检测 + 光流跟踪(人脸)
   抽帧跳帧(--frame-skip, 提速2-3倍)
 
 用法:
-  python video_mask_batch_fish_v2.py video.mp4
-  python video_mask_batch_fish_v2.py ./videos/              # 整个目录
-  python video_mask_batch_fish_v2.py a.mp4 b.mov            # 多文件
-  python video_mask_batch_fish_v2.py video.mp4 --face-model yolov8
-  python video_mask_batch_fish_v2.py video.mp4 --out-dir ./out
-  python video_mask_batch_fish_v2.py video.mp4 --no-face            # 关闭人脸打码
-  python video_mask_batch_fish_v2.py video.mp4 --no-card            # 关闭信用卡打码
-  python video_mask_batch_fish_v2.py video.mp4 --no-pet             # 关闭宠物打码
-  python video_mask_batch_fish_v2.py video.mp4 --no-text            # 关闭文字打码
-  python video_mask_batch_fish_v2.py video.mp4 --pet-conf 0.4       # 宠物置信度阈值
-  python video_mask_batch_fish_v2.py video.mp4 --pet-int 10         # 宠物检测间隔
-  python video_mask_batch_fish_v2.py video.mp4 --text-conf 0.3      # 文字置信度阈值
-  python video_mask_batch_fish_v2.py video.mp4 --text-int 10        # 文字检测间隔
-  python video_mask_batch_fish_v2.py video.mp4 --face-conf 0.25
-  python video_mask_batch_fish_v2.py video.mp4 --card-conf 0.3      # 信用卡置信度阈值
-  python video_mask_batch_fish_v2.py video.mp4 --card-key-int 20     # 信用卡检测间隔
-  python video_mask_batch_fish_v2.py video.mp4 --card-size 0           # 信用卡用原图(最准最慢)
-  python video_mask_batch_fish_v2.py video.mp4 --fisheye
-  python video_mask_batch_fish_v2.py video.mp4 --fisheye --fisheye-device pico4
-  python video_mask_batch_fish_v2.py video.mp4 --frame-skip 2
+  python video_mask_batch_fish_v1.py video.mp4
+  python video_mask_batch_fish_v1.py ./videos/              # 整个目录
+  python video_mask_batch_fish_v1.py a.mp4 b.mov            # 多文件
+  python video_mask_batch_fish_v1.py video.mp4 --face-model yolov8
+  python video_mask_batch_fish_v1.py video.mp4 --out-dir ./out
+  python video_mask_batch_fish_v1.py video.mp4 --no-face            # 关闭人脸打码
+  python video_mask_batch_fish_v1.py video.mp4 --face-conf 0.25
+  python video_mask_batch_fish_v1.py video.mp4 --fisheye
+  python video_mask_batch_fish_v1.py video.mp4 --fisheye --fisheye-device pico4
+  python video_mask_batch_fish_v1.py video.mp4 --frame-skip 2
 
 依赖:
   pip install opencv-python numpy
   # YOLOv8 人脸检测可选: pip install ultralytics
-  # 信用卡检测: 需先跑 train_card_yolov8.py 产出 yolov8n-card.pt(约6MB), 复用 ultralytics
-  # 宠物检测: yolov8n.pt 首次自动下载(约6MB), 复用 ultralytics
-  # 文字检测: pip install paddlepaddle paddleocr (首次自动下载 PP-OCRv4 模型约10MB)
   # 系统需 ffmpeg(保留音轨)
 
 代码调用:
-  from video_mask_batch_fish_v2 import process_video
-  process_video("in.mp4", "out.mp4", face_model="yunet", card_on=True, pet_on=True, text_on=True)
+  from video_mask_batch_fish_v1 import process_video
+  process_video("in.mp4", "out.mp4", face_model="yunet")
 """
 import argparse
 import glob
@@ -81,29 +58,6 @@ FACE_YUNET_SIZE = 640         # 人脸检测输入尺寸(YuNet/YOLOv8 均自动�
 FACE_DETECT_INT = 5           # 人脸检测间隔: 每5帧检测1次, 中间帧光流跟踪(默认5; 运动剧烈可改2~3)
 FRAME_SKIP = 1                # 抽帧跳过间隔(1=逐帧处理; 2=隔1帧抽1帧提速2x; 3=每3帧抽1帧提速3x)
 FACE_GRACE = 4               # 人脸漏检沿用旧框帧数(运动时收紧, 防打码框滞后)
-CARD_CELLS, CARD_SIGMA = 6, 35.0
-CARD_KEY_INT = 10            # 信用卡每10帧检测一次
-CARD_CONF = 0.25          # 信用卡置信度阈值
-CARD_SIZE = 640          # 信用卡检测输入尺寸(32的倍数)
-CARD_MODEL_FILE = "yolov8n-card.pt"  # 自训练单类别模型, 由 train_card_yolov8.py 产出, 约6MB
-
-# 宠物检测 (YOLOv8n COCO: cat/dog/bird)
-PET_MODEL_FILE = "yolov8n.pt"          # COCO 预训练, ultralytics 首次自动下载约6MB
-PET_CLASSES = (15, 16, 14)             # COCO 类别: 15=cat, 16=dog, 14=bird
-PET_CONF = 0.3                         # 宠物置信度阈值
-PET_INT = 5                            # 宠物检测间隔帧数(每5帧检测1次, 中间帧光流跟踪)
-PET_GRACE = 4                          # 宠物漏检沿用旧框帧数
-PET_EXPAND = 0.12                      # 宠物打码框外扩比例
-PET_CELLS, PET_SIGMA = 6, 35.0         # 宠物马赛克参数
-PET_INPUT_SIZE = 640                   # 宠物检测输入尺寸(32的倍数)
-
-# 文字检测 (PaddleOCR PP-OCRv4 DBNet, 零训练开箱即用, 支持中英文+数字)
-TEXT_CONF = 0.3                         # 文字置信度阈值(PaddleOCR 内部已过滤, 此值保留接口兼容)
-TEXT_INT = 5                            # 文字检测间隔帧数(每5帧检测1次,中间帧光流跟踪)
-TEXT_GRACE = 8                          # 文字漏检沿用旧框帧数(文字位置稳定可多沿用)
-TEXT_EXPAND = 0.05                      # 文字打码框外扩比例(文字框紧凑少外扩)
-TEXT_CELLS, TEXT_SIGMA = 8, 30.0        # 文字马赛克参数(cells=8比卡大,避免细长文字残留)
-TEXT_INPUT_SIZE = 960                   # 兼容保留(PaddleOCR 自动缩放, 此参数被忽略)
 
 VIDEO_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v",
                  ".mpg", ".mpeg", ".ts", ".m2ts", ".wmv", ".3gp", ".rmvb",
@@ -507,507 +461,6 @@ class FaceProcessor:
         return self.last_faces
 
 
-# ================= 宠物检测 =================
-# YOLOv8n COCO 预训练模型 (cat/dog/bird)
-
-class PetDetector:
-    """YOLOv8n COCO 宠物检测器 — 检测 cat(15)/dog(16)/bird(14)。
-
-    与 YOLOFaceDetector 保持相同接口: detect(img, conf) -> [(x1,y1,x2,y2),...]
-    使用 ultralytics 包，首次运行自动下载 yolov8n.pt 到 ~/.cache/ultralytics/。
-    """
-
-    def __init__(self, model_dir=None, yolo_size=PET_INPUT_SIZE, use_gpu=True):
-        try:
-            from ultralytics import YOLO
-        except ImportError as exc:
-            raise RuntimeError(
-                "缺少 ultralytics。请安装：pip install ultralytics"
-            ) from exc
-        self.yolo_size = self._normalize_size(yolo_size)
-        self.device = self._select_device(use_gpu)
-
-        # 查找模型: model_dir > CWD > 脚本目录 > ultralytics 自动下载
-        model_path = self._find_model(model_dir, PET_MODEL_FILE)
-        self._model = YOLO(model_path if model_path else PET_MODEL_FILE)
-
-        # fuse(): 融合 Conv+BN 层, 数学等价但推理快 5-15%
-        try:
-            self._model.fuse()
-        except Exception:
-            pass
-
-        # 预热: 跑一次空推理，避免首帧卡顿
-        import numpy as np
-        dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
-        self._model(dummy, imgsz=self.yolo_size, device=self.device,
-                    conf=0.5, verbose=False)
-
-    @staticmethod
-    def _find_model(model_dir, filename):
-        """按优先级搜索模型文件。返回路径或 None(触发 ultralytics 自动下载)。"""
-        candidates = []
-        if model_dir:
-            candidates.append(os.path.join(model_dir, filename))
-        candidates.append(os.path.join(os.getcwd(), filename))
-        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       filename))
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
-        return None
-
-    @staticmethod
-    def _normalize_size(size):
-        """调整为 32 的倍数 (YOLO 要求)。"""
-        return max(32, round(size / 32) * 32)
-
-    @staticmethod
-    def _select_device(use_gpu):
-        """自动选择最优设备: CUDA > MPS > CPU。"""
-        if not use_gpu:
-            return "cpu"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda"
-            if torch.backends.mps.is_available():
-                return "mps"
-        except Exception:
-            pass
-        return "cpu"
-
-    def detect(self, img, conf=PET_CONF):
-        """返回 bbox 列表, 仅保留 cat/dog/bird 三类。"""
-        if img is None or img.size == 0:
-            return []
-
-        # stream=True: 生成器模式, 减少结果对象包装开销
-        results = self._model(img, imgsz=self.yolo_size, conf=conf,
-                              device=self.device, verbose=False, stream=True)
-        bboxes = []
-        for r in results:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                cls_id = int(box.cls[0]) if box.cls is not None else -1
-                if cls_id not in PET_CLASSES:  # 仅保留 cat(15)/dog(16)/bird(14)
-                    continue
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                h, w = img.shape[:2]
-                x1, y1 = max(0, int(x1)), max(0, int(y1))
-                x2, y2 = min(w, int(x2)), min(h, int(y2))
-                if x2 > x1 and y2 > y1:
-                    bboxes.append((x1, y1, x2, y2))
-        return bboxes
-
-
-class PetProcessor:
-    """宠物检测+光流跟踪：关键帧检测，中间帧LK光流跟踪。支持多目标。"""
-    def __init__(self, detector, detect_int=PET_INT, grace=PET_GRACE, conf=PET_CONF):
-        self.detector = detector
-        self.detect_int = max(1, detect_int)
-        self.conf = conf
-        self.grace = grace          # 检测失败时沿用旧框的帧数
-        self.miss_count = 0         # 连续检测失败的周期数
-        self.last_pets = []
-        self.prev_gray = None
-        self.pet_pts = {}
-        # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
-        self.lk = dict(winSize=(21, 21), maxLevel=3,
-                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
-        # 网格采样点数: 3×3=9 点, 替代 goodFeaturesToTrack 的 corner detection 开销
-        # 9 点 median 估计位移仍稳健, 比 5×5=25 点 LK 提速约 2x
-        self._grid_rows, self._grid_cols = 3, 3
-
-    def _init_pts(self, gray, box):
-        """用均匀网格采样替代 goodFeaturesToTrack 的角点检测。
-        grid 采样 O(1) vs corner detection O(N), 对 1080P 帧约节省 2-5ms。"""
-        x1, y1, x2, y2 = box
-        h_img, w_img = gray.shape
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w_img, x2), min(h_img, y2)
-        bw, bh = x2 - x1, y2 - y1
-        if bw < 12 or bh < 12:
-            return None
-        # 在 bbox 内部均匀采样 3x3 网格点
-        margin = 0.12
-        xs = np.linspace(x1 + bw * margin, x2 - bw * margin, self._grid_cols, dtype=np.float32)
-        ys = np.linspace(y1 + bh * margin, y2 - bh * margin, self._grid_rows, dtype=np.float32)
-        xv, yv = np.meshgrid(xs, ys)
-        pts = np.column_stack((xv.ravel(), yv.ravel())).reshape(-1, 1, 2)
-        return pts.astype(np.float32)
-
-    def process(self, img, frame_idx):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_pets
-        if need_detect:
-            dets = self.detector.detect(img, conf=self.conf)
-            # 多目标场景: 保留全部检测结果
-            if dets:
-                pets = dets
-                self.miss_count = 0
-            elif self.last_pets and self.miss_count < self.grace:
-                # 检测失败: 宽容期内沿用上一帧框(LK跟踪会继续修正)
-                pets = self.last_pets
-                self.miss_count += 1
-            else:
-                pets = []
-                self.miss_count = 0
-            self.pet_pts = {}
-            for i, box in enumerate(pets):
-                pts = self._init_pts(gray, box)
-                if pts is not None:
-                    self.pet_pts[i] = pts
-            self.last_pets = pets
-        elif self.prev_gray is not None and self.last_pets and self.pet_pts:
-            tracked, new_pts = [], {}
-            for i, (x1, y1, x2, y2) in enumerate(self.last_pets):
-                if i not in self.pet_pts or len(self.pet_pts[i]) < 4:
-                    tracked.append((x1, y1, x2, y2))
-                    continue
-                pts = self.pet_pts[i]
-                npts, status, _ = cv2.calcOpticalFlowPyrLK(
-                    self.prev_gray, gray, pts, None, **self.lk)
-                good_mask = status.flatten() == 1
-                if good_mask.sum() >= 4:
-                    good = npts[good_mask].reshape(-1, 2)
-                    old_flat = pts[good_mask].reshape(-1, 2)
-                    dx = float(np.median(good[:, 0] - old_flat[:, 0]))
-                    dy = float(np.median(good[:, 1] - old_flat[:, 1]))
-                    tracked.append((int(x1 + dx), int(y1 + dy),
-                                    int(x2 + dx), int(y2 + dy)))
-                    new_pts[i] = good.reshape(-1, 1, 2)
-                else:
-                    tracked.append((x1, y1, x2, y2))
-            self.pet_pts = new_pts
-            self.last_pets = tracked
-        self.prev_gray = gray
-        return self.last_pets
-
-
-# ================= 信用卡检测 =================
-# 自训练 YOLOv8n 单类别检测(需先跑 train_card_yolov8.py 产出 yolov8n-card.pt)
-
-class YoloCardDetector:
-    """YOLOv8n 自训练信用卡检测器 — 加载 yolov8n-card.pt 单类别模型(class 0=card)。
-    模型由 train_card_yolov8.py 训练产出, 需放在 model_dir/CWD/脚本目录。
-    detect() 返回 [(x1,y1,x2,y2,score), ...], 含 score 供 CardTracker 选最佳框。"""
-    _inst = None
-    _inst_size = None
-    _inst_gpu = None
-
-    def __init__(self, model_dir=None, yolo_size=CARD_SIZE, use_gpu=True):
-        try:
-            from ultralytics import YOLO
-        except ImportError as exc:
-            raise RuntimeError(
-                "缺少 ultralytics。请安装：pip install ultralytics"
-            ) from exc
-        self.yolo_size = self._normalize_size(yolo_size)
-        self.device = self._select_device(use_gpu)
-        # 查找模型: model_dir > CWD > 脚本目录; 未找到则抛 FileNotFoundError(不自动下载)
-        model_path = self._find_model(model_dir, CARD_MODEL_FILE)
-        if model_path is None:
-            raise FileNotFoundError("未找到 yolov8n-card.pt")
-        self._model = YOLO(model_path)
-        # fuse(): 融合 Conv+BN 层, 数学等价但推理快 5-15%
-        try:
-            self._model.fuse()
-        except Exception:
-            pass
-        # 预热: 跑一次空推理，避免首帧卡顿
-        dummy = np.zeros((self.yolo_size, self.yolo_size, 3), dtype=np.uint8)
-        self._model(dummy, imgsz=self.yolo_size, device=self.device,
-                    conf=0.5, verbose=False)
-
-    @classmethod
-    def get(cls, yolo_size=CARD_SIZE, use_gpu=True, model_dir=None):
-        if cls._inst is None or cls._inst_size != yolo_size or cls._inst_gpu != use_gpu:
-            cls._inst = cls(model_dir=model_dir, yolo_size=yolo_size, use_gpu=use_gpu)
-            cls._inst_size = yolo_size
-            cls._inst_gpu = use_gpu
-        return cls._inst
-
-    @staticmethod
-    def _find_model(model_dir, filename):
-        """按优先级搜索模型文件。返回路径或 None(由上层抛 FileNotFoundError)。"""
-        candidates = []
-        if model_dir:
-            candidates.append(os.path.join(model_dir, filename))
-        candidates.append(os.path.join(os.getcwd(), filename))
-        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       filename))
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
-        return None
-
-    @staticmethod
-    def _normalize_size(size):
-        """调整为 32 的倍数 (YOLO 要求)。"""
-        return max(32, round(size / 32) * 32)
-
-    @staticmethod
-    def _select_device(use_gpu):
-        """自动选择最优设备: CUDA > MPS > CPU。"""
-        if not use_gpu:
-            return "cpu"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda"
-            if torch.backends.mps.is_available():
-                return "mps"
-        except Exception:
-            pass
-        return "cpu"
-
-    def detect(self, img, thr=CARD_CONF):
-        """返回 [(x1,y1,x2,y2,score), ...], 含 score 供 CardTracker 选最佳框。
-        单类别模型(class 0=card) 无需 cls_id 过滤。"""
-        if img is None or img.size == 0:
-            return []
-        h0, w0 = img.shape[:2]
-        # stream=True: 生成器模式, 减少结果对象包装开销
-        results = self._model(img, imgsz=self.yolo_size, conf=thr,
-                              device=self.device, verbose=False, stream=True)
-        out = []
-        for r in results:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                s = float(box.conf[0])
-                # clip 到图像边界
-                x1 = max(0, min(int(x1), w0 - 1))
-                y1 = max(0, min(int(y1), h0 - 1))
-                x2 = max(0, min(int(x2), w0 - 1))
-                y2 = max(0, min(int(y2), h0 - 1))
-                if x2 > x1 and y2 > y1:
-                    out.append((x1, y1, x2, y2, s))
-        return out
-
-
-# ================= 卡的 LK 跟踪器(自训练 YOLOv8n 关键帧 + 光流) =================
-
-class CardTracker:
-    def __init__(self, detector, key_int=CARD_KEY_INT, conf=CARD_CONF):
-        self.detector = detector          # YoloCardDetector 或 None
-        self.color_hint = None
-        self.key_int = key_int
-        self.conf = conf
-        self.box = None
-        self.pts = None
-        self.prev_gray = None
-        self.next_detect = 0          # 首帧即检测; 后续按 key_int 调度
-        self.lk = dict(winSize=(31, 31), maxLevel=4,
-                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
-
-    def _init_pts(self, gray, box):
-        x1, y1, x2, y2 = box
-        mask = np.zeros_like(gray)
-        mask[y1:y2, x1:x2] = 255
-        pts = cv2.goodFeaturesToTrack(gray, maxCorners=80, qualityLevel=0.01,
-                                      minDistance=10, mask=mask, blockSize=9)
-        return None if pts is None else pts.reshape(-1, 1, 2)
-
-    def update(self, img, frame_idx):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if self.detector is not None:
-            need = (frame_idx >= self.next_detect)
-            if need:
-                dets = self.detector.detect(img, self.conf)
-                if dets:
-                    best = max(dets, key=lambda b: b[4])
-                    self.box = best[:4]
-                    self.pts = self._init_pts(gray, self.box)
-                    self.next_detect = frame_idx + self.key_int
-                else:
-                    self.box = None
-                    self.next_detect = frame_idx + self.key_int  # 未检出, 等key_int帧后重检(避免每帧都跑YOLOv8n)
-            elif self.box is not None and self.pts is not None and len(self.pts) >= 8 \
-                    and self.prev_gray is not None:
-                npts, status, _ = cv2.calcOpticalFlowPyrLK(
-                    self.prev_gray, gray, self.pts, None, **self.lk)
-                gn = npts[status.flatten() == 1].reshape(-1, 2)
-                go = self.pts[status.flatten() == 1].reshape(-1, 2)
-                if len(gn) >= 8:
-                    dx = float(np.median(gn[:, 0] - go[:, 0]))
-                    dy = float(np.median(gn[:, 1] - go[:, 1]))
-                    self.box = (int(self.box[0] + dx), int(self.box[1] + dy),
-                                int(self.box[2] + dx), int(self.box[3] + dy))
-                    self.pts = gn.reshape(-1, 1, 2)
-                    # 跟踪质量差(位移过大/点数太少) → 提前重检, 防止打码框漂移
-                    box_w = max(1, self.box[2] - self.box[0])
-                    if len(gn) < 15 or abs(dx) > box_w * 0.5 or abs(dy) > box_w * 0.5:
-                        self.next_detect = frame_idx + 1
-                else:
-                    self.pts = self._init_pts(gray, self.box)
-                    self.next_detect = frame_idx + 1
-        # 结果
-        self.prev_gray = gray
-        return [self.box] if self.box is not None else []
-
-
-# ================= 文字检测 =================
-# TextDetection (PaddleOCR DBNet, 零训练, 首次自动下载模型到 ~/.paddlex/)
-# 仅跑检测跳过识别, 比完整 PaddleOCR 快约 10x
-
-class OcrTextDetector:
-    """PaddleOCR 文字检测器 — 零训练开箱即用, 支持中英文+数字。
-
-    使用 TextDetection 独立接口(仅 DBNet 检测, 跳过识别模型), 比完整 PaddleOCR
-    快约 10x(1080p 实测 ~450ms vs ~4774ms)。打码只需检测框, 不需识别内容。
-    模型首次运行自动下载到 ~/.paddlex/(约 10MB), 无需手动准备。
-    detect() 返回 [(x1,y1,x2,y2,score), ...], 兼容 TextProcessor 接口。
-    """
-    _inst = None
-
-    def __init__(self, use_gpu=True):
-        try:
-            from paddleocr import TextDetection
-        except ImportError as exc:
-            raise RuntimeError(
-                "缺少 paddleocr。请安装：pip install paddlepaddle paddleocr"
-            ) from exc
-        # PaddlePaddle 不支持 Apple MPS, Mac 上用 CPU
-        # TextDetection 仅跑 DBNet 检测(跳过识别模型), limit_side_len 限制长边加速
-        self._td = TextDetection(limit_side_len=640, limit_type="max")
-        # 预热: 跑一次空推理, 触发模型下载 + 避免首帧卡顿
-        dummy = np.zeros((64, 320, 3), dtype=np.uint8)
-        try:
-            self._td.predict(dummy)
-        except Exception:
-            pass
-
-    @classmethod
-    def get(cls, yolo_size=None, use_gpu=True, model_dir=None):
-        """单例获取。yolo_size/model_dir 参数保留接口兼容, PaddleOCR 自动缩放故忽略。"""
-        if cls._inst is None:
-            cls._inst = cls(use_gpu=use_gpu)
-        return cls._inst
-
-    def detect(self, img, conf=TEXT_CONF):
-        """返回 [(x1,y1,x2,y2,score), ...]。
-        TextDetection 返回 List[TextDetResult], 含 dt_polys(4点框) + dt_scores(置信度)。
-        TextDetResult 为 dict-like(支持 .get()/.keys()), 不支持属性访问。"""
-        if img is None or img.size == 0:
-            return []
-        h0, w0 = img.shape[:2]
-        try:
-            results = self._td.predict(img)
-        except Exception:
-            return []
-        if not results:
-            return []
-        item = results[0]
-        polys = item.get('dt_polys') if hasattr(item, 'get') else None
-        scores = item.get('dt_scores') if hasattr(item, 'get') else None
-        # dt_polys 可能是 ndarray(N,4,2), 不能用 bool() 判空
-        if polys is None or len(polys) == 0:
-            return []
-        out = []
-        for i, poly in enumerate(polys):
-            if poly is None or len(poly) < 4:
-                continue
-            xs = [float(p[0]) for p in poly]
-            ys = [float(p[1]) for p in poly]
-            x1 = max(0, min(int(min(xs)), w0 - 1))
-            y1 = max(0, min(int(min(ys)), h0 - 1))
-            x2 = max(0, min(int(max(xs)), w0 - 1))
-            y2 = max(0, min(int(max(ys)), h0 - 1))
-            if x2 > x1 and y2 > y1:
-                s = 1.0
-                if scores is not None and i < len(scores):
-                    try:
-                        s = float(scores[i])
-                    except (TypeError, ValueError):
-                        s = 1.0
-                out.append((x1, y1, x2, y2, s))
-        return out
-
-
-class TextProcessor:
-    """文字检测+光流跟踪：关键帧检测，中间帧LK光流跟踪。支持多目标。
-    仿 PetProcessor 结构, 因为一帧可能有多个文字区域(字幕+标题+水印)。"""
-    def __init__(self, detector, detect_int=TEXT_INT, grace=TEXT_GRACE, conf=TEXT_CONF):
-        self.detector = detector
-        self.detect_int = max(1, detect_int)
-        self.conf = conf
-        self.grace = grace          # 检测失败时沿用旧框的帧数
-        self.miss_count = 0         # 连续检测失败的周期数
-        self.last_texts = []
-        self.prev_gray = None
-        self.text_pts = {}
-        # LK 参数: 与 PetProcessor 一致(3x3 网格采样 + 小搜索窗)
-        self.lk = dict(winSize=(21, 21), maxLevel=3,
-                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
-        self._grid_rows, self._grid_cols = 3, 3
-
-    def _init_pts(self, gray, box):
-        """用均匀网格采样替代 goodFeaturesToTrack 的角点检测。"""
-        x1, y1, x2, y2 = box
-        h_img, w_img = gray.shape
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w_img, x2), min(h_img, y2)
-        bw, bh = x2 - x1, y2 - y1
-        if bw < 12 or bh < 12:
-            return None
-        margin = 0.12
-        xs = np.linspace(x1 + bw * margin, x2 - bw * margin, self._grid_cols, dtype=np.float32)
-        ys = np.linspace(y1 + bh * margin, y2 - bh * margin, self._grid_rows, dtype=np.float32)
-        xv, yv = np.meshgrid(xs, ys)
-        pts = np.column_stack((xv.ravel(), yv.ravel())).reshape(-1, 1, 2)
-        return pts.astype(np.float32)
-
-    def process(self, img, frame_idx):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_texts
-        if need_detect:
-            dets = self.detector.detect(img, conf=self.conf)
-            # 多目标场景: 保留全部检测结果(去掉 score, 只保留坐标)
-            if dets:
-                texts = [d[:4] for d in dets]
-                self.miss_count = 0
-            elif self.last_texts and self.miss_count < self.grace:
-                texts = self.last_texts
-                self.miss_count += 1
-            else:
-                texts = []
-                self.miss_count = 0
-            self.text_pts = {}
-            for i, box in enumerate(texts):
-                pts = self._init_pts(gray, box)
-                if pts is not None:
-                    self.text_pts[i] = pts
-            self.last_texts = texts
-        elif self.prev_gray is not None and self.last_texts and self.text_pts:
-            tracked, new_pts = [], {}
-            for i, (x1, y1, x2, y2) in enumerate(self.last_texts):
-                if i not in self.text_pts or len(self.text_pts[i]) < 4:
-                    tracked.append((x1, y1, x2, y2))
-                    continue
-                pts = self.text_pts[i]
-                npts, status, _ = cv2.calcOpticalFlowPyrLK(
-                    self.prev_gray, gray, pts, None, **self.lk)
-                good_mask = status.flatten() == 1
-                if good_mask.sum() >= 4:
-                    good = npts[good_mask].reshape(-1, 2)
-                    old_flat = pts[good_mask].reshape(-1, 2)
-                    dx = float(np.median(good[:, 0] - old_flat[:, 0]))
-                    dy = float(np.median(good[:, 1] - old_flat[:, 1]))
-                    tracked.append((int(x1 + dx), int(y1 + dy),
-                                    int(x2 + dx), int(y2 + dy)))
-                    new_pts[i] = good.reshape(-1, 1, 2)
-                else:
-                    tracked.append((x1, y1, x2, y2))
-            self.text_pts = new_pts
-            self.last_texts = tracked
-        self.prev_gray = gray
-        return self.last_texts
-
-
 # ================= 视频处理 =================
 
 def _run(cmd):
@@ -1210,12 +663,10 @@ def hw_bitrate(w, h, fps, encoder, src_bitrate=None):
     return target
 
 
-def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, card_size,
-                  pet_on, pet_conf, pet_int,
-                  text_on, text_conf, text_int, text_size,
-                  model_dir, face_size, face_int, face_conf, face_model,
-                  keep_tmp, force_h264, use_gpu, frame_skip,
-                  fisheye, fisheye_strength, fisheye_device, fisheye_downscale, log):
+def _process_pipe(src, dst, face_on, model_dir, face_size,
+                  face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
+                  frame_skip, fisheye, fisheye_strength, fisheye_device,
+                  fisheye_downscale, log):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -1240,39 +691,6 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, card_size
         fd = YuNetFaceDetector(model_dir=model_dir, yunet_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YuNet (输入{face_size})")
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
-
-    card_tr = None
-    if card_on:
-        try:
-            yc = YoloCardDetector.get(yolo_size=card_size, use_gpu=use_gpu, model_dir=model_dir)
-            card_tr = CardTracker(yc, key_int=card_key_int, conf=card_conf)
-            log(f"  [信用卡] YOLOv8n 自训练 (输入{card_size})")
-        except FileNotFoundError:
-            log(f"  [警告] 未找到 yolov8n-card.pt, 请先运行 train_card_yolov8.py 训练模型, 禁用信用卡打码")
-            card_tr = None
-        except Exception as e:
-            log(f"  [警告] 信用卡检测器加载失败({e}), 禁用信用卡打码")
-            card_tr = None
-
-    pet_proc = None
-    if pet_on:
-        try:
-            pd = PetDetector(model_dir=model_dir, yolo_size=PET_INPUT_SIZE, use_gpu=use_gpu)
-            pet_proc = PetProcessor(pd, detect_int=pet_int, conf=pet_conf)
-            log(f"  [宠物] YOLOv8n COCO (cat/dog/bird, 输入{PET_INPUT_SIZE})")
-        except Exception as e:
-            log(f"  [警告] 宠物检测器加载失败({e}), 禁用宠物打码")
-            pet_proc = None
-
-    text_proc = None
-    if text_on:
-        try:
-            ocr_det = OcrTextDetector.get(use_gpu=use_gpu)
-            text_proc = TextProcessor(ocr_det, detect_int=text_int, grace=TEXT_GRACE, conf=text_conf)
-            log(f"  [文字] PaddleOCR PP-OCRv4 (零训练, 中英文+数字)")
-        except Exception as e:
-            log(f"  [警告] PaddleOCR 加载失败({e}), 禁用文字打码")
-            text_proc = None
 
     # 启动抽帧进程(raw BGR → stdout pipe)
     # NVDEC 硬件解码(可用时): -hwaccel cuda 让 ffmpeg 用 GPU 解码
@@ -1403,9 +821,6 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, card_size
     # 主循环: 取帧 → 处理 → 入写队列
     frame_idx = 0
     total_face = 0
-    total_card = 0
-    total_pet = 0
-    total_text = 0
     try:
         while True:
             raw = read_q.get()
@@ -1431,42 +846,12 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, card_size
                                  FACE_CELLS, FACE_SIGMA)
                 total_face += len(faces)
 
-            cards = []
-            if card_tr is not None:
-                cards = card_tr.update(img, frame_idx)
-                for (x1, y1, x2, y2) in cards:
-                    bw, bh = x2 - x1, y2 - y1
-                    heavy_mosaic(img, int(x1 - 0.1 * bw), int(y1 - 0.1 * bh),
-                                 int(x2 + 0.1 * bw), int(y2 + 0.1 * bh),
-                                 CARD_CELLS, CARD_SIGMA)
-                total_card += len(cards)
-
-            pets = []
-            if pet_proc is not None:
-                pets = pet_proc.process(img, frame_idx)
-                for (x1, y1, x2, y2) in pets:
-                    bw, bh = x2 - x1, y2 - y1
-                    heavy_mosaic(img, int(x1 - PET_EXPAND * bw), int(y1 - PET_EXPAND * bh),
-                                 int(x2 + PET_EXPAND * bw), int(y2 + PET_EXPAND * bh),
-                                 PET_CELLS, PET_SIGMA)
-                total_pet += len(pets)
-
-            texts = []
-            if text_proc is not None:
-                texts = text_proc.process(img, frame_idx)
-                for (x1, y1, x2, y2) in texts:
-                    bw, bh = x2 - x1, y2 - y1
-                    heavy_mosaic(img, int(x1 - TEXT_EXPAND * bw), int(y1 - TEXT_EXPAND * bh),
-                                 int(x2 + TEXT_EXPAND * bw), int(y2 + TEXT_EXPAND * bh),
-                                 TEXT_CELLS, TEXT_SIGMA)
-                total_text += len(texts)
-
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
             # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
             write_q.put(memoryview(img))
 
             if frame_idx % 50 == 0:
-                log(f"    [{frame_idx}] 人脸={len(faces)} 卡={len(cards)} 宠={len(pets)} 文={len(texts)} "
+                log(f"    [{frame_idx}] 人脸={len(faces)} "
                     f"elapsed={time.time()-t0:.0f}s")
     except BrokenPipeError:
         log("  [警告] 管道中断")
@@ -1498,16 +883,14 @@ def _process_pipe(src, dst, face_on, card_on, card_conf, card_key_int, card_size
             # 流式管道提前结束(<30%帧处理完成), 自动回退文件模式
             raise RuntimeError(
                 f"管道提前结束(仅处理{frame_idx}/{total_expected}帧, {actual_ratio:.0%}), 回退文件模式")
-    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face} 卡帧次={total_card} 宠帧次={total_pet} 文帧次={total_text}")
+    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}")
     return encode.returncode == 0
 
 
-def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, card_size,
-                   pet_on, pet_conf, pet_int,
-                   text_on, text_conf, text_int, text_size,
-                   model_dir, face_size, face_int, face_conf, face_model,
-                   keep_tmp, force_h264, use_gpu, frame_skip,
-                   fisheye, fisheye_strength, fisheye_device, fisheye_downscale, log):
+def _process_files(src, dst, face_on, model_dir, face_size,
+                   face_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
+                   frame_skip, fisheye, fisheye_strength, fisheye_device,
+                   fisheye_downscale, log):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1534,39 +917,6 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, card_siz
     frames = sorted(f for f in os.listdir(fin) if f.endswith(".jpg"))
     log(f"  共 {len(frames)} 帧")
 
-    card_tr = None
-    if card_on:
-        try:
-            yc = YoloCardDetector.get(yolo_size=card_size, use_gpu=use_gpu, model_dir=model_dir)
-            card_tr = CardTracker(yc, key_int=card_key_int, conf=card_conf)
-            log(f"  [信用卡] YOLOv8n 自训练 (输入{card_size})")
-        except FileNotFoundError:
-            log(f"  [警告] 未找到 yolov8n-card.pt, 请先运行 train_card_yolov8.py 训练模型, 禁用信用卡打码")
-            card_tr = None
-        except Exception as e:
-            log(f"  [警告] 信用卡检测器加载失败({e}), 禁用信用卡打码")
-            card_tr = None
-
-    pet_proc = None
-    if pet_on:
-        try:
-            pd = PetDetector(model_dir=model_dir, yolo_size=PET_INPUT_SIZE, use_gpu=use_gpu)
-            pet_proc = PetProcessor(pd, detect_int=pet_int, conf=pet_conf)
-            log(f"  [宠物] YOLOv8n COCO (cat/dog/bird, 输入{PET_INPUT_SIZE})")
-        except Exception as e:
-            log(f"  [警告] 宠物检测器加载失败({e}), 禁用宠物打码")
-            pet_proc = None
-
-    text_proc = None
-    if text_on:
-        try:
-            ocr_det = OcrTextDetector.get(use_gpu=use_gpu)
-            text_proc = TextProcessor(ocr_det, detect_int=text_int, grace=TEXT_GRACE, conf=text_conf)
-            log(f"  [文字] PaddleOCR PP-OCRv4 (零训练, 中英文+数字)")
-        except Exception as e:
-            log(f"  [警告] PaddleOCR 加载失败({e}), 禁用文字打码")
-            text_proc = None
-
     if face_model == "yolov8":
         fd = YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu)
         log(f"  [人脸] YOLOv8-nano (输入{face_size})")
@@ -1575,9 +925,6 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, card_siz
         log(f"  [人脸] YuNet (输入{face_size})")
     face_proc = FaceProcessor(fd, detect_int=face_int, conf=face_conf) if face_on else None
     total_face = 0
-    total_card = 0
-    total_pet = 0
-    total_text = 0
 
     for i, fn in enumerate(frames, 1):
         img = cv2.imread(os.path.join(fin, fn))
@@ -1596,36 +943,9 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, card_siz
                 ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
                 heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
             total_face += len(faces)
-        cards = []
-        if card_tr is not None:
-            cards = card_tr.update(img, i)
-            for (x1, y1, x2, y2) in cards:
-                bw, bh = x2 - x1, y2 - y1
-                heavy_mosaic(img, int(x1 - 0.1 * bw), int(y1 - 0.1 * bh),
-                             int(x2 + 0.1 * bw), int(y2 + 0.1 * bh),
-                             CARD_CELLS, CARD_SIGMA)
-            total_card += len(cards)
-        pets = []
-        if pet_proc is not None:
-            pets = pet_proc.process(img, i)
-            for (x1, y1, x2, y2) in pets:
-                bw, bh = x2 - x1, y2 - y1
-                heavy_mosaic(img, int(x1 - PET_EXPAND * bw), int(y1 - PET_EXPAND * bh),
-                             int(x2 + PET_EXPAND * bw), int(y2 + PET_EXPAND * bh),
-                             PET_CELLS, PET_SIGMA)
-            total_pet += len(pets)
-        texts = []
-        if text_proc is not None:
-            texts = text_proc.process(img, i)
-            for (x1, y1, x2, y2) in texts:
-                bw, bh = x2 - x1, y2 - y1
-                heavy_mosaic(img, int(x1 - TEXT_EXPAND * bw), int(y1 - TEXT_EXPAND * bh),
-                             int(x2 + TEXT_EXPAND * bw), int(y2 + TEXT_EXPAND * bh),
-                             TEXT_CELLS, TEXT_SIGMA)
-            total_text += len(texts)
         cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
-            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} 卡帧={len(cards)} 宠帧={len(pets)} 文帧={len(texts)} elapsed={time.time()-t0:.0f}s")
+            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} elapsed={time.time()-t0:.0f}s")
 
     log("  合成视频...")
     hw = find_hw_encoder(family="h264" if force_h264 else "hevc")
@@ -1651,39 +971,28 @@ def _process_files(src, dst, face_on, card_on, card_conf, card_key_int, card_siz
         return False
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
-    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face} 卡帧次={total_card} 宠帧次={total_pet} 文帧次={total_text}")
+    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face}")
     return True
 
 
-def process_video(src, dst, face_on=True, card_on=True, card_conf=CARD_CONF,
-                  card_key_int=CARD_KEY_INT, card_size=CARD_SIZE,
-                  pet_on=True, pet_conf=PET_CONF, pet_int=PET_INT, model_dir=None,
-                  text_on=True, text_conf=TEXT_CONF, text_int=TEXT_INT, text_size=TEXT_INPUT_SIZE,
+def process_video(src, dst, face_on=True, model_dir=None,
                   face_size=FACE_YUNET_SIZE, face_int=FACE_DETECT_INT,
                   face_conf=FACE_CONF, face_model="yunet",
                   use_pipe=True, keep_tmp=False,
                   force_h264=False, use_gpu=True, frame_skip=FRAME_SKIP,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
                   fisheye_downscale=1, log=print):
-    """处理单个视频: 人脸+信用卡+宠物+文字打码, 保留音轨。返回是否成功。"""
+    """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
-            return _process_pipe(src, dst, face_on, card_on, card_conf,
-                                 card_key_int, card_size,
-                                 pet_on, pet_conf, pet_int,
-                                 text_on, text_conf, text_int, text_size,
-                                 model_dir, face_size,
+            return _process_pipe(src, dst, face_on, model_dir, face_size,
                                  face_int, face_conf, face_model,
                                  keep_tmp, force_h264, use_gpu,
                                  frame_skip, fisheye, fisheye_strength,
                                  fisheye_device, fisheye_downscale, log)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
-    return _process_files(src, dst, face_on, card_on, card_conf,
-                          card_key_int, card_size,
-                          pet_on, pet_conf, pet_int,
-                          text_on, text_conf, text_int, text_size,
-                          model_dir, face_size,
+    return _process_files(src, dst, face_on, model_dir, face_size,
                           face_int, face_conf, face_model,
                           keep_tmp, force_h264, use_gpu,
                           frame_skip, fisheye, fisheye_strength,
@@ -1703,14 +1012,9 @@ def expand_inputs(inputs):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="视频批量打码(人脸+信用卡+宠物+文字, YOLOv8/YuNet + YOLOv8n 自训练卡 + YOLOv8n 宠物 + PaddleOCR 文字)")
+    ap = argparse.ArgumentParser(description="视频批量打码(仅人脸, YuNet/YOLOv8)")
     ap.add_argument("inputs", nargs="+", help="视频文件/目录/通配符")
     ap.add_argument("--out-dir", default="masked_out", help="输出目录(默认 masked_out)")
-    ap.add_argument("--card-conf", type=float, default=CARD_CONF, help="信用卡置信度阈值(默认0.25)")
-    ap.add_argument("--card-key-int", type=int, default=CARD_KEY_INT,
-                    help="信用卡检测间隔帧数(默认10; 调大提速但快速移动可能漏)")
-    ap.add_argument("--card-size", type=int, default=CARD_SIZE,
-                    help="信用卡检测输入尺寸(32的倍数,默认640; 0=原图)")
     ap.add_argument("--face-size", type=int, default=FACE_YUNET_SIZE,
                     help="人脸检测输入尺寸(默认640; YuNet/YOLOv8 均调整为32的倍数)")
     ap.add_argument("--face-model", default="yunet", choices=["yunet", "yolov8"],
@@ -1735,17 +1039,6 @@ def main():
     ap.add_argument("--force-h264", action="store_true",
                     help="强制H.264输出(兼容性无敌: 微信/Android/旧播放器都能播; 画质仍近无损高码率)")
     ap.add_argument("--no-face", action="store_true", help="关闭人脸打码")
-    ap.add_argument("--no-card", action="store_true", help="关闭信用卡打码")
-    ap.add_argument("--pet-conf", type=float, default=PET_CONF, help="宠物置信度阈值(默认0.3)")
-    ap.add_argument("--pet-int", type=int, default=PET_INT,
-                    help="宠物检测间隔帧数(默认5: 每5帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
-    ap.add_argument("--no-pet", action="store_true", help="关闭宠物打码")
-    ap.add_argument("--text-conf", type=float, default=TEXT_CONF, help="文字置信度阈值(默认0.3)")
-    ap.add_argument("--text-int", type=int, default=TEXT_INT,
-                    help="文字检测间隔帧数(默认5: 每5帧检测1次,中间帧光流跟踪; 1=每帧检测最准)")
-    ap.add_argument("--text-size", type=int, default=TEXT_INPUT_SIZE,
-                    help="文字检测输入尺寸(PaddleOCR自动缩放,此参数已忽略,保留兼容)")
-    ap.add_argument("--no-text", action="store_true", help="关闭文字打码")
     ap.add_argument("--no-gpu", action="store_true",
                     help="关闭 GPU 加速(CUDA/MPS 均禁用, 强制 CPU)")
     ap.add_argument("--model-dir", default=None, help="人脸模型目录")
@@ -1764,11 +1057,6 @@ def main():
         dst = os.path.join(args.out_dir, "masked_" + name + ".mp4")
         print(f"\n>>> {src}")
         if process_video(src, dst, face_on=not args.no_face,
-                         card_on=not args.no_card, card_conf=args.card_conf,
-                         card_key_int=args.card_key_int, card_size=args.card_size,
-                         pet_on=not args.no_pet, pet_conf=args.pet_conf, pet_int=args.pet_int,
-                         text_on=not args.no_text, text_conf=args.text_conf,
-                         text_int=args.text_int, text_size=args.text_size,
                          model_dir=args.model_dir,
                          face_size=args.face_size, face_int=args.face_int,
                          face_conf=args.face_conf, face_model=args.face_model,

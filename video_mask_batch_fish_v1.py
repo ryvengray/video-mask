@@ -646,6 +646,42 @@ class DualFaceDetector:
                 used.add(best_j)
         return consensus
 
+    def detect_with_conf(self, img, conf=FACE_CONF, iou_thresh=0.2):
+        """双模型共识 + 返回置信度, 供 debug 可视化使用。
+
+        返回 [(box, avg_conf, match_iou), ...] 其中 avg_conf 为两模型 conf 均值。
+        """
+        # A 模型: 优先用 detect_with_conf 获取 conf
+        if hasattr(self._det_a, 'detect_with_conf'):
+            dets_a = self._det_a.detect_with_conf(img, conf=conf)
+        else:
+            dets_a = [(b, 0.0) for b in self._det_a.detect(img, conf=conf)]
+        if not dets_a:
+            return []  # 短路: A 没检出 → 跳过 B
+        if hasattr(self._det_b, 'detect_with_conf'):
+            dets_b = self._det_b.detect_with_conf(img, conf=conf)
+        else:
+            dets_b = [(b, 0.0) for b in self._det_b.detect(img, conf=conf)]
+        if not dets_b:
+            return []
+        # 贪心匹配(同 detect()), 额外返回双方 conf 均值和匹配 IoU
+        consensus = []
+        used = set()
+        for ba, ca in dets_a:
+            best_iou, best_j = 0, -1
+            for j, (bb, cb) in enumerate(dets_b):
+                if j in used:
+                    continue
+                score = self._iou(ba, bb)
+                if score > best_iou:
+                    best_iou, best_j = score, j
+            if best_iou >= iou_thresh and best_j >= 0:
+                bb, cb = dets_b[best_j]
+                avg_conf = (ca + cb) / 2
+                consensus.append((ba, avg_conf, best_iou))
+                used.add(best_j)
+        return consensus
+
 
 class SCRFDVerifier:
     """SCRFD 人脸验证器 — 用关键点模型验证 YOLO 检出的候选框是否为真脸。
@@ -815,6 +851,13 @@ class FaceProcessor:
         self.face_pts = {}
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
         self.dual_iou = dual_iou    # 双模型共识 IoU 阈值(仅 DualFaceDetector 使用)
+        # debug 可视化: 每帧 process() 后填充, 供 _draw_debug_overlay 读取
+        self.debug_info = []        # [(box, info_dict), ...]
+        self._last_debug_info = []  # 检测帧的 debug_info, 供跟踪帧/宽容期沿用
+        if isinstance(detector, DualFaceDetector):
+            self._debug_model_name = detector._name
+        else:
+            self._debug_model_name = type(detector).__name__.replace("Detector", "").replace("Face", "")
         # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
         self.lk = dict(winSize=(21, 21), maxLevel=3,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
@@ -895,37 +938,64 @@ class FaceProcessor:
         cold_start = frame_idx <= 2
         need_detect = ((frame_idx - 1) % self.detect_int == 0) or not self.last_faces or cold_start
         if need_detect:
+            debug_infos = []  # 本检测帧的 debug 元数据
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
             if isinstance(self.detector, DualFaceDetector):
-                dets = self.detector.detect(img, conf=self.conf, iou_thresh=self.dual_iou)
+                dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf, iou_thresh=self.dual_iou)
+                dets = [item[0] for item in dets_with_conf] if dets_with_conf else []
+                conf_map = {id(item[0]): item[1] for item in dets_with_conf}
                 # 双模型共识 + SCRFD 二次验证: 共识后再用 SCRFD 过滤非人脸(手/玩具)
+                # 小脸(框面积 < 5%画面)跳过 SCRFD(关键点定位不准, 侧脸/远处脸易被误杀)
+                scrfd_used = False
                 if self.scrfd_verifier is not None and dets:
+                    img_area = img.shape[0] * img.shape[1]
                     scrfd_boxes = self.scrfd_verifier.detect(img)
-                    if scrfd_boxes:
-                        verified = []
-                        for cb in dets:
-                            if any(SCRFDVerifier._iou(cb, sb) > self.scrfd_verifier._iou_thresh
-                                   for sb in scrfd_boxes):
-                                verified.append(cb)
-                        dets = verified
-                    else:
-                        dets = []  # SCRFD 未检出任何脸 → 共识结果可能全是误检
+                    if frame_idx <= 10 or frame_idx % 100 == 0:
+                        import sys
+                        print(f"  [DBG] F{frame_idx}: consensus={len(dets)} scrfd={len(scrfd_boxes)}",
+                              file=sys.stderr)
+                    verified = []
+                    for cb in dets:
+                        box_area = (cb[2] - cb[0]) * (cb[3] - cb[1])
+                        if box_area < img_area * 0.05:
+                            verified.append(cb)  # 小脸: 信任双模型共识, 跳过 SCRFD
+                            debug_infos.append({"src": "DET", "conf": conf_map.get(id(cb), 0),
+                                                "scrfd": False})
+                        elif scrfd_boxes and any(
+                                SCRFDVerifier._iou(cb, sb) > self.scrfd_verifier._iou_thresh
+                                for sb in scrfd_boxes):
+                            verified.append(cb)  # 大脸: SCRFD 也认为是脸 → 保留
+                            debug_infos.append({"src": "DET", "conf": conf_map.get(id(cb), 0),
+                                                "scrfd": True})
+                    dets = verified
+                    scrfd_used = True
+                if not scrfd_used:
+                    debug_infos = [{"src": "DET", "conf": conf_map.get(id(b), 0),
+                                    "scrfd": False} for b in dets]
             # SCRFD 二次验证: 高conf框直接保留, 低conf框用SCRFD确认(过滤手/玩具误检)
             elif self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
                 dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf)
                 dets = self.scrfd_verifier.verify(dets_with_conf, img)
+                conf_map = {id(b): c for b, c in dets_with_conf}
+                debug_infos = [{"src": "DET", "conf": conf_map.get(id(b), 0),
+                                "scrfd": True} for b in dets]
             else:
                 dets = self.detector.detect(img, conf=self.conf)
+                debug_infos = [{"src": "DET", "conf": 0, "scrfd": False} for b in dets]
             if dets:
                 faces = dets
                 self.miss_count = 0
+                self._last_debug_info = debug_infos
             elif self.last_faces and self.miss_count < self.grace:
                 # 检测失败: 宽容期内沿用上一帧框(LK跟踪会继续修正)
                 faces = self.last_faces
                 self.miss_count += 1
+                # 宽容期: 沿用上次 debug_info, 标记来源为 GRC
+                self._last_debug_info = [{**d, "src": "GRC"} for d in self._last_debug_info]
             else:
                 faces = []
                 self.miss_count = 0
+                self._last_debug_info = []
             self.face_pts = {}
             for i, box in enumerate(faces):
                 pts = self._init_pts(gray, box)
@@ -956,8 +1026,56 @@ class FaceProcessor:
                         new_pts[i] = pts
             self.face_pts = new_pts
             self.last_faces = tracked
+            # 跟踪帧: 标记来源为 TRK, 沿用上次 conf
+            self._last_debug_info = [{**d, "src": "TRK"} for d in self._last_debug_info]
+        # 填充 debug_info: 与 self.last_faces 一一对应
+        self.debug_info = list(zip(self.last_faces, self._last_debug_info)) \
+            if self.last_faces and self._last_debug_info else []
         self.prev_gray = gray
         return self.last_faces
+
+
+def _draw_debug_overlay(img, face_proc, frame_idx, faces):
+    """在帧上绘制检测框和元信息标签(仅 --debug 模式调用)。
+
+    绿色 = 检测帧(DET), 黄色 = 跟踪帧(TRK), 橙色 = 宽容期(GRC)。
+    标签格式: [模型名 来源 置信度 +S(SCRFD)]
+    左上角显示帧级信息: F:帧号 faces:框数 来源
+    """
+    colors = {"DET": (0, 255, 0), "TRK": (0, 255, 255), "GRC": (0, 165, 255)}
+    dbg = face_proc.debug_info  # [(box, info_dict), ...]
+
+    # 逐框绘制
+    for box, info in dbg:
+        x1, y1, x2, y2 = box
+        src = info.get("src", "DET")
+        conf = info.get("conf", 0)
+        color = colors.get(src, (255, 255, 255))
+
+        # 框
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+        # 标签文本
+        model = face_proc._debug_model_name
+        label = f"{model} {src}"
+        if conf > 0:
+            label += f" {conf:.2f}"
+        if info.get("scrfd"):
+            label += " +S"
+        if info.get("mirror"):
+            label += " M"
+
+        # 标签背景 + 文字
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(img, label, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+    # 帧级信息(左上角)
+    src_tag = dbg[0][1].get("src", "?") if dbg else "NONE"
+    header = f"F:{frame_idx} faces:{len(faces)} {src_tag}"
+    cv2.putText(img, header, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
 
 
 # ================= 视频处理 =================
@@ -1167,7 +1285,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   frame_skip, fisheye, fisheye_strength, fisheye_device,
                   fisheye_downscale, fisheye_dual, fisheye_crop, log,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                  dual_iou=0.2, dual_mirror=False):
+                  dual_iou=0.2, dual_mirror=False, debug=False):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -1454,6 +1572,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                                  int(y2 + FACE_EXPAND * bh),
                                  FACE_CELLS, FACE_SIGMA)
                 total_face += 1 if faces else 0
+            if debug:
+                _draw_debug_overlay(img, face_proc, frame_idx, faces)
 
             # 零拷贝写入: memoryview 直接引用 numpy 数组内部缓冲区,
             # 替代 img.tobytes() 的每帧 6MB 内存拷贝。
@@ -1530,7 +1650,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    frame_skip, fisheye, fisheye_strength, fisheye_device,
                    fisheye_downscale, fisheye_dual, fisheye_crop, log,
                    scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                   dual_iou=0.2, dual_mirror=False):
+                   dual_iou=0.2, dual_mirror=False, debug=False):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -1642,6 +1762,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                 ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
                 heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
             total_face += 1 if faces else 0
+        if debug:
+            _draw_debug_overlay(img, face_proc, i, faces)
         cv2.imwrite(os.path.join(fout, fn), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
         if i % 50 == 0 or i == len(frames):
             log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} elapsed={time.time()-t0:.0f}s")
@@ -1682,7 +1804,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   fisheye=False, fisheye_strength=1.0, fisheye_device="pico4",
                   fisheye_downscale=2, fisheye_dual="auto", fisheye_crop=1.0, log=print,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                  dual_iou=0.2, dual_mirror=False):
+                  dual_iou=0.2, dual_mirror=False, debug=False):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -1693,7 +1815,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  fisheye_device, fisheye_downscale,
                                  fisheye_dual, fisheye_crop, log,
                                  scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                                 dual_iou, dual_mirror)
+                                 dual_iou, dual_mirror, debug)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -1703,7 +1825,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           fisheye_device, fisheye_downscale,
                           fisheye_dual, fisheye_crop, log,
                           scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                          dual_iou, dual_mirror)
+                          dual_iou, dual_mirror, debug)
 
 
 def expand_inputs(inputs):
@@ -1776,6 +1898,8 @@ def main():
     ap.add_argument("--dual-mirror", action="store_true",
                     help="双鱼眼镜像打码: 一侧检出的脸同步镜像到另一侧(仅双鱼眼模式生效)")
     ap.add_argument("--keep-tmp", action="store_true", help="保留中间帧")
+    ap.add_argument("--debug", action="store_true",
+                    help="调试模式: 在输出视频上绘制检测框/模型名/置信度/来源标签")
     args = ap.parse_args()
 
     files = expand_inputs(args.inputs)
@@ -1806,7 +1930,8 @@ def main():
                          scrfd_iou=args.scrfd_iou,
                          scrfd_keep_conf=args.scrfd_keep_conf,
                          dual_iou=args.dual_iou,
-                         dual_mirror=args.dual_mirror):
+                         dual_mirror=args.dual_mirror,
+                         debug=args.debug):
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
 
