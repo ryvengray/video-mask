@@ -37,7 +37,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("Install cluster requirements: pip install -r requirements-cluster.txt") from exc
 
 from cluster.store import ClusterStore
-from cluster.local_ingest import DEFAULT_ALGORITHM, DEFAULT_ARGS, VIDEO_SUFFIXES, LocalIngestor
+from cluster.local_ingest import VIDEO_SUFFIXES, LocalIngestor
 from cluster.s3_ingest import S3Ingestor
 
 
@@ -230,8 +230,8 @@ class TaskRequest(BaseModel):
     source_size_bytes: int | None = None
     source_sha256: str | None = None
     source_duration_seconds: float | None = None
-    algorithm: str = DEFAULT_ALGORITHM
-    arguments: list[str] = Field(default_factory=lambda: list(DEFAULT_ARGS))
+    algorithm: str | None = None
+    arguments: list[str] | None = None
     output_object_key: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=20)
 
@@ -243,6 +243,11 @@ class WorkerProvisionRequest(BaseModel):
 
 class S3IngestSwitchRequest(BaseModel):
     enabled: bool
+
+
+class AlgorithmDefaultsRequest(BaseModel):
+    algorithm: str = Field(min_length=1, max_length=255)
+    arguments: list[str] = Field(default_factory=list)
 
 
 class FaceReviewRequest(BaseModel):
@@ -896,6 +901,16 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         # as the UI control, so this browser-facing switch has no token prompt.
         return {"configured": bool(s3_ingestor), "enabled": s3_ingest_is_enabled()}
 
+    @app.get("/api/admin/algorithm-defaults")
+    def get_algorithm_defaults() -> dict[str, Any]:
+        return store.get_algorithm_defaults()
+
+    @app.put("/api/admin/algorithm-defaults")
+    def set_algorithm_defaults(request: AlgorithmDefaultsRequest,
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_admin(authorization)
+        return store.set_algorithm_defaults(request.algorithm, request.arguments)
+
     @app.put("/api/admin/s3-ingest")
     def set_s3_ingest_switch(request: S3IngestSwitchRequest) -> dict[str, bool]:
         nonlocal s3_ingest_enabled
@@ -1191,8 +1206,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "status_tones": STATUS_TONES,
                 "s3_ingest_configured": bool(s3_ingestor),
                 "s3_ingest_enabled": s3_ingest_is_enabled(),
-                "manual_task_default_algorithm": DEFAULT_ALGORITHM,
-                "manual_task_default_arguments": DEFAULT_ARGS,
+                "manual_task_default_algorithm": store.get_algorithm_defaults()["algorithm"],
+                "manual_task_default_arguments": store.get_algorithm_defaults()["arguments"],
                 "processing_statistics": processing_statistics,
                 "statistics_range_hours": round((stats_end - stats_start) / 3600),
                 "statistics_start_input": datetime_local(stats_start),

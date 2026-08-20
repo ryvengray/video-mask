@@ -9,7 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-from cluster.local_ingest import DEFAULT_ALGORITHM, DEFAULT_ARGS, VIDEO_SUFFIXES
+from cluster.local_ingest import VIDEO_SUFFIXES
 from cluster.store import ClusterStore
 
 
@@ -144,8 +144,6 @@ class S3Ingestor:
                         "source_url": f"s3://{self.source_bucket}/{key}",
                         "source_object_key": key,
                         "source_size_bytes": int(object_info.get("Size") or 0),
-                        "algorithm": DEFAULT_ALGORITHM,
-                        "arguments": DEFAULT_ARGS,
                         "output_object_key": output_key,
                     })
                     created += 1

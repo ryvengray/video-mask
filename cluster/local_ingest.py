@@ -9,11 +9,6 @@ from cluster.store import ClusterStore
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts"}
-DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
-                "--face-int", "5", "--face-conf", "0.4", "--frame-skip", "1",
-                "--face-model", "yolov8+yolo11", "--dual-iou", "0.4",
-                ]
-DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
 
 
 class LocalIngestor:
@@ -49,8 +44,6 @@ class LocalIngestor:
                     "output_upload_url": output.as_uri(),
                     "source_object_key": str(relative),
                     "source_size_bytes": stat.st_size,
-                    "algorithm": DEFAULT_ALGORITHM,
-                    "arguments": DEFAULT_ARGS,
                     "output_object_key": str(output.relative_to(self.output_dir)),
                 })
                 created += 1

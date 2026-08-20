@@ -101,7 +101,21 @@ class ClusterStore:
             setting_value TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS algorithm_defaults (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            algorithm TEXT NOT NULL DEFAULT 'video_mask_batch_fish_v1.py',
+            arguments_json TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL
+        );
         """)
+        self.conn.execute("""
+            INSERT INTO algorithm_defaults (id, algorithm, arguments_json, updated_at)
+            SELECT 1, 'video_mask_batch_fish_v1.py',
+                   '["--fisheye","--fisheye-device","pico4","--face-size","960",
+                     "--face-int","5","--face-conf","0.4","--frame-skip","1",
+                     "--face-model","yolov8+yolo11","--dual-iou","0.4"]', ?
+            WHERE NOT EXISTS (SELECT 1 FROM algorithm_defaults WHERE id = 1)
+        """, (now(),))
         task_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(tasks)")}
         if "restarted_at" not in task_columns:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN restarted_at REAL")
@@ -257,10 +271,41 @@ class ClusterStore:
         return self.worker(worker_id) or {}
 
     @synchronized
+    def get_algorithm_defaults(self) -> dict[str, Any]:
+        """Return the current global default algorithm and arguments."""
+        row = self.conn.execute(
+            "SELECT algorithm, arguments_json FROM algorithm_defaults WHERE id=1"
+        ).fetchone()
+        if row is None:
+            return {"algorithm": "video_mask_batch_fish_v1.py", "arguments": []}
+        return {"algorithm": str(row[0]), "arguments": json.loads(row[1] or "[]")}
+
+    @synchronized
+    def set_algorithm_defaults(self, algorithm: str, arguments: list[str]) -> dict[str, Any]:
+        """Update the global default algorithm and arguments."""
+        stamp = now()
+        self.conn.execute("""
+            INSERT INTO algorithm_defaults (id, algorithm, arguments_json, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              algorithm=excluded.algorithm,
+              arguments_json=excluded.arguments_json,
+              updated_at=excluded.updated_at
+        """, (algorithm, json.dumps(arguments), stamp))
+        self.conn.commit()
+        return self.get_algorithm_defaults()
+
+    @synchronized
     def create_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         import uuid
         task_id = payload.get("task_id") or str(uuid.uuid4())
-        args = payload.get("arguments") or []
+        defaults = self.get_algorithm_defaults()
+        algorithm = payload.get("algorithm")
+        if not algorithm:
+            algorithm = defaults["algorithm"]
+        args = payload.get("arguments")
+        if args is None:
+            args = defaults["arguments"]
         if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
             raise ValueError("arguments must be a list of strings")
         required = ("source_url",)
@@ -276,7 +321,7 @@ class ClusterStore:
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """, (task_id, payload["source_url"], payload.get("source_object_key"),
                   payload.get("source_size_bytes"), payload.get("source_sha256"),
-                  payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
+                  payload.get("source_duration_seconds"), algorithm,
                   json.dumps(args), payload.get("output_upload_url") or "", payload.get("output_object_key"),
                   int(payload.get("max_attempts", 3)), stamp, stamp))
             self.conn.commit()

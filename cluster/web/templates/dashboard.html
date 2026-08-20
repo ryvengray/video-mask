@@ -26,6 +26,7 @@
       <button class="tab" data-tab="tasks" role="tab">Tasks</button>
       <button class="tab" data-tab="workers" role="tab">Workers</button>
       <button class="tab" data-tab="statistics" role="tab">Statistics</button>
+      <button class="tab" data-tab="settings" role="tab">Settings</button>
     </nav>
     <section id="panel-tasks" class="tab-panel" role="tabpanel">
       <section class="task-launchers" aria-label="Task shortcuts"><div id="s3-ingest-control" class="s3-ingest-control" data-configured="{{ 'true' if s3_ingest_configured else 'false' }}" data-enabled="{{ 'true' if s3_ingest_enabled else 'false' }}" aria-label="S3 task ingestion control"><span id="s3-ingest-status" class="s3-ingest-status-light {% if not s3_ingest_configured %}unconfigured{% elif s3_ingest_enabled %}enabled{% else %}paused{% endif %}" role="img" aria-label="{% if not s3_ingest_configured %}S3 ingestion not configured{% elif s3_ingest_enabled %}S3 ingestion enabled{% else %}S3 ingestion paused{% endif %}" title="{% if not s3_ingest_configured %}S3 ingestion not configured{% elif s3_ingest_enabled %}S3 ingestion enabled{% else %}S3 ingestion paused{% endif %}"></span><button id="s3-ingest-toggle" class="task-search-button s3-ingest-button" type="button" {% if not s3_ingest_configured %}disabled{% endif %}>{% if s3_ingest_enabled %}Pause S3 ingestion{% else %}Resume S3 ingestion{% endif %}</button><p id="s3-ingest-message" class="s3-ingest-message" aria-live="polite"></p></div><button id="manual-task-open" class="task-search-button" type="button" {% if not s3_ingest_configured %}disabled{% endif %}>Add manual task</button><button id="face-review-claim" class="task-search-button" type="button">Get video to label</button></section>
@@ -43,7 +44,18 @@
       <section class="statistics-metrics" aria-label="Processing summary"><div class="metric"><div class="metric-label">Completed</div><div id="stat-completed" class="metric-value">-</div><div id="stat-success-note" class="metric-note">-</div></div><div class="metric"><div class="metric-label">Video processed</div><div id="stat-video-hours" class="metric-value">-</div><div id="stat-throughput-note" class="metric-note">Calendar throughput</div></div><div class="metric"><div class="metric-label">Algorithm speed</div><div id="stat-algorithm-speed" class="metric-value">-</div><div id="stat-worker-hours-note" class="metric-note">Worker time per video hour</div></div><div class="metric"><div class="metric-label">Task concurrency</div><div id="stat-concurrency" class="metric-value">-</div><div id="stat-concurrency-note" class="metric-note">Average / peak in-flight slots</div></div></section>
       <div class="statistics-charts"><section class="panel chart-panel"><div class="chart-head"><h3>Completed video by hour</h3><span>Bars: video hours · Red marker: failures</span></div><svg id="statistics-throughput-chart" class="statistics-chart" viewBox="0 0 720 240" role="img" aria-label="Completed video duration by hour"></svg></section><section class="panel chart-panel"><div class="chart-head"><h3>Hourly task concurrency</h3><span>Blue: average · Green: peak</span></div><svg id="statistics-concurrency-chart" class="statistics-chart" viewBox="0 0 720 240" role="img" aria-label="Average and peak task concurrency by hour"></svg></section></div>
       <section class="panel statistics-workers"><div class="chart-head"><h3>Worker server capacity</h3><span>Algorithm speed is video hours processed per Worker processing hour.</span></div><div class="table-scroll"><table><thead><tr><th>Worker server</th><th>Slots seen</th><th>Completed</th><th>Failed</th><th>Video hours</th><th>Algorithm Worker hours</th><th>Algorithm speed</th><th>Worker hours / video hour</th><th>End-to-end speed</th></tr></thead><tbody id="statistics-worker-rows"></tbody></table></div></section>
-      <p class="statistics-footnote">“Worker hours / video hour” uses Worker-reported algorithm processing time. It excludes idle cloud-instance time, downloads and uploads. “In-flight concurrency” includes download, processing and upload while a task is assigned.</p>
+      <p class="statistics-footnote">"Worker hours / video hour" uses Worker-reported algorithm processing time. It excludes idle cloud-instance time, downloads and uploads. "In-flight concurrency" includes download, processing and upload while a task is assigned.</p>
+    </section>
+    <section id="panel-settings" class="tab-panel" role="tabpanel">
+      <div class="section-head"><h2>Algorithm defaults</h2><span class="subtle">Global default algorithm and parameters used for new tasks</span></div>
+      <section class="panel">
+        <form id="algorithm-defaults-form" class="manual-task-form" style="grid-template-columns: minmax(220px,1.3fr) minmax(280px,1.6fr) auto;max-width:900px;">
+          <label>Algorithm file name<input id="algorithm-defaults-name" type="text" value="{{ manual_task_default_algorithm }}" required></label>
+          <label>Algorithm parameters (JSON array)<textarea id="algorithm-defaults-args" required>{{ manual_task_default_arguments | tojson }}</textarea></label>
+          <button id="algorithm-defaults-submit" class="task-search-button" type="submit">Save</button>
+        </form>
+        <p id="algorithm-defaults-message" class="manual-task-message" aria-live="polite"></p>
+      </section>
     </section>
   </main>
   <div id="play-link-modal" class="play-modal" hidden>

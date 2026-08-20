@@ -4,6 +4,7 @@ const panels = {
   tasks: document.getElementById('panel-tasks'),
   workers: document.getElementById('panel-workers'),
   statistics: document.getElementById('panel-statistics'),
+  settings: document.getElementById('panel-settings'),
 };
 function activate(name) {
   tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.tab === name));
@@ -11,7 +12,7 @@ function activate(name) {
   if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
 }
 tabs.forEach(tab => tab.addEventListener('click', () => activate(tab.dataset.tab)));
-activate(['tasks', 'workers', 'statistics'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'tasks');
+activate(['tasks', 'workers', 'statistics', 'settings'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'tasks');
 const workerFilter = document.getElementById('worker-status-filter');
 workerFilter?.addEventListener('change', () => {
   const selected = workerFilter.value;
@@ -884,6 +885,44 @@ if (statisticsPayload) {
 function localDateTimeValue(date) {
   const pad = value => String(value).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+const algorithmDefaultsForm = document.getElementById('algorithm-defaults-form');
+if (algorithmDefaultsForm) {
+  const algorithmDefaultsName = document.getElementById('algorithm-defaults-name');
+  const algorithmDefaultsArgs = document.getElementById('algorithm-defaults-args');
+  const algorithmDefaultsMessage = document.getElementById('algorithm-defaults-message');
+
+  algorithmDefaultsForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    let parsedArgs;
+    try {
+      parsedArgs = JSON.parse(algorithmDefaultsArgs.value);
+      if (!Array.isArray(parsedArgs) || !parsedArgs.every(value => typeof value === 'string')) {
+        throw new Error('not a string array');
+      }
+    } catch (_) {
+      algorithmDefaultsMessage.textContent = 'Algorithm parameters must be a JSON array of strings.';
+      algorithmDefaultsMessage.classList.add('error');
+      return;
+    }
+    algorithmDefaultsMessage.textContent = 'Saving...';
+    algorithmDefaultsMessage.classList.remove('error');
+    try {
+      const response = await fetch('/api/admin/algorithm-defaults', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({algorithm: algorithmDefaultsName.value.trim(), arguments: parsedArgs}),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+      algorithmDefaultsMessage.textContent = 'Saved successfully.';
+      algorithmDefaultsMessage.classList.remove('error');
+    } catch (error) {
+      algorithmDefaultsMessage.textContent = error instanceof Error ? error.message : 'Unable to save algorithm defaults.';
+      algorithmDefaultsMessage.classList.add('error');
+    }
+  });
 }
 
 document.getElementById('statistics-preset')?.addEventListener('change', event => {
