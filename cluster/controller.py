@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -62,6 +63,22 @@ FRAME_PREVIEW_HEIGHT = 240
 FRAME_PREVIEW_PER_MINUTE = 2
 FRAME_PREVIEW_MAX_IMAGES = 24
 PLAYBACK_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+def parse_algorithm_arguments(value: str | list[str]) -> list[str]:
+    """Accept JSON string arrays or a shell-style parameter line safely."""
+    if isinstance(value, str):
+        raw = value.strip()
+        try:
+            arguments = json.loads(raw) if raw.startswith("[") else shlex.split(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("algorithm parameters must be a JSON array or command-line string") from exc
+    else:
+        arguments = value
+    if (not isinstance(arguments, list) or len(arguments) > 128
+            or not all(isinstance(argument, str) and len(argument) <= 4096 for argument in arguments)):
+        raise ValueError("algorithm parameters must contain at most 128 strings")
+    return arguments
 
 
 def frame_preview_timestamps(task_id: str, duration_seconds: float) -> list[float]:
@@ -248,7 +265,7 @@ class S3IngestSwitchRequest(BaseModel):
 
 class AlgorithmDefaultsRequest(BaseModel):
     algorithm: str = Field(min_length=1, max_length=255)
-    arguments: list[str] = Field(default_factory=list)
+    arguments: list[str] | str = Field(default_factory=list)
 
 
 class TaskRestartRequest(BaseModel):
@@ -735,7 +752,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
         if (len(request.arguments) > 128
                 or not all(isinstance(value, str) and len(value) <= 4096 for value in request.arguments)):
-            raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of at most 128 strings")
+            raise HTTPException(status_code=400, detail="algorithm parameters must contain at most 128 strings")
         return store.restart_task(task_id, algorithm=algorithm, arguments=request.arguments)
 
     @app.get("/api/dashboard/tasks/{task_id}/restart-config")
@@ -781,9 +798,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 or Path(selected_algorithm).name != selected_algorithm):
             raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
         try:
-            selected_arguments = json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of strings") from exc
+            selected_arguments = parse_algorithm_arguments(arguments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if (not isinstance(selected_arguments, list) or len(selected_arguments) > 128
                 or not all(isinstance(value, str) and len(value) <= 4096 for value in selected_arguments)):
             raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of at most 128 strings")
@@ -940,7 +957,11 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def set_algorithm_defaults(request: AlgorithmDefaultsRequest) -> dict[str, Any]:
         # Dashboard access is protected by the same outer proxy authentication
         # as the UI control, so this browser-facing endpoint has no token prompt.
-        return store.set_algorithm_defaults(request.algorithm, request.arguments)
+        try:
+            arguments = parse_algorithm_arguments(request.arguments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return store.set_algorithm_defaults(request.algorithm, arguments)
 
     @app.put("/api/admin/s3-ingest")
     def set_s3_ingest_switch(request: S3IngestSwitchRequest) -> dict[str, bool]:

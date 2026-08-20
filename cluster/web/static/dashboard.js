@@ -1,5 +1,59 @@
 console.info('[video-mask] dashboard.js loaded (manual-upload build 2026-08-19a, no token prompt)');
 const tabs = document.querySelectorAll('.tab');
+function parseAlgorithmArguments(value) {
+  const raw = value.trim();
+  if (!raw) return [];
+  if (raw.startsWith('[')) {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || !parsed.every(argument => typeof argument === 'string')) {
+      throw new Error('not a string array');
+    }
+    return parsed;
+  }
+
+  const argumentsValue = [];
+  let argument = '';
+  let quote = '';
+  let escaping = false;
+  let started = false;
+  for (const character of raw) {
+    if (escaping) {
+      argument += character;
+      escaping = false;
+      started = true;
+    } else if (character === '\\') {
+      escaping = true;
+      started = true;
+    } else if (quote) {
+      if (character === quote) quote = '';
+      else argument += character;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+      started = true;
+    } else if (/\s/.test(character)) {
+      if (started) {
+        argumentsValue.push(argument);
+        argument = '';
+        started = false;
+      }
+    } else {
+      argument += character;
+      started = true;
+    }
+  }
+  if (escaping || quote) throw new Error('unterminated command-line argument');
+  if (started) argumentsValue.push(argument);
+  return argumentsValue;
+}
+
+function configureAlgorithmArgumentsInput(input) {
+  if (!input) return;
+  input.placeholder = '--fisheye --fisheye-device pico4 --face-size 640';
+  const label = input.closest('label');
+  const text = [...(label?.childNodes || [])].find(node => node.nodeType === Node.TEXT_NODE);
+  if (text) text.textContent = 'Algorithm parameters (JSON array or command line)';
+}
+
 const panels = {
   tasks: document.getElementById('panel-tasks'),
   workers: document.getElementById('panel-workers'),
@@ -82,6 +136,7 @@ if (manualTaskControl?.dataset.s3Configured === 'true') {
   const manualTaskArguments = document.getElementById('manual-task-arguments');
   const manualTaskSubmit = document.getElementById('manual-task-submit');
   const manualTaskMessage = document.getElementById('manual-task-message');
+  configureAlgorithmArgumentsInput(manualTaskArguments);
   const defaultAlgorithm = manualTaskAlgorithm.value;
   const defaultArguments = manualTaskArguments.value;
 
@@ -108,13 +163,11 @@ if (manualTaskControl?.dataset.s3Configured === 'true') {
       setManualTaskMessage('Choose a video file first.', true);
       return;
     }
+    let parsed;
     try {
-      const parsed = JSON.parse(manualTaskArguments.value);
-      if (!Array.isArray(parsed) || !parsed.every(value => typeof value === 'string')) {
-        throw new Error('not a string array');
-      }
+      parsed = parseAlgorithmArguments(manualTaskArguments.value);
     } catch (_) {
-      setManualTaskMessage('Algorithm parameters must be a JSON array of strings.', true);
+      setManualTaskMessage('Algorithm parameters must be a JSON array or command-line string.', true);
       return;
     }
     const request = new XMLHttpRequest();
@@ -125,7 +178,7 @@ if (manualTaskControl?.dataset.s3Configured === 'true') {
     request.setRequestHeader('Content-Type', source.type || 'application/octet-stream');
     request.setRequestHeader('X-Video-Mask-Filename', source.name);
     request.setRequestHeader('X-Video-Mask-Algorithm', manualTaskAlgorithm.value.trim());
-    request.setRequestHeader('X-Video-Mask-Arguments', manualTaskArguments.value);
+    request.setRequestHeader('X-Video-Mask-Arguments', JSON.stringify(parsed));
     request.upload.addEventListener('progress', progress => {
       if (!progress.lengthComputable) return;
       const percent = Math.min(100, Math.round(progress.loaded / progress.total * 100));
@@ -1001,17 +1054,15 @@ if (algorithmDefaultsForm) {
   const algorithmDefaultsName = document.getElementById('algorithm-defaults-name');
   const algorithmDefaultsArgs = document.getElementById('algorithm-defaults-args');
   const algorithmDefaultsMessage = document.getElementById('algorithm-defaults-message');
+  configureAlgorithmArgumentsInput(algorithmDefaultsArgs);
 
   algorithmDefaultsForm.addEventListener('submit', async event => {
     event.preventDefault();
     let parsedArgs;
     try {
-      parsedArgs = JSON.parse(algorithmDefaultsArgs.value);
-      if (!Array.isArray(parsedArgs) || !parsedArgs.every(value => typeof value === 'string')) {
-        throw new Error('not a string array');
-      }
+      parsedArgs = parseAlgorithmArguments(algorithmDefaultsArgs.value);
     } catch (_) {
-      algorithmDefaultsMessage.textContent = 'Algorithm parameters must be a JSON array of strings.';
+      algorithmDefaultsMessage.textContent = 'Algorithm parameters must be a JSON array or command-line string.';
       algorithmDefaultsMessage.classList.add('error');
       return;
     }

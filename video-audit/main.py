@@ -26,8 +26,11 @@ CONTROLLER_AUTH_PASS = os.environ.get("CONTROLLER_AUTH_PASS", "")
 
 def _controller_headers() -> dict[str, str]:
     headers: dict[str, str] = {}
-    if CONTROLLER_TOKEN:
-        headers["Authorization"] = CONTROLLER_TOKEN
+    token = CONTROLLER_TOKEN.strip()
+    if token:
+        headers["Authorization"] = (
+            token if token.lower().startswith("bearer ") else f"Bearer {token}"
+        )
     return headers
 
 
