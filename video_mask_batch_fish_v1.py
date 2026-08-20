@@ -898,6 +898,18 @@ class FaceProcessor:
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
             if isinstance(self.detector, DualFaceDetector):
                 dets = self.detector.detect(img, conf=self.conf, iou_thresh=self.dual_iou)
+                # 双模型共识 + SCRFD 二次验证: 共识后再用 SCRFD 过滤非人脸(手/玩具)
+                if self.scrfd_verifier is not None and dets:
+                    scrfd_boxes = self.scrfd_verifier.detect(img)
+                    if scrfd_boxes:
+                        verified = []
+                        for cb in dets:
+                            if any(SCRFDVerifier._iou(cb, sb) > self.scrfd_verifier._iou_thresh
+                                   for sb in scrfd_boxes):
+                                verified.append(cb)
+                        dets = verified
+                    else:
+                        dets = []  # SCRFD 未检出任何脸 → 共识结果可能全是误检
             # SCRFD 二次验证: 高conf框直接保留, 低conf框用SCRFD确认(过滤手/玩具误检)
             elif self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
                 dets_with_conf = self.detector.detect_with_conf(img, conf=self.conf)
