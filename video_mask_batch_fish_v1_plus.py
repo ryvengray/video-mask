@@ -1824,7 +1824,7 @@ class FaceProcessor:
         pts = np.column_stack((xv.ravel(), yv.ravel())).reshape(-1, 1, 2)
         return pts.astype(np.float32)
 
-    def _track_box_from_points(self, prev_gray, gray, box, pts):
+    def _track_box_from_flow(self, box, pts, npts, status, back_pts, back_status):
         """F1+F2+F3: 用给定特征点对 box 做 LK 跟踪。
 
         F1 forward-backward 验证: 正向 LK 后再反向 LK, FB 误差大的点剔除,
@@ -1838,16 +1838,11 @@ class FaceProcessor:
         box_size = max(bw, bh)
         if pts is None or len(pts) < 4:
             return None, None
-        # 正向 LK: prev_gray → gray
-        npts, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray, gray, pts, None, **self.lk)
+        if npts is None or status is None or back_pts is None or back_status is None:
+            return None, None
         fwd_mask = status.flatten() == 1
         if fwd_mask.sum() < 4:
             return None, None
-        # F1 反向 LK: gray → prev_gray, 验证点是否真的跟踪正确
-        # 原理: 真实跟踪的点反向应该回到原位, 跑到背景的点反向会跑飞
-        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
-            gray, prev_gray, npts, None, **self.lk)
         back_mask = back_status.flatten() == 1
         # FB 误差: |back_pts - 原始 pts|, 大于阈值的点视为跑飞剔除
         fb_err = np.linalg.norm(
@@ -1883,8 +1878,17 @@ class FaceProcessor:
 
     def _track_box(self, prev_gray, gray, box):
         """使用低成本 3x3 网格光流，不在失败帧追加昂贵角点检测。"""
-        return self._track_box_from_points(
-            prev_gray, gray, box, self._init_pts(prev_gray, box))
+        pts = self._init_pts(prev_gray, box)
+        if pts is None:
+            return None, None
+        npts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, gray, pts, None, **self.lk)
+        if npts is None:
+            return None, None
+        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            gray, prev_gray, npts, None, **self.lk)
+        return self._track_box_from_flow(
+            box, pts, npts, status, back_pts, back_status)
 
     @staticmethod
     def _center(box):
@@ -1970,10 +1974,35 @@ class FaceProcessor:
         """先把所有存量轨迹推进到当前帧，再与本帧检测框关联。"""
         if self.prev_gray is None:
             return
+        point_batches = [self._init_pts(self.prev_gray, track["box"])
+                         for track in self.tracks]
+        valid_batches = [(index, points) for index, points in enumerate(point_batches)
+                         if points is not None and len(points) >= 4]
+        flow_results = {}
+        if valid_batches:
+            all_points = np.concatenate([points for _, points in valid_batches], axis=0)
+            all_next, all_status, _ = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray, gray, all_points, None, **self.lk)
+            if all_next is not None:
+                all_back, all_back_status, _ = cv2.calcOpticalFlowPyrLK(
+                    gray, self.prev_gray, all_next, None, **self.lk)
+                offset = 0
+                for index, points in valid_batches:
+                    count = len(points)
+                    flow_results[index] = (
+                        points, all_next[offset:offset + count],
+                        all_status[offset:offset + count] if all_status is not None else None,
+                        all_back[offset:offset + count] if all_back is not None else None,
+                        all_back_status[offset:offset + count]
+                        if all_back_status is not None else None,
+                    )
+                    offset += count
         active_tracks = []
-        for track in self.tracks:
+        for index, track in enumerate(self.tracks):
             old_box = track["box"]
-            new_box, _ = self._track_box(self.prev_gray, gray, old_box)
+            flow = flow_results.get(index)
+            new_box, _ = (self._track_box_from_flow(old_box, *flow)
+                          if flow is not None else (None, None))
             if new_box is not None:
                 # 只有较大位移时才做外观复核，避免为每个普通跟踪帧增加开销。
                 old_size = max(old_box[2] - old_box[0], old_box[3] - old_box[1], 1)
@@ -2216,14 +2245,16 @@ class FaceProcessor:
             self._force_detect = True
 
     def process(self, img, frame_idx, raw_debug=False):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = None
         had_confirmed_tracks = any(
             track.get("confirmed", True) for track in self.tracks)
         if had_confirmed_tracks:
             # 轨迹在本帧检测前即使暂时不可见，也说明场景不是空场景；
             # 保持主动扫描，避免丢轨后退回每5帧一次的空场景节奏。
             self._active_hold_remaining = self.active_hold
-        self._track_all(gray, frame_idx=frame_idx)
+        if self.tracks:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            self._track_all(gray, frame_idx=frame_idx)
         self.last_raw_debug_faces = []
         self.last_backfill_events = []
         # F5 首帧强制双检: frame_idx<=2 时强制检测, 避免模型冷启动漏检
@@ -2238,6 +2269,8 @@ class FaceProcessor:
                        or cold_start or self._force_detect
                        or self._burst_remaining > 0)
         if need_detect:
+            if gray is None:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             self._force_detect = False
             if self._burst_remaining > 0:
                 self._burst_remaining -= 1
