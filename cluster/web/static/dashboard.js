@@ -527,7 +527,7 @@ if (faceReviewControl) {
       const suggestion = document.createElement('button');
       suggestion.type = 'button';
       suggestion.className = 'content-tag-suggestion';
-      suggestion.textContent = tag;
+      suggestion.textContent = `+ ${tag}`;
       suggestion.addEventListener('click', () => addContentTag(tag));
       contentTagSuggestions.append(suggestion);
     });
@@ -614,7 +614,7 @@ if (faceReviewControl) {
       const suggestion = document.createElement('button');
       suggestion.type = 'button';
       suggestion.className = 'content-tag-suggestion';
-      suggestion.textContent = tag;
+      suggestion.textContent = `+ ${tag}`;
       suggestion.addEventListener('click', () => addModalContentTag(tag));
       modalContentTagSuggestions.append(suggestion);
     });
