@@ -418,6 +418,65 @@ function enhanceTaskIdentifiersAndFiles() {
 
 enhanceTaskIdentifiersAndFiles();
 
+function configureManualLabelFilters() {
+  const form = document.getElementById('task-status-filter');
+  const oldFilter = form?.querySelector('.annotation-filter');
+  if (!form || !oldFilter) return;
+  const faceOptions = [...oldFilter.querySelectorAll('input[name="face_annotation"]')].map(input => ({
+    value: input.value, label: input.parentElement?.textContent?.trim() || input.value, selected: input.checked,
+  }));
+  const faceLabel = document.createElement('label');
+  faceLabel.className = 'subtle';
+  faceLabel.htmlFor = 'face-annotation-filter-select';
+  faceLabel.textContent = 'Manual label';
+  const faceSelect = document.createElement('select');
+  faceSelect.id = 'face-annotation-filter-select';
+  faceSelect.className = 'fleet-filter';
+  faceSelect.name = 'face_annotation';
+  faceSelect.setAttribute('aria-label', 'Filter tasks by manual face label');
+  const allFaces = new Option('All labels', '');
+  faceSelect.add(allFaces);
+  faceOptions.forEach(option => faceSelect.add(new Option(option.label, option.value, false, option.selected)));
+
+  const selectedTags = new Set(new URLSearchParams(window.location.search).getAll('content_tag'));
+  const tagFilter = document.createElement('details');
+  tagFilter.className = 'content-tag-filter';
+  tagFilter.open = selectedTags.size > 0;
+  const summary = document.createElement('summary');
+  summary.textContent = selectedTags.size ? `Content tags (${selectedTags.size})` : 'Content tags';
+  const options = document.createElement('div');
+  options.className = 'content-tag-filter-options';
+  options.textContent = 'Loading tags…';
+  tagFilter.append(summary, options);
+  oldFilter.replaceWith(faceLabel, faceSelect, tagFilter);
+
+  fetch('/api/content-tags').then(async response => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || 'Unable to load content tags');
+    return Array.isArray(payload.tags) ? payload.tags : [];
+  }).then(tags => {
+    options.replaceChildren();
+    if (!tags.length) {
+      options.textContent = 'No content tags yet';
+      return;
+    }
+    tags.forEach(tag => {
+      const label = document.createElement('label');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.name = 'content_tag';
+      checkbox.value = tag;
+      checkbox.checked = selectedTags.has(tag);
+      label.append(checkbox, document.createTextNode(tag));
+      options.append(label);
+    });
+  }).catch(() => {
+    options.textContent = 'Unable to load content tags';
+  });
+}
+
+configureManualLabelFilters();
+
 const faceReviewControl = document.getElementById('face-review-control');
 if (faceReviewControl) {
   const reviewerStorageKey = 'video-mask-face-reviewer-id';
@@ -950,7 +1009,7 @@ if (faceReviewControl) {
     if (!header.querySelector('.face-annotation-heading')) {
       const cell = document.createElement('th');
       cell.className = 'face-annotation-heading';
-      cell.textContent = 'Manual label';
+      cell.textContent = 'Manual labels';
       header.insertBefore(cell, header.children[2] || null);
     }
     const rows = [...table.querySelectorAll('tbody tr')];
@@ -978,17 +1037,18 @@ if (faceReviewControl) {
       cell.className = 'face-annotation-cell';
       if (!review?.reviewable) {
         cell.textContent = '–';
-      } else if (review.has_face === true) {
-        cell.textContent = '👍 Face';
-        cell.classList.add('labelled');
-      } else if (review.has_face === false) {
-        cell.textContent = '👎 No face';
-        cell.classList.add('labelled');
-      } else if (review.reviewing) {
-        cell.textContent = '👀 Reviewing';
-        cell.classList.add('reviewing');
       } else {
-        cell.textContent = 'Unlabelled';
+        const labels = [];
+        if (review.has_face === true) labels.push('👍 Face');
+        else if (review.has_face === false) labels.push('👎 No face');
+        else if (review.reviewing) labels.push('👀 Reviewing');
+        else labels.push('Face: unlabelled');
+        const tags = Array.isArray(review.content_tags) ? review.content_tags : [];
+        if (tags.length) labels.push(`🏷 ${tags.join(' · ')}`);
+        else if (review.has_face !== null) labels.push('🏷 Content: unlabelled');
+        cell.textContent = labels.join('\n');
+        if (review.has_face !== null || tags.length) cell.classList.add('labelled');
+        else if (review.reviewing) cell.classList.add('reviewing');
       }
     });
   }

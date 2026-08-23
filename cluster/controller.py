@@ -1030,10 +1030,16 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         ))
         if set(selected_face_annotations) - set(FACE_ANNOTATION_FILTERS):
             raise HTTPException(status_code=400, detail="unknown face annotation filter")
+        selected_content_tags = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_tag") if value.strip()
+        ))
+        if len(selected_content_tags) > 20 or any(len(value) > 64 for value in selected_content_tags):
+            raise HTTPException(status_code=400, detail="invalid content tag filter")
         selected_search = q.strip()[:200] or None
-        total = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None)
+        total = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None,
+                                  selected_content_tags or None)
         tasks = store.list_tasks(max(1, total), 0, selected_statuses, selected_search,
-                                 selected_face_annotations or None)
+                                 selected_face_annotations or None, selected_content_tags or None)
 
         def timestamp(value: Any) -> str:
             try:
@@ -1112,18 +1118,25 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         unknown_face_annotations = set(selected_face_annotations) - set(FACE_ANNOTATION_FILTERS)
         if unknown_face_annotations:
             raise HTTPException(status_code=400, detail="unknown face annotation filter")
+        selected_content_tags = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_tag") if value.strip()
+        ))
+        if len(selected_content_tags) > 20 or any(len(value) > 64 for value in selected_content_tags):
+            raise HTTPException(status_code=400, detail="invalid content tag filter")
         selected_search = q.strip()[:200] or None
         task_filter_query = urllib.parse.urlencode([
             *([("task_status", selected_task_status)] if selected_task_status else []),
             *(("face_annotation", value) for value in selected_face_annotations),
+            *(("content_tag", value) for value in selected_content_tags),
             *([("q", selected_search)] if selected_search else []),
         ])
         page_size = 50
-        total_tasks = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None)
+        total_tasks = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None,
+                                        selected_content_tags or None)
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
         rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses, selected_search,
-                                selected_face_annotations or None)
+                                selected_face_annotations or None, selected_content_tags or None)
 
         def byte_size(value: Any) -> str:
             try:
@@ -1293,6 +1306,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                     ("unlabelled", "Unlabelled"),
                 ),
                 "selected_face_annotations": selected_face_annotations,
+                "content_tag_filter_options": store.content_tags(),
+                "selected_content_tags": selected_content_tags,
                 "selected_search": selected_search or "",
                 "task_filter_query": task_filter_query,
                 "task_total_all": sum(task_status_counts.values()),

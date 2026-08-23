@@ -229,6 +229,26 @@ def test_task_list_can_filter_by_multiple_face_annotations(tmp_path: Path):
     store.close()
 
 
+def test_task_list_can_filter_by_any_selected_content_tag(tmp_path: Path):
+    store = new_store(tmp_path)
+    laundry = store.create_task(task_payload())
+    room_payload = task_payload()
+    room_payload["source_url"] = "https://storage.example/room.mov"
+    room = store.create_task(room_payload)
+    unlabelled_payload = task_payload()
+    unlabelled_payload["source_url"] = "https://storage.example/unlabelled.mov"
+    unlabelled = store.create_task(unlabelled_payload)
+    store.conn.execute("UPDATE tasks SET content_tags_json=? WHERE task_id=?", (json.dumps(["Laundry", "Home"]), laundry["task_id"]))
+    store.conn.execute("UPDATE tasks SET content_tags_json=? WHERE task_id=?", (json.dumps(["Tidy room"]), room["task_id"]))
+    store.conn.commit()
+
+    selected = store.list_tasks(content_tags=("Laundry", "Tidy room"))
+    assert {task["task_id"] for task in selected} == {laundry["task_id"], room["task_id"]}
+    assert store.count_tasks(content_tags=("Laundry",)) == 1
+    assert unlabelled["task_id"] not in {task["task_id"] for task in selected}
+    store.close()
+
+
 def test_processing_statistics_reports_hourly_concurrency_and_worker_efficiency(tmp_path: Path):
     store = new_store(tmp_path)
     start = 1_700_000_000.0

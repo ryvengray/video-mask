@@ -575,13 +575,13 @@ class ClusterStore:
             placeholders = ", ".join("?" for _ in task_ids)
             rows = self.conn.execute(f"""
                 SELECT task_id, status, source_object_key, face_annotation, face_review_owner,
-                  face_review_lease_until FROM tasks
+                  face_review_lease_until, content_tags_json FROM tasks
                 WHERE task_id IN ({placeholders})
             """, task_ids).fetchall()
         else:
             rows = self.conn.execute("""
                 SELECT task_id, status, source_object_key, face_annotation, face_review_owner,
-                  face_review_lease_until FROM tasks
+                  face_review_lease_until, content_tags_json FROM tasks
                 WHERE face_annotation IS NULL AND face_review_owner IS NOT NULL
                 ORDER BY face_review_lease_until
             """).fetchall()
@@ -593,6 +593,7 @@ class ClusterStore:
                 "has_face": None if row[3] is None else bool(row[3]),
                 "reviewing": bool(row[4] and float(row[5] or 0) > stamp),
                 "lease_until": float(row[5] or 0),
+                "content_tags": json.loads(row[6] or "[]"),
             }
             for row in rows
         ]}
@@ -674,7 +675,8 @@ class ClusterStore:
     @staticmethod
     def _task_filter_conditions(statuses: tuple[str, ...] | None,
                                 search: str | None,
-                                face_annotations: tuple[str, ...] | None = None) -> tuple[str, list[Any]]:
+                                face_annotations: tuple[str, ...] | None = None,
+                                content_tags: tuple[str, ...] | None = None) -> tuple[str, list[Any]]:
         """Build a WHERE clause from optional task, label, and text filters."""
         conditions: list[str] = []
         values: list[Any] = []
@@ -698,13 +700,22 @@ class ClusterStore:
                 annotation_conditions.append("face_annotation IS NULL")
             if annotation_conditions:
                 conditions.append("(" + " OR ".join(annotation_conditions) + ")")
+        if content_tags:
+            tag_conditions: list[str] = []
+            for tag in content_tags:
+                encoded_tag = json.dumps(tag, ensure_ascii=False)
+                escaped_tag = encoded_tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                tag_conditions.append("IFNULL(content_tags_json, '') LIKE ? ESCAPE '\\'")
+                values.append(f"%{escaped_tag}%")
+            conditions.append("(" + " OR ".join(tag_conditions) + ")")
         return (" WHERE " + " AND ".join(conditions)) if conditions else "", values
 
     @synchronized
     def count_tasks(self, statuses: tuple[str, ...] | None = None,
                     search: str | None = None,
-                    face_annotations: tuple[str, ...] | None = None) -> int:
-        where, values = self._task_filter_conditions(statuses, search, face_annotations)
+                    face_annotations: tuple[str, ...] | None = None,
+                    content_tags: tuple[str, ...] | None = None) -> int:
+        where, values = self._task_filter_conditions(statuses, search, face_annotations, content_tags)
         return int(self.conn.execute("SELECT COUNT(*) FROM tasks" + where, values).fetchone()[0])
 
     @synchronized
@@ -722,8 +733,9 @@ class ClusterStore:
     def list_tasks(self, limit: int = 100, offset: int = 0,
                    statuses: tuple[str, ...] | None = None,
                    search: str | None = None,
-                   face_annotations: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
-        where, values = self._task_filter_conditions(statuses, search, face_annotations)
+                   face_annotations: tuple[str, ...] | None = None,
+                   content_tags: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        where, values = self._task_filter_conditions(statuses, search, face_annotations, content_tags)
         values.extend((limit, max(0, offset)))
         rows = self.conn.execute(
             "SELECT * FROM tasks" + where + " ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?",
