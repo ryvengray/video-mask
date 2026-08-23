@@ -58,3 +58,17 @@ def test_basic_auth_file_builds_http_basic_header(tmp_path: Path):
     assert downloader.basic_auth_header(str(credentials)) == (
         "Authorization", "Basic YWRtaW46Y29ycmVjdCBob3JzZSBiYXR0ZXJ5IHN0YXBsZQ==",
     )
+
+
+def test_controller_config_reuses_video_audit_env_credentials(tmp_path: Path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("""
+CONTROLLER_URL=https://controller.example.com/
+CONTROLLER_TOKEN=secret-token
+CONTROLLER_AUTH_USER=admin
+CONTROLLER_AUTH_PASS=dashboard-password
+""")
+    controller, headers = downloader.controller_config(None, str(env_file), [], None)
+    assert controller == "https://controller.example.com"
+    assert headers["Authorization"] == "Basic YWRtaW46ZGFzaGJvYXJkLXBhc3N3b3Jk"
+    assert headers["X-Video-Mask-Authorization"] == "Bearer secret-token"

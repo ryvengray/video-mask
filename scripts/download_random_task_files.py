@@ -27,6 +27,7 @@ from typing import Any
 
 
 DEFAULT_STATE_DIR = Path.home() / ".video-mask-task-download"
+DEFAULT_VIDEO_AUDIT_ENV = Path(__file__).resolve().parents[1] / "video-audit" / ".env"
 CHUNK_BYTES = 256 * 1024
 
 
@@ -41,16 +42,69 @@ def parse_header(value: str) -> tuple[str, str]:
     return name.strip(), header_value.strip()
 
 
+def basic_auth_header_from_credentials(credentials: str) -> tuple[str, str]:
+    credentials = credentials.strip()
+    username, separator, password = credentials.partition(":")
+    if not separator or not username or not password:
+        raise ValueError("Basic Auth credentials must contain one 'username:password' line")
+    token = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+    return "Authorization", f"Basic {token}"
+
+
 def basic_auth_header(credentials_file: str) -> tuple[str, str]:
     try:
         credentials = Path(credentials_file).expanduser().read_text().strip()
     except OSError as exc:
         raise ValueError(f"unable to read --basic-auth-file: {exc}") from exc
-    username, separator, password = credentials.partition(":")
-    if not separator or not username or not password:
-        raise ValueError("--basic-auth-file must contain one 'username:password' line")
-    token = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
-    return "Authorization", f"Basic {token}"
+    return basic_auth_header_from_credentials(credentials)
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    """Read the simple KEY=value format used by video-audit/.env."""
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[:1] == value[-1:] and value.startswith(("'", '"')):
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def header_value(headers: dict[str, str], name: str) -> str | None:
+    return next((value for key, value in headers.items() if key.lower() == name.lower()), None)
+
+
+def controller_config(controller_arg: str | None, env_file: str, supplied_headers: list[tuple[str, str]],
+                      basic_auth_file: str | None) -> tuple[str, dict[str, str]]:
+    environment = load_dotenv(Path(env_file).expanduser())
+    controller = (controller_arg or environment.get("CONTROLLER_URL") or "").strip().rstrip("/")
+    if not controller:
+        raise ValueError("set --controller or CONTROLLER_URL in the video-audit .env file")
+    headers = dict(supplied_headers)
+    if basic_auth_file:
+        if header_value(headers, "Authorization"):
+            raise ValueError("use either --header Authorization or --basic-auth-file, not both")
+        name, value = basic_auth_header(basic_auth_file)
+        headers[name] = value
+    elif not header_value(headers, "Authorization"):
+        user = environment.get("CONTROLLER_AUTH_USER", "").strip()
+        password = environment.get("CONTROLLER_AUTH_PASS", "").strip()
+        if user and password:
+            name, value = basic_auth_header_from_credentials(f"{user}:{password}")
+            headers[name] = value
+    token = environment.get("CONTROLLER_TOKEN", "").strip()
+    if token and not header_value(headers, "X-Video-Mask-Authorization"):
+        bearer = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+        token_header = "X-Video-Mask-Authorization" if header_value(headers, "Authorization") else "Authorization"
+        headers[token_header] = bearer
+    return controller, headers
 
 
 def state_paths(state_dir: Path) -> tuple[Path, Path, Path]:
@@ -278,14 +332,9 @@ def start(args: argparse.Namespace) -> int:
         tasks = select_tasks(database, controller_file, args.count, statuses)
         if not tasks:
             raise ValueError("no matching downloadable tasks were found in the SQLite snapshot")
-        headers = dict(args.header)
-        if args.basic_auth_file:
-            if any(name.lower() == "authorization" for name in headers):
-                raise ValueError("use either --header Authorization or --basic-auth-file, not both")
-            name, value = basic_auth_header(args.basic_auth_file)
-            headers[name] = value
+        controller, headers = controller_config(args.controller, args.env_file, args.header, args.basic_auth_file)
         job = {
-            "controller": args.controller.rstrip("/"), "file": controller_file, "file_label": args.file,
+            "controller": controller, "file": controller_file, "file_label": args.file,
             "destination": str(destination), "headers": headers, "insecure": args.insecure,
             "tasks": tasks,
         }
@@ -320,7 +369,7 @@ def parser() -> argparse.ArgumentParser:
     subcommands = command.add_subparsers(dest="command", required=True)
     start_parser = subcommands.add_parser("start", help="Start one background download batch")
     start_parser.add_argument("--database", required=True, help="Downloaded Controller SQLite snapshot")
-    start_parser.add_argument("--controller", required=True, help="Controller base URL, e.g. https://controller.example.com")
+    start_parser.add_argument("--controller", help="Controller base URL; overrides CONTROLLER_URL in --env-file")
     start_parser.add_argument("--count", type=int, required=True, help="Number of random tasks to select")
     start_parser.add_argument("--destination", default="./task-downloads", help="Root directory for downloaded object-key paths")
     start_parser.add_argument("--file", choices=("source", "output"), default="source", help="Download source video (default) or processed output")
@@ -330,6 +379,8 @@ def parser() -> argparse.ArgumentParser:
                               help="HTTP header for Controller/Nginx auth; repeat as needed, e.g. 'Authorization: Bearer …'")
     start_parser.add_argument("--basic-auth-file",
                               help="File containing one Controller Nginx 'username:password' line (recommended for Basic Auth)")
+    start_parser.add_argument("--env-file", default=str(DEFAULT_VIDEO_AUDIT_ENV),
+                              help="video-audit .env file for CONTROLLER_URL, token, and Nginx credentials")
     start_parser.add_argument("--insecure", action="store_true", help="Allow an untrusted HTTPS certificate")
     start_parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR), help="Local state/lock directory")
     for name, help_text in (("status", "Show progress for the current or latest batch"), ("cancel", "Request cancellation of the active batch")):
