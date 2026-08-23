@@ -8,6 +8,7 @@ S3 directly: every byte is requested from the Controller ``/play`` endpoint.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -38,6 +39,18 @@ def parse_header(value: str) -> tuple[str, str]:
     if not separator or not name.strip() or not header_value.strip():
         raise argparse.ArgumentTypeError("headers must use 'Name: value' format")
     return name.strip(), header_value.strip()
+
+
+def basic_auth_header(credentials_file: str) -> tuple[str, str]:
+    try:
+        credentials = Path(credentials_file).expanduser().read_text().strip()
+    except OSError as exc:
+        raise ValueError(f"unable to read --basic-auth-file: {exc}") from exc
+    username, separator, password = credentials.partition(":")
+    if not separator or not username or not password:
+        raise ValueError("--basic-auth-file must contain one 'username:password' line")
+    token = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+    return "Authorization", f"Basic {token}"
 
 
 def state_paths(state_dir: Path) -> tuple[Path, Path, Path]:
@@ -266,6 +279,11 @@ def start(args: argparse.Namespace) -> int:
         if not tasks:
             raise ValueError("no matching downloadable tasks were found in the SQLite snapshot")
         headers = dict(args.header)
+        if args.basic_auth_file:
+            if any(name.lower() == "authorization" for name in headers):
+                raise ValueError("use either --header Authorization or --basic-auth-file, not both")
+            name, value = basic_auth_header(args.basic_auth_file)
+            headers[name] = value
         job = {
             "controller": args.controller.rstrip("/"), "file": controller_file, "file_label": args.file,
             "destination": str(destination), "headers": headers, "insecure": args.insecure,
@@ -310,6 +328,8 @@ def parser() -> argparse.ArgumentParser:
                               help="Task status to include; repeat for multiple statuses (default: completed)")
     start_parser.add_argument("--header", action="append", default=[], type=parse_header,
                               help="HTTP header for Controller/Nginx auth; repeat as needed, e.g. 'Authorization: Bearer …'")
+    start_parser.add_argument("--basic-auth-file",
+                              help="File containing one Controller Nginx 'username:password' line (recommended for Basic Auth)")
     start_parser.add_argument("--insecure", action="store_true", help="Allow an untrusted HTTPS certificate")
     start_parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR), help="Local state/lock directory")
     for name, help_text in (("status", "Show progress for the current or latest batch"), ("cancel", "Request cancellation of the active batch")):

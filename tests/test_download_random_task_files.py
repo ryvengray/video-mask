@@ -50,3 +50,11 @@ def test_download_path_stays_under_destination_and_play_request_uses_controller(
     )
     assert request.full_url == "https://controller.example.com/api/tasks/task%20%2F%201/play?file=input&download=true"
     assert request.get_header("Authorization") == "Basic token"
+
+
+def test_basic_auth_file_builds_http_basic_header(tmp_path: Path):
+    credentials = tmp_path / "controller-auth"
+    credentials.write_text("admin:correct horse battery staple\n")
+    assert downloader.basic_auth_header(str(credentials)) == (
+        "Authorization", "Basic YWRtaW46Y29ycmVjdCBob3JzZSBiYXR0ZXJ5IHN0YXBsZQ==",
+    )
