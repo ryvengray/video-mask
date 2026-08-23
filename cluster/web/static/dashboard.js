@@ -453,12 +453,21 @@ if (faceReviewControl) {
   const modalAnnotationStatus = document.getElementById('play-modal-annotation-status');
   const modalHasFaceButton = document.getElementById('play-modal-has-face');
   const modalNoFaceButton = document.getElementById('play-modal-no-face');
+  const modalContentTags = document.getElementById('play-modal-content-tags');
+  const modalContentTagInput = document.getElementById('play-modal-content-tag-input');
+  const modalContentTagAddButton = document.getElementById('play-modal-content-tag-add');
+  const modalContentTagsSaveButton = document.getElementById('play-modal-content-tags-save');
+  const modalContentTagSelected = document.getElementById('play-modal-content-tag-selected');
+  const modalContentTagOptions = document.getElementById('play-modal-content-tag-options');
+  const modalContentTagSuggestions = document.getElementById('play-modal-content-tag-suggestions');
+  const modalContentTagMessage = document.getElementById('play-modal-content-tag-message');
   let heartbeatTimer;
   let framePreviewTimer;
   let modalHeartbeatTimer;
   let activeModalReview = null;
   let modalReviewToken = 0;
   let selectedContentTags = [];
+  let selectedModalContentTags = [];
   let knownContentTags = [];
 
   async function reviewRequest(path, options = {}) {
@@ -556,6 +565,7 @@ if (faceReviewControl) {
       const payload = await reviewRequest('/api/content-tags');
       knownContentTags = Array.isArray(payload.tags) ? payload.tags.map(normaliseContentTag).filter(Boolean) : [];
       renderContentTags();
+      renderModalContentTags();
     } catch (error) {
       console.warn('[video-mask] unable to load content-tag suggestions', error);
     }
@@ -570,6 +580,71 @@ if (faceReviewControl) {
   function setModalAnnotationControls(enabled) {
     modalHasFaceButton.disabled = !enabled;
     modalNoFaceButton.disabled = !enabled;
+    modalContentTagInput.disabled = !enabled;
+    modalContentTagAddButton.disabled = !enabled;
+    modalContentTagsSaveButton.disabled = !enabled || !selectedModalContentTags.length;
+  }
+
+  function renderModalContentTags() {
+    modalContentTagSelected.replaceChildren();
+    selectedModalContentTags.forEach(tag => {
+      const chip = document.createElement('span');
+      chip.className = 'content-tag-chip';
+      chip.textContent = tag;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', `Remove ${tag}`);
+      remove.textContent = '×';
+      remove.addEventListener('click', () => {
+        selectedModalContentTags = selectedModalContentTags.filter(value => value !== tag);
+        renderModalContentTags();
+        setModalAnnotationControls(Boolean(activeModalReview));
+      });
+      chip.append(remove);
+      modalContentTagSelected.append(chip);
+    });
+    modalContentTagOptions.replaceChildren();
+    modalContentTagSuggestions.replaceChildren();
+    const selected = new Set(selectedModalContentTags.map(tag => tag.toLocaleLowerCase()));
+    knownContentTags.forEach(tag => {
+      const option = document.createElement('option');
+      option.value = tag;
+      modalContentTagOptions.append(option);
+      if (selected.has(tag.toLocaleLowerCase())) return;
+      const suggestion = document.createElement('button');
+      suggestion.type = 'button';
+      suggestion.className = 'content-tag-suggestion';
+      suggestion.textContent = tag;
+      suggestion.addEventListener('click', () => addModalContentTag(tag));
+      modalContentTagSuggestions.append(suggestion);
+    });
+  }
+
+  function setSelectedModalContentTags(tags) {
+    const seen = new Set();
+    selectedModalContentTags = (Array.isArray(tags) ? tags : []).map(normaliseContentTag).filter(tag => {
+      const key = tag.toLocaleLowerCase();
+      if (!tag || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 20);
+    renderModalContentTags();
+  }
+
+  function addModalContentTag(value = modalContentTagInput.value) {
+    const candidates = String(value || '').split(/[,，;；\n]/).map(normaliseContentTag).filter(Boolean);
+    let added = false;
+    candidates.forEach(tag => {
+      if (selectedModalContentTags.length >= 20 || selectedModalContentTags.some(value => value.toLocaleLowerCase() === tag.toLocaleLowerCase())) return;
+      selectedModalContentTags.push(tag);
+      added = true;
+    });
+    modalContentTagInput.value = '';
+    if (added) {
+      modalContentTagMessage.textContent = 'Tags ready to save.';
+      renderModalContentTags();
+      setModalAnnotationControls(Boolean(activeModalReview));
+    }
   }
 
   async function heartbeatModalReview() {
@@ -582,6 +657,7 @@ if (faceReviewControl) {
       window.clearInterval(modalHeartbeatTimer);
       activeModalReview = null;
       setModalAnnotationControls(false);
+      modalContentTagMessage.textContent = error instanceof Error ? error.message : 'Manual label lease ended.';
       modalAnnotationStatus.textContent = error instanceof Error ? error.message : 'Manual label lease ended.';
     }
   }
@@ -600,9 +676,35 @@ if (faceReviewControl) {
       );
       modalAnnotationStatus.textContent = modalAnnotationText(task.face_annotation);
       activeModalReview = {task_id: reopened.task.task_id};
+      setSelectedModalContentTags(reopened.task.content_tags || []);
       refreshFaceReviewStatuses();
     } catch (error) {
       modalAnnotationStatus.textContent = error instanceof Error ? error.message : 'Unable to save manual label.';
+    } finally {
+      setModalAnnotationControls(Boolean(activeModalReview));
+    }
+  }
+
+  async function saveModalContentTags() {
+    if (!activeModalReview) return;
+    addModalContentTag();
+    if (!selectedModalContentTags.length) {
+      modalContentTagMessage.textContent = 'Add at least one content tag before saving.';
+      return;
+    }
+    setModalAnnotationControls(false);
+    modalContentTagMessage.textContent = 'Saving tags…';
+    try {
+      const task = await reviewRequest(
+        `/api/face-reviews/${encodeURIComponent(activeModalReview.task_id)}/content-tags`,
+        {method: 'PUT', body: JSON.stringify({reviewer_id: reviewerId, tags: selectedModalContentTags})},
+      );
+      activeModalReview = {...activeModalReview, ...task};
+      setSelectedModalContentTags(task.content_tags || selectedModalContentTags);
+      modalContentTagMessage.textContent = 'Content tags saved.';
+      await loadKnownContentTags();
+    } catch (error) {
+      modalContentTagMessage.textContent = error instanceof Error ? error.message : 'Unable to save content tags.';
     } finally {
       setModalAnnotationControls(Boolean(activeModalReview));
     }
@@ -613,7 +715,10 @@ if (faceReviewControl) {
     window.clearInterval(modalHeartbeatTimer);
     activeModalReview = null;
     modalAnnotation.hidden = false;
+    modalContentTags.hidden = false;
     modalAnnotationStatus.textContent = 'Opening manual label…';
+    modalContentTagMessage.textContent = 'Opening content labels…';
+    setSelectedModalContentTags([]);
     setModalAnnotationControls(false);
     try {
       const payload = await reviewRequest(`/api/face-reviews/${encodeURIComponent(taskId)}/open`, {
@@ -628,6 +733,8 @@ if (faceReviewControl) {
       }
       activeModalReview = {task_id: taskId};
       modalAnnotationStatus.textContent = modalAnnotationText(payload.task.face_annotation);
+      setSelectedModalContentTags(payload.task.content_tags || []);
+      modalContentTagMessage.textContent = 'Choose an existing tag or enter a new one. Multiple tags are supported.';
       setModalAnnotationControls(true);
       modalHeartbeatTimer = window.setInterval(heartbeatModalReview, 30_000);
     } catch (error) {
@@ -644,6 +751,8 @@ if (faceReviewControl) {
     const review = activeModalReview;
     activeModalReview = null;
     modalAnnotation.hidden = true;
+    modalContentTags.hidden = true;
+    setSelectedModalContentTags([]);
     setModalAnnotationControls(false);
     if (!review) return;
     fetch(`/api/face-reviews/${encodeURIComponent(review.task_id)}/release`, {
@@ -911,6 +1020,14 @@ if (faceReviewControl) {
   releaseButton.addEventListener('click', releaseFaceReview);
   modalHasFaceButton.addEventListener('click', () => saveModalAnnotation(true));
   modalNoFaceButton.addEventListener('click', () => saveModalAnnotation(false));
+  modalContentTagAddButton.addEventListener('click', () => addModalContentTag());
+  modalContentTagInput.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addModalContentTag();
+    }
+  });
+  modalContentTagsSaveButton.addEventListener('click', saveModalContentTags);
   window.addEventListener('pagehide', () => {
     if (!activeFaceReview) return;
     fetch(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/release`, {
