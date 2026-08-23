@@ -89,6 +89,8 @@ def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypat
     assert {claimed_first["task_id"], claimed_second["task_id"]} == {first["task_id"], second["task_id"]}
     assert store.claim_next_face_review("browser-c-unique-id", 300) is None
 
+    labelled = store.annotate_content_tags(claimed_first["task_id"], "browser-a-unique-id", ["Laundry"])
+    assert labelled["content_tags"] == ["Laundry"]
     labelled = store.annotate_face(claimed_first["task_id"], "browser-a-unique-id", True)
     assert labelled["face_annotation"] == 1
     status = store.face_review_status((claimed_first["task_id"], claimed_second["task_id"]))["reviews"]
@@ -105,6 +107,35 @@ def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypat
     clock[0] += 301
     reclaimed = store.claim_next_face_review("browser-c-unique-id", 300)
     assert reclaimed and reclaimed["task_id"] == claimed_second["task_id"]
+    store.close()
+
+
+def test_content_tags_are_saved_normalised_and_listed_for_reuse(tmp_path: Path):
+    store = new_store(tmp_path)
+    first = store.create_task(task_payload())
+    second_payload = task_payload()
+    second_payload["source_url"] = "https://storage.example/second.mov"
+    second = store.create_task(second_payload)
+    store.conn.execute("UPDATE tasks SET status='completed'")
+    store.conn.commit()
+
+    claimed = store.claim_next_face_review("browser-a-unique-id", 300)
+    assert claimed is not None
+    tagged = store.annotate_content_tags(
+        claimed["task_id"], "browser-a-unique-id", ["  Washing   clothes ", "washing clothes", "Tidy room"]
+    )
+    assert tagged["content_tags"] == ["Washing clothes", "Tidy room"]
+    assert store.content_tags() == ["Washing clothes", "Tidy room"]
+    store.annotate_face(claimed["task_id"], "browser-a-unique-id", True)
+
+    # A completed video whose face state is already known remains eligible
+    # until it receives its content labels.
+    other_id = second["task_id"] if claimed["task_id"] == first["task_id"] else first["task_id"]
+    store.conn.execute("UPDATE tasks SET face_annotation=1 WHERE task_id=?", (other_id,))
+    store.conn.commit()
+    next_claim = store.claim_next_face_review("browser-b-unique-id", 300)
+    assert next_claim is not None
+    assert next_claim["task_id"] == other_id
     store.close()
 
 
@@ -134,7 +165,10 @@ def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tm
     store = ClusterStore(database)
     columns = {row[1] for row in store.conn.execute("PRAGMA table_info(tasks)")}
     indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(tasks)")}
-    assert {"face_annotation", "face_annotated_at", "face_review_owner", "face_review_lease_until"} <= columns
+    assert {
+        "face_annotation", "face_annotated_at", "content_tags_json", "content_tagged_at",
+        "face_review_owner", "face_review_lease_until",
+    } <= columns
     assert "idx_tasks_face_review" in indexes
     store.close()
 

@@ -397,6 +397,8 @@ function enhanceTaskIdentifiersAndFiles() {
     if (fileButton.dataset.enhanced === 'true') return;
     const filePath = fileButton.textContent.trim();
     if (!filePath || filePath === '-') return;
+    const status = fileButton.closest('tr')?.querySelector('.badge')?.textContent?.trim();
+    if (fileButton.dataset.file === 'output' && status !== 'completed') return;
     fileButton.dataset.enhanced = 'true';
     fileButton.title = filePath;
     const download = document.createElement('button');
@@ -440,6 +442,13 @@ if (faceReviewControl) {
   const faceButton = document.getElementById('face-review-face');
   const noFaceButton = document.getElementById('face-review-no-face');
   const releaseButton = document.getElementById('face-review-release');
+  const contentTagInput = document.getElementById('content-tag-input');
+  const contentTagAddButton = document.getElementById('content-tag-add');
+  const contentTagsSaveButton = document.getElementById('content-tags-save');
+  const contentTagSelected = document.getElementById('content-tag-selected');
+  const contentTagOptions = document.getElementById('content-tag-options');
+  const contentTagSuggestions = document.getElementById('content-tag-suggestions');
+  const contentTagMessage = document.getElementById('content-tag-message');
   const modalAnnotation = document.getElementById('play-modal-annotation');
   const modalAnnotationStatus = document.getElementById('play-modal-annotation-status');
   const modalHasFaceButton = document.getElementById('play-modal-has-face');
@@ -449,6 +458,8 @@ if (faceReviewControl) {
   let modalHeartbeatTimer;
   let activeModalReview = null;
   let modalReviewToken = 0;
+  let selectedContentTags = [];
+  let knownContentTags = [];
 
   async function reviewRequest(path, options = {}) {
     const response = await fetch(path, {
@@ -466,9 +477,88 @@ if (faceReviewControl) {
 
   function setReviewControls(busy = false) {
     claimButton.disabled = busy || Boolean(activeFaceReview);
-    faceButton.disabled = busy;
-    noFaceButton.disabled = busy;
-    releaseButton.disabled = busy;
+    faceButton.disabled = busy || !activeFaceReview;
+    noFaceButton.disabled = busy || !activeFaceReview;
+    releaseButton.disabled = busy || !activeFaceReview;
+    contentTagInput.disabled = busy || !activeFaceReview;
+    contentTagAddButton.disabled = busy || !activeFaceReview;
+    contentTagsSaveButton.disabled = busy || !activeFaceReview || !selectedContentTags.length;
+  }
+
+  function normaliseContentTag(value) {
+    return String(value || '').trim().replace(/\s+/g, ' ');
+  }
+
+  function renderContentTags() {
+    contentTagSelected.replaceChildren();
+    selectedContentTags.forEach(tag => {
+      const chip = document.createElement('span');
+      chip.className = 'content-tag-chip';
+      chip.textContent = tag;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', `Remove ${tag}`);
+      remove.textContent = '×';
+      remove.addEventListener('click', () => {
+        selectedContentTags = selectedContentTags.filter(value => value !== tag);
+        renderContentTags();
+        setReviewControls();
+      });
+      chip.append(remove);
+      contentTagSelected.append(chip);
+    });
+    contentTagOptions.replaceChildren();
+    contentTagSuggestions.replaceChildren();
+    const selected = new Set(selectedContentTags.map(tag => tag.toLocaleLowerCase()));
+    knownContentTags.forEach(tag => {
+      const option = document.createElement('option');
+      option.value = tag;
+      contentTagOptions.append(option);
+      if (selected.has(tag.toLocaleLowerCase())) return;
+      const suggestion = document.createElement('button');
+      suggestion.type = 'button';
+      suggestion.className = 'content-tag-suggestion';
+      suggestion.textContent = tag;
+      suggestion.addEventListener('click', () => addContentTag(tag));
+      contentTagSuggestions.append(suggestion);
+    });
+  }
+
+  function setSelectedContentTags(tags) {
+    const seen = new Set();
+    selectedContentTags = (Array.isArray(tags) ? tags : []).map(normaliseContentTag).filter(tag => {
+      const key = tag.toLocaleLowerCase();
+      if (!tag || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 20);
+    renderContentTags();
+  }
+
+  function addContentTag(value = contentTagInput.value) {
+    const candidates = String(value || '').split(/[,，;；\n]/).map(normaliseContentTag).filter(Boolean);
+    let added = false;
+    candidates.forEach(tag => {
+      if (selectedContentTags.length >= 20 || selectedContentTags.some(value => value.toLocaleLowerCase() === tag.toLocaleLowerCase())) return;
+      selectedContentTags.push(tag);
+      added = true;
+    });
+    contentTagInput.value = '';
+    if (added) {
+      contentTagMessage.textContent = 'Tags ready to save.';
+      renderContentTags();
+      setReviewControls();
+    }
+  }
+
+  async function loadKnownContentTags() {
+    try {
+      const payload = await reviewRequest('/api/content-tags');
+      knownContentTags = Array.isArray(payload.tags) ? payload.tags.map(normaliseContentTag).filter(Boolean) : [];
+      renderContentTags();
+    } catch (error) {
+      console.warn('[video-mask] unable to load content-tag suggestions', error);
+    }
   }
 
   function modalAnnotationText(faceAnnotation) {
@@ -575,10 +665,11 @@ if (faceReviewControl) {
     player.hidden = true;
     reviewDetails.hidden = true;
     activeFaceReview = null;
+    setSelectedContentTags([]);
     activeBadge.className = 'badge muted';
     activeBadge.textContent = 'No active review';
     setReviewControls();
-    if (!keepMessage) setReviewMessage('Video released. You can claim another unlabelled completed video.');
+    if (!keepMessage) setReviewMessage('Video released. You can claim another video needing a manual label.');
     scheduleAutoRefresh();
   }
 
@@ -656,17 +747,18 @@ if (faceReviewControl) {
 
   async function claimFaceReview() {
     setReviewControls(true);
-    setReviewMessage('Finding an unlabelled completed video…');
+    setReviewMessage('Finding a random completed video needing a manual label…');
     try {
       const payload = await reviewRequest('/api/face-reviews/claim', {
         method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
       });
       if (!payload.task) {
-        window.alert('No unlabelled completed videos are available right now.');
+        window.alert('No completed videos need manual labels right now.');
         setReviewControls();
         return;
       }
       activeFaceReview = {...payload.task, playback_url: payload.playback_url};
+      setSelectedContentTags(payload.task.content_tags || []);
       reviewDetails.hidden = false;
       player.hidden = false;
       activeBadge.className = 'badge active';
@@ -698,6 +790,30 @@ if (faceReviewControl) {
       refreshFaceReviewStatuses();
     } catch (error) {
       setReviewMessage(error instanceof Error ? error.message : 'Unable to save the label.');
+      setReviewControls();
+    }
+  }
+
+  async function saveContentTags() {
+    if (!activeFaceReview) return;
+    addContentTag();
+    if (!selectedContentTags.length) {
+      contentTagMessage.textContent = 'Add at least one content tag before saving.';
+      return;
+    }
+    setReviewControls(true);
+    contentTagMessage.textContent = 'Saving tags…';
+    try {
+      const task = await reviewRequest(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/content-tags`, {
+        method: 'PUT', body: JSON.stringify({reviewer_id: reviewerId, tags: selectedContentTags}),
+      });
+      activeFaceReview = {...activeFaceReview, ...task};
+      setSelectedContentTags(task.content_tags || selectedContentTags);
+      contentTagMessage.textContent = 'Content tags saved.';
+      await loadKnownContentTags();
+    } catch (error) {
+      contentTagMessage.textContent = error instanceof Error ? error.message : 'Unable to save content tags.';
+    } finally {
       setReviewControls();
     }
   }
@@ -784,6 +900,14 @@ if (faceReviewControl) {
   reviewTabs.forEach(tab => tab.addEventListener('click', () => showFaceReviewTab(tab.dataset.faceReviewTab)));
   faceButton.addEventListener('click', () => annotateFaceReview(true));
   noFaceButton.addEventListener('click', () => annotateFaceReview(false));
+  contentTagAddButton.addEventListener('click', () => addContentTag());
+  contentTagInput.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addContentTag();
+    }
+  });
+  contentTagsSaveButton.addEventListener('click', saveContentTags);
   releaseButton.addEventListener('click', releaseFaceReview);
   modalHasFaceButton.addEventListener('click', () => saveModalAnnotation(true));
   modalNoFaceButton.addEventListener('click', () => saveModalAnnotation(false));
@@ -795,6 +919,7 @@ if (faceReviewControl) {
     });
   });
   refreshFaceReviewStatuses();
+  loadKnownContentTags();
   window.setInterval(refreshFaceReviewStatuses, 10_000);
 }
 

@@ -281,6 +281,10 @@ class FaceAnnotationRequest(FaceReviewRequest):
     has_face: bool
 
 
+class ContentTagsRequest(FaceReviewRequest):
+    tags: list[str] = Field(min_length=1, max_length=20)
+
+
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                local_source_dir: Path | None = None, local_output_dir: Path | None = None,
                s3_ingestor: S3Ingestor | None = None,
@@ -920,6 +924,17 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.put("/api/face-reviews/{task_id}/content-tags")
+    def annotate_content_tags(task_id: str, request: ContentTagsRequest) -> dict[str, Any]:
+        try:
+            return store.annotate_content_tags(task_id, request.reviewer_id, request.tags)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/content-tags")
+    def list_content_tags() -> dict[str, list[str]]:
+        return {"tags": store.content_tags()}
+
     @app.get("/api/face-reviews/status")
     def get_face_review_status(task_ids: str = "") -> dict[str, Any]:
         selected = tuple(value for value in task_ids.split(",") if value)[:100]
@@ -1035,8 +1050,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "Output upload URL", "Output file/key", "Attempt count", "Max attempts", "Assigned worker ID",
             "Worker name", "Worker slot", "Progress (JSON)", "Processing seconds", "Task lifetime (seconds)",
             "Output SHA256", "Output size (bytes)", "Output duration (seconds)", "Error message", "Created at",
-            "Started at", "Restarted at", "Finished at", "Face annotation",
-            "Face annotated at", "Face review owner", "Face review lease until", "Updated at",
+            "Started at", "Restarted at", "Finished at", "Face annotation", "Content tags",
+            "Face annotated at", "Content tagged at", "Face review owner", "Face review lease until", "Updated at",
         ]
         rows: list[list[Any]] = []
         for task in tasks:
@@ -1060,7 +1075,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 task.get("error_message"), timestamp(task.get("created_at")),
                 timestamp(task.get("started_at")), timestamp(task.get("restarted_at")), timestamp(task.get("finished_at")),
                 "Has face" if annotation == 1 else "No face" if annotation == 0 else "Unlabelled",
-                timestamp(task.get("face_annotated_at")), task.get("face_review_owner"),
+                ", ".join(task.get("content_tags") or []), timestamp(task.get("face_annotated_at")),
+                timestamp(task.get("content_tagged_at")), task.get("face_review_owner"),
                 timestamp(task.get("face_review_lease_until")), timestamp(task.get("updated_at")),
             ])
         workbook = tasks_xlsx(headers, rows)

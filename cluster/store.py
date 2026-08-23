@@ -79,6 +79,8 @@ class ClusterStore:
             finished_at REAL,
             face_annotation INTEGER,
             face_annotated_at REAL,
+            content_tags_json TEXT,
+            content_tagged_at REAL,
             face_review_owner TEXT,
             face_review_lease_until REAL,
             updated_at REAL NOT NULL
@@ -122,6 +124,8 @@ class ClusterStore:
         for column, definition in (
             ("face_annotation", "INTEGER"),
             ("face_annotated_at", "REAL"),
+            ("content_tags_json", "TEXT"),
+            ("content_tagged_at", "REAL"),
             ("face_review_owner", "TEXT"),
             ("face_review_lease_until", "REAL"),
         ):
@@ -132,6 +136,10 @@ class ClusterStore:
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_face_review
               ON tasks(status, face_annotation, face_review_owner, finished_at)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_content_review
+              ON tasks(status, content_tags_json, face_review_owner, finished_at)
         """)
         self.conn.commit()
 
@@ -169,6 +177,8 @@ class ClusterStore:
         for name in ("arguments_json", "progress_json", "capabilities_json"):
             if name in value:
                 value[name.removesuffix("_json")] = json.loads(value.pop(name) or "{}")
+        if "content_tags_json" in value:
+            value["content_tags"] = json.loads(value.pop("content_tags_json") or "[]")
         return value
 
     @synchronized
@@ -400,7 +410,7 @@ class ClusterStore:
 
     @synchronized
     def claim_next_face_review(self, reviewer_id: str, lease_seconds: int) -> dict[str, Any] | None:
-        """Atomically reserve one unlabelled completed source video for review."""
+        """Atomically reserve a random completed video needing a manual label."""
         stamp = now()
         lease_until = stamp + lease_seconds
         self.conn.execute("BEGIN IMMEDIATE")
@@ -408,9 +418,10 @@ class ClusterStore:
             self._expire_face_review_leases(stamp)
             row = self.conn.execute("""
                 SELECT task_id FROM tasks
-                WHERE status='completed' AND face_annotation IS NULL AND source_object_key IS NOT NULL
+                WHERE status='completed' AND (face_annotation IS NULL OR content_tags_json IS NULL)
+                  AND source_object_key IS NOT NULL
                   AND face_review_owner IS NULL
-                ORDER BY finished_at, created_at
+                ORDER BY RANDOM()
                 LIMIT 1
             """).fetchone()
             if row is None:
@@ -489,6 +500,72 @@ class ClusterStore:
             raise ValueError("face-review lease expired or this task is no longer available")
         self.conn.commit()
         return self.task(task_id) or {}
+
+    @staticmethod
+    def _normalise_content_tags(tags: list[str]) -> list[str]:
+        """Validate and de-duplicate human-entered video-content labels."""
+        if not isinstance(tags, list) or not tags:
+            raise ValueError("provide at least one content tag")
+        if len(tags) > 20:
+            raise ValueError("at most 20 content tags may be saved")
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in tags:
+            if not isinstance(value, str):
+                raise ValueError("content tags must be text")
+            tag = " ".join(value.split())
+            if not tag or len(tag) > 64:
+                raise ValueError("each content tag must contain 1 to 64 characters")
+            key = tag.casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(tag)
+        if not result:
+            raise ValueError("provide at least one content tag")
+        return result
+
+    @synchronized
+    def annotate_content_tags(self, task_id: str, reviewer_id: str, tags: list[str]) -> dict[str, Any]:
+        """Save content labels while retaining the current review lease."""
+        normalised_tags = self._normalise_content_tags(tags)
+        stamp = now()
+        self._expire_face_review_leases(stamp)
+        cursor = self.conn.execute("""
+            UPDATE tasks SET content_tags_json=?, content_tagged_at=?, updated_at=?
+            WHERE task_id=? AND status='completed' AND face_review_owner=?
+        """, (json.dumps(normalised_tags, ensure_ascii=False), stamp, stamp, task_id, reviewer_id))
+        if cursor.rowcount != 1:
+            self.conn.commit()
+            raise ValueError("face-review lease expired or this task is no longer available")
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def content_tags(self, limit: int = 500) -> list[str]:
+        """Return distinct labels already used, newest first, for the picker."""
+        rows = self.conn.execute("""
+            SELECT content_tags_json FROM tasks
+            WHERE content_tags_json IS NOT NULL
+            ORDER BY content_tagged_at DESC, updated_at DESC
+            LIMIT ?
+        """, (max(1, min(limit, 10_000)),)).fetchall()
+        tags: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                values = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                tag = " ".join(value.split())
+                if tag and tag.casefold() not in seen:
+                    seen.add(tag.casefold())
+                    tags.append(tag)
+        return tags
 
     @synchronized
     def face_review_status(self, task_ids: tuple[str, ...] | None = None) -> dict[str, Any]:

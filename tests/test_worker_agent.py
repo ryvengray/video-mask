@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from cluster.worker_agent import Worker
+from cluster.worker_agent import Worker, cuda_library_paths
 
 
 def test_worker_uses_controller_selected_sibling_algorithm(tmp_path):
@@ -22,3 +22,15 @@ def test_worker_uses_controller_selected_sibling_algorithm(tmp_path):
     assert worker.algorithm_path_for_task({}) == default_algorithm.resolve()
     with pytest.raises(RuntimeError, match="filename"):
         worker.algorithm_path_for_task({"algorithm": "../outside.py"})
+
+
+def test_cuda_library_paths_discovers_torch_and_nvidia_wheels(tmp_path, monkeypatch):
+    site_packages = tmp_path / "site-packages"
+    (site_packages / "torch" / "lib").mkdir(parents=True)
+    (site_packages / "nvidia" / "cublas" / "lib").mkdir(parents=True)
+    monkeypatch.setattr("cluster.worker_agent.site.getsitepackages", lambda: [str(site_packages)])
+
+    assert cuda_library_paths() == [
+        str(site_packages / "torch" / "lib"),
+        str(site_packages / "nvidia" / "cublas" / "lib"),
+    ]

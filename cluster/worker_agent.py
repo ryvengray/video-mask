@@ -10,6 +10,7 @@ import os
 import signal
 import shutil
 import socket
+import site
 import subprocess
 import sys
 import threading
@@ -27,6 +28,18 @@ DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
                 ]
 DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
 SINGLE_PUT_MAX_BYTES = 5 * 1024 * 1024 * 1024
+
+
+def cuda_library_paths() -> list[str]:
+    """Find CUDA shared libraries installed by PyTorch's pip dependencies."""
+    paths: list[str] = []
+    for site_packages in site.getsitepackages():
+        root = Path(site_packages)
+        candidates = [root / "torch" / "lib", *sorted(root.glob("nvidia/*/lib"))]
+        for candidate in candidates:
+            if candidate.is_dir() and str(candidate) not in paths:
+                paths.append(str(candidate))
+    return paths
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -67,6 +80,13 @@ class Worker:
         self.poll_seconds = args.poll_seconds
         self.extra_args = args.extra_arg or DEFAULT_ARGS
         self.allow_local_files = args.allow_local_files
+        self.algorithm_environment = dict(os.environ)
+        cuda_paths = cuda_library_paths()
+        if cuda_paths:
+            inherited_paths = self.algorithm_environment.get("LD_LIBRARY_PATH", "")
+            self.algorithm_environment["LD_LIBRARY_PATH"] = ":".join(
+                [*cuda_paths, *filter(None, inherited_paths.split(":"))]
+            )
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.completed_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -304,7 +324,7 @@ class Worker:
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1, start_new_session=True,
-                                       env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                                       env={**self.algorithm_environment, "PYTHONUNBUFFERED": "1"})
 
             cancel_monitor_stop = threading.Event()
 
