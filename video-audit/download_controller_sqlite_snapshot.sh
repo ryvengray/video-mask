@@ -25,6 +25,8 @@ Options:
 
 The script uses Python's SQLite backup API on the Controller, so the live
 database remains online and no -wal/-shm files need to be downloaded.
+The Controller's first-seen SSH host key is saved automatically; a changed
+host key is still rejected.
 EOF
 }
 
@@ -63,7 +65,9 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 REMOTE_SNAPSHOT="/tmp/video-mask-controller-${TIMESTAMP}-$$.sqlite3"
 LOCAL_SNAPSHOT="${OUTPUT_DIR%/}/controller-${CONTROLLER_HOST//[^A-Za-z0-9._-]/_}-${TIMESTAMP}.sqlite3"
 SSH_TARGET="${CONTROLLER_USER}@${CONTROLLER_HOST}"
-SSH_OPTIONS=(-i "$PEM_FILE" -o BatchMode=yes -o ConnectTimeout=20)
+# Accept a first-seen host key without an interactive prompt, while still
+# refusing a changed key that could indicate a host replacement or MITM.
+SSH_OPTIONS=(-i "$PEM_FILE" -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new)
 
 remote_quote() {
   printf '%q' "$1"
