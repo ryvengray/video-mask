@@ -249,6 +249,25 @@ def test_task_list_can_filter_by_any_selected_content_tag(tmp_path: Path):
     store.close()
 
 
+def test_content_tag_statistics_counts_each_video_once_per_tag(tmp_path: Path):
+    store = new_store(tmp_path)
+    first = store.create_task(task_payload())
+    second_payload = task_payload()
+    second_payload["source_url"] = "https://storage.example/second.mov"
+    second = store.create_task(second_payload)
+    store.conn.execute("UPDATE tasks SET status='completed', content_tags_json=? WHERE task_id=?", (json.dumps(["Laundry", "Home", "Laundry"]), first["task_id"]))
+    store.conn.execute("UPDATE tasks SET status='failed', content_tags_json=? WHERE task_id=?", (json.dumps(["Laundry"]), second["task_id"]))
+    store.conn.commit()
+
+    assert store.content_tag_statistics() == [
+        {"tag": "Laundry", "video_count": 2}, {"tag": "Home", "video_count": 1},
+    ]
+    assert store.content_tag_statistics(("completed",)) == [
+        {"tag": "Home", "video_count": 1}, {"tag": "Laundry", "video_count": 1},
+    ]
+    store.close()
+
+
 def test_processing_statistics_reports_hourly_concurrency_and_worker_efficiency(tmp_path: Path):
     store = new_store(tmp_path)
     start = 1_700_000_000.0

@@ -10,6 +10,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections import Counter
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -566,6 +567,34 @@ class ClusterStore:
                     seen.add(tag.casefold())
                     tags.append(tag)
         return tags
+
+    @synchronized
+    def content_tag_statistics(self, statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Count videos for every saved content tag, optionally by task status."""
+        values: list[Any] = []
+        where = "WHERE content_tags_json IS NOT NULL"
+        if statuses:
+            where += " AND status IN (" + ", ".join("?" for _ in statuses) + ")"
+            values.extend(statuses)
+        rows = self.conn.execute(
+            "SELECT content_tags_json FROM tasks " + where, values
+        ).fetchall()
+        counts: Counter[str] = Counter()
+        for row in rows:
+            try:
+                tags = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(tags, list):
+                continue
+            # Current writes already deduplicate tags.  Retain that guarantee
+            # when reporting against historical data too.
+            unique_tags = {tag for tag in tags if isinstance(tag, str) and tag}
+            counts.update(unique_tags)
+        return [
+            {"tag": tag, "video_count": count}
+            for tag, count in sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+        ]
 
     @synchronized
     def face_review_status(self, task_ids: tuple[str, ...] | None = None) -> dict[str, Any]:

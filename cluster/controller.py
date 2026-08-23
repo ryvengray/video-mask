@@ -935,6 +935,20 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def list_content_tags() -> dict[str, list[str]]:
         return {"tags": store.content_tags()}
 
+    @app.get("/api/dashboard/content-tag-statistics")
+    def content_tag_statistics(status: str = "") -> dict[str, Any]:
+        """Return the tagged-video count for each content label."""
+        statuses = tuple(dict.fromkeys(value.strip() for value in status.split(",") if value.strip()))
+        if set(statuses) - set(TASK_FILTER_STATUSES):
+            raise HTTPException(status_code=400, detail="unknown task status filter")
+        tags = store.content_tag_statistics(statuses or None)
+        return {
+            "tags": tags,
+            "total_tags": len(tags),
+            "tagged_video_occurrences": sum(item["video_count"] for item in tags),
+            "statuses": statuses,
+        }
+
     @app.get("/api/face-reviews/status")
     def get_face_review_status(task_ids: str = "") -> dict[str, Any]:
         selected = tuple(value for value in task_ids.split(",") if value)[:100]
