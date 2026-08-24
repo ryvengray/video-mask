@@ -10,7 +10,7 @@
   </style>
 </head>
 <body>
-  <header class="top"><div class="brand"><span class="dot"></span>Video library</div><p>Browse shared completed videos by content category.</p></header>
+  <header class="top"><div class="brand"><span class="dot"></span>Video library</div><p>Browse shared completed {{ "source" if share_file == "input" else "processed" }} videos by content category.</p></header>
   <main class="shell">
     {% if categories %}
     <nav class="tabs" role="tablist" aria-label="Content categories">

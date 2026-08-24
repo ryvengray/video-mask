@@ -805,6 +805,15 @@ class ClusterStore:
         return str(row[0]) if row else ""
 
     @synchronized
+    def category_share_file(self) -> str:
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings WHERE setting_key='content_category_share_file'"
+        ).fetchone()
+        # Existing installations default to sharing source videos until an
+        # administrator explicitly chooses processed output.
+        return str(row[0]) if row and row[0] in {"input", "output"} else "input"
+
+    @synchronized
     def set_category_share_id(self, share_id: str) -> str:
         value = share_id.strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", value):
@@ -819,17 +828,32 @@ class ClusterStore:
         return value
 
     @synchronized
+    def set_category_share_file(self, file: str) -> str:
+        if file not in {"input", "output"}:
+            raise ValueError("shared category video must be 'input' or 'output'")
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES('content_category_share_file', ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (file, now()))
+        self.conn.commit()
+        return file
+
+    @synchronized
     def public_category_catalog(self, share_id: str) -> list[dict[str, Any]] | None:
         configured = self.category_share_id()
         if not configured or configured != share_id:
             return None
+        file = self.category_share_file()
+        key_column = "tasks.source_object_key" if file == "input" else "tasks.output_object_key"
         rows = self.conn.execute("""
             SELECT categories.category_id, categories.name, tasks.task_id,
               tasks.source_object_key, tasks.output_object_key
             FROM content_categories AS categories
             JOIN tasks ON tasks.content_category_id=categories.category_id
             WHERE tasks.status='completed'
-              AND (tasks.source_object_key IS NOT NULL OR tasks.output_object_key IS NOT NULL)
+              AND """ + key_column + """ IS NOT NULL
             ORDER BY categories.name COLLATE NOCASE, tasks.finished_at DESC, tasks.task_id DESC
         """).fetchall()
         grouped: dict[int, dict[str, Any]] = {}
@@ -838,8 +862,7 @@ class ClusterStore:
             category = grouped.setdefault(category_id, {
                 "category_id": category_id, "name": str(row[1]), "videos": [],
             })
-            file = "output" if row[4] else "input"
-            key = row[4] if file == "output" else row[3]
+            key = row[3] if file == "input" else row[4]
             if not key:
                 continue
             category["videos"].append({
@@ -853,16 +876,17 @@ class ClusterStore:
         configured = self.category_share_id()
         if not configured or configured != share_id:
             return None
+        file = self.category_share_file()
+        key_column = "source_object_key" if file == "input" else "output_object_key"
         row = self.conn.execute("""
             SELECT tasks.source_object_key, tasks.output_object_key
             FROM tasks
             WHERE task_id=? AND status='completed' AND content_category_id IS NOT NULL
-              AND (source_object_key IS NOT NULL OR output_object_key IS NOT NULL)
+              AND """ + key_column + """ IS NOT NULL
         """, (task_id,)).fetchone()
         if row is None:
             return None
-        file = "output" if row[1] else "input"
-        key = row[1] if file == "output" else row[0]
+        key = row[0] if file == "input" else row[1]
         return {"task_id": task_id, "file": file, "filename": Path(str(key)).name or "video.mp4"}
 
     @synchronized

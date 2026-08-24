@@ -301,6 +301,7 @@ class TaskContentCategoryRequest(BaseModel):
 
 class ContentCategoryShareRequest(BaseModel):
     share_id: str = Field(min_length=16, max_length=64)
+    file: str = Field(default="input", pattern="^(input|output)$")
 
 
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
@@ -772,7 +773,10 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         categories = public_category_catalog_or_404(share_id)
         response = templates.TemplateResponse(
             request=request, name="category-share.html",
-            context={"share_id": share_id, "categories": categories},
+            context={
+                "share_id": share_id, "categories": categories,
+                "share_file": store.category_share_file(),
+            },
         )
         response.headers["Cache-Control"] = "private, no-store"
         return response
@@ -794,6 +798,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "categories": store.content_categories(),
             "assignments": store.task_content_categories(selected),
             "share_id": store.category_share_id(),
+            "share_file": store.category_share_file(),
         }
 
     @app.post("/api/dashboard/content-categories")
@@ -822,9 +827,13 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     def set_content_category_share(request: ContentCategoryShareRequest) -> dict[str, str]:
         try:
             share_id = store.set_category_share_id(request.share_id)
+            share_file = store.set_category_share_file(request.file)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"share_id": share_id, "url": f"/share/categories/{urllib.parse.quote(share_id, safe='')}"}
+        return {
+            "share_id": share_id, "share_file": share_file,
+            "url": f"/share/categories/{urllib.parse.quote(share_id, safe='')}",
+        }
 
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):

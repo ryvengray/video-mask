@@ -224,10 +224,18 @@ def test_content_categories_assign_one_per_task_and_build_public_catalog(tmp_pat
     catalog = store.public_category_catalog(share_id)
     assert catalog is not None
     assert catalog[0]["name"] == "Laundry"
-    assert catalog[0]["videos"][0]["file"] == "output"
+    assert catalog[0]["videos"][0]["file"] == "input"
     assert store.public_category_catalog("wrong_share_id") is None
     item = store.public_category_catalog_item(share_id, task["task_id"])
-    assert item and item["filename"] == "input.mp4"
+    assert item and item["file"] == "input" and item["filename"] == "input.mov"
+    assert store.category_share_file() == "input"
+    assert store.set_category_share_file("output") == "output"
+    output_catalog = store.public_category_catalog(share_id)
+    assert output_catalog and output_catalog[0]["videos"][0]["file"] == "output"
+    output_item = store.public_category_catalog_item(share_id, task["task_id"])
+    assert output_item and output_item["file"] == "output"
+    with pytest.raises(ValueError, match="shared category video"):
+        store.set_category_share_file("original")
     store.close()
 
 
