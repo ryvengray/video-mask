@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from collections import Counter
 from functools import wraps
 from pathlib import Path
@@ -110,6 +112,25 @@ class ClusterStore:
             arguments_json TEXT NOT NULL DEFAULT '[]',
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS video_shares (
+            share_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            revoked_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_shares_valid
+          ON video_shares(token_hash, expires_at, revoked_at);
+        CREATE TABLE IF NOT EXISTS video_share_items (
+            share_id TEXT NOT NULL REFERENCES video_shares(share_id) ON DELETE CASCADE,
+            item_id TEXT NOT NULL,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            file TEXT NOT NULL CHECK(file IN ('input', 'output')),
+            PRIMARY KEY (share_id, item_id),
+            UNIQUE (share_id, task_id, file)
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_share_items_task
+          ON video_share_items(task_id);
         """)
         self.conn.execute("""
             INSERT INTO algorithm_defaults (id, algorithm, arguments_json, updated_at)
@@ -691,6 +712,123 @@ class ClusterStore:
     @synchronized
     def task(self, task_id: str) -> dict[str, Any] | None:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
+
+    @synchronized
+    def create_video_share(self, task_ids: list[str], files: list[str],
+                           expires_in_days: int = 7) -> dict[str, Any]:
+        """Create an expiring, opaque customer-share token for selected media.
+
+        Only the SHA-256 digest is persisted.  The raw token is returned once
+        to the dashboard and is never recoverable from the Controller DB.
+        """
+        if not task_ids:
+            raise ValueError("select at least one task to share")
+        if len(task_ids) > 100:
+            raise ValueError("at most 100 tasks may be shared at once")
+        if not files or any(file not in {"input", "output"} for file in files):
+            raise ValueError("select source and/or processed output")
+        try:
+            expires_in_days = int(expires_in_days)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("share expiry must be a whole number of days") from exc
+        if not 1 <= expires_in_days <= 30:
+            raise ValueError("share expiry must be between 1 and 30 days")
+
+        unique_task_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if str(task_id)))
+        unique_files = list(dict.fromkeys(files))
+        selected: list[tuple[str, str]] = []
+        for task_id in unique_task_ids:
+            task = self.task(task_id)
+            if task is None:
+                raise ValueError(f"task does not exist: {task_id}")
+            for file in unique_files:
+                key = task.get("source_object_key") if file == "input" else task.get("output_object_key")
+                # Output is not a customer-ready artifact until a Worker has
+                # reported successful completion.  Source may be shared while
+                # a task is still being processed.
+                if key and (file == "input" or task.get("status") == "completed"):
+                    selected.append((task_id, file))
+        if not selected:
+            raise ValueError("the selected tasks do not have shareable files")
+
+        stamp = now()
+        share_id = str(uuid.uuid4())
+        raw_token = secrets.token_urlsafe(32)
+        self.conn.execute(
+            "INSERT INTO video_shares(share_id, token_hash, created_at, expires_at) VALUES(?, ?, ?, ?)",
+            (share_id, token_hash(raw_token), stamp, stamp + expires_in_days * 86400),
+        )
+        self.conn.executemany(
+            "INSERT INTO video_share_items(share_id, item_id, task_id, file) VALUES(?, ?, ?, ?)",
+            [(share_id, uuid.uuid4().hex, task_id, file) for task_id, file in selected],
+        )
+        self.conn.commit()
+        return {
+            "share_id": share_id,
+            "token": raw_token,
+            "created_at": stamp,
+            "expires_at": stamp + expires_in_days * 86400,
+            "item_count": len(selected),
+        }
+
+    @synchronized
+    def video_share(self, raw_token: str) -> dict[str, Any] | None:
+        """Resolve a public share only while its token is valid and active."""
+        if not raw_token:
+            return None
+        stamp = now()
+        share = self.conn.execute("""
+            SELECT share_id, created_at, expires_at FROM video_shares
+            WHERE token_hash=? AND revoked_at IS NULL AND expires_at>?
+        """, (token_hash(raw_token), stamp)).fetchone()
+        if share is None:
+            return None
+        rows = self.conn.execute("""
+            SELECT items.item_id, items.task_id, items.file,
+              tasks.source_object_key, tasks.output_object_key, tasks.status
+            FROM video_share_items AS items
+            JOIN tasks ON tasks.task_id=items.task_id
+            WHERE items.share_id=?
+            ORDER BY tasks.created_at DESC, items.file
+        """, (share["share_id"],)).fetchall()
+        items = []
+        for row in rows:
+            key = row["source_object_key"] if row["file"] == "input" else row["output_object_key"]
+            if key:
+                items.append({
+                    "item_id": str(row["item_id"]), "task_id": str(row["task_id"]),
+                    "file": str(row["file"]), "filename": Path(str(key)).name or "video.mp4",
+                })
+        if not items:
+            return None
+        return {
+            "share_id": str(share["share_id"]), "created_at": float(share["created_at"]),
+            "expires_at": float(share["expires_at"]), "items": items,
+        }
+
+    @synchronized
+    def video_share_item(self, raw_token: str, item_id: str) -> dict[str, Any] | None:
+        """Return the selected task/file pair if it belongs to an active share."""
+        share = self.video_share(raw_token)
+        if share is None:
+            return None
+        for item in share["items"]:
+            # The share token is the secret.  Item IDs only select a member of
+            # that already-authorized share, so a normal equality comparison
+            # also handles malformed non-ASCII path values safely.
+            if str(item["item_id"]) == str(item_id):
+                return item
+        return None
+
+    @synchronized
+    def revoke_video_share(self, share_id: str) -> bool:
+        """Disable an existing customer link without deleting audit history."""
+        cursor = self.conn.execute(
+            "UPDATE video_shares SET revoked_at=? WHERE share_id=? AND revoked_at IS NULL",
+            (now(), share_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
 
     @synchronized
     def active_task_for_worker(self, worker_id: str, token: str, task_id: str) -> dict[str, Any]:

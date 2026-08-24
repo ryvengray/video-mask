@@ -151,6 +151,36 @@ def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path
     reopened.close()
 
 
+def test_video_share_is_opaque_expiring_and_can_be_revoked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store = new_store(tmp_path)
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr("cluster.store.now", lambda: clock[0])
+    task = store.create_task(task_payload())
+    store.conn.execute(
+        "UPDATE tasks SET status='completed', output_object_key='output/masked/input.mp4' WHERE task_id=?",
+        (task["task_id"],),
+    )
+    store.conn.commit()
+
+    created = store.create_video_share([task["task_id"]], ["input", "output"], expires_in_days=3)
+    assert "token" in created
+    digest = store.conn.execute("SELECT token_hash FROM video_shares").fetchone()[0]
+    assert digest != created["token"]
+    share = store.video_share(created["token"])
+    assert share is not None
+    assert {item["file"] for item in share["items"]} == {"input", "output"}
+    item = share["items"][0]
+    assert store.video_share_item(created["token"], item["item_id"]) == item
+
+    assert store.revoke_video_share(created["share_id"]) is True
+    assert store.video_share(created["token"]) is None
+
+    another = store.create_video_share([task["task_id"]], ["input"], expires_in_days=1)
+    clock[0] += 86_401
+    assert store.video_share(another["token"]) is None
+    store.close()
+
+
 def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     connection = sqlite3.connect(database)

@@ -418,6 +418,159 @@ function enhanceTaskIdentifiersAndFiles() {
 
 enhanceTaskIdentifiersAndFiles();
 
+let taskShareModal;
+
+function selectedTaskIdsForShare() {
+  return [...document.querySelectorAll('[data-share-task]:checked')]
+    .map(input => input.dataset.shareTask).filter(Boolean);
+}
+
+function updateTaskShareButton() {
+  const button = document.getElementById('task-share-selected');
+  if (!button) return;
+  const count = selectedTaskIdsForShare().length;
+  button.disabled = count === 0;
+  button.textContent = count ? `Share selected (${count})` : 'Share selected';
+}
+
+function ensureTaskShareSelection() {
+  if (!taskTable) return;
+  const table = taskTable.querySelector('table');
+  const header = table?.querySelector('thead tr');
+  if (!table || !header) return;
+  if (!header.querySelector('.task-share-heading')) {
+    const cell = document.createElement('th');
+    cell.className = 'task-share-heading';
+    const selectAll = document.createElement('input');
+    selectAll.type = 'checkbox';
+    selectAll.title = 'Select all tasks on this page';
+    selectAll.setAttribute('aria-label', 'Select all tasks on this page');
+    selectAll.addEventListener('change', () => {
+      table.querySelectorAll('[data-share-task]').forEach(input => { input.checked = selectAll.checked; });
+      updateTaskShareButton();
+    });
+    cell.append(selectAll);
+    header.insertBefore(cell, header.firstElementChild);
+  }
+  table.querySelectorAll('tbody tr').forEach(row => {
+    if (row.querySelector('.task-share-cell')) return;
+    const playButton = row.querySelector('.file-play[data-task-id]');
+    if (!playButton) {
+      row.querySelector('td')?.setAttribute('colspan', String(header.children.length));
+      return;
+    }
+    const cell = document.createElement('td');
+    cell.className = 'task-share-cell';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.dataset.shareTask = playButton.dataset.taskId;
+    input.setAttribute('aria-label', `Select task ${playButton.dataset.taskId} for customer sharing`);
+    input.addEventListener('change', updateTaskShareButton);
+    cell.append(input);
+    row.insertBefore(cell, row.firstElementChild);
+  });
+  if (!document.getElementById('task-share-selected')) {
+    const button = document.createElement('button');
+    button.id = 'task-share-selected';
+    button.type = 'button';
+    button.className = 'task-search-button task-share-button';
+    button.addEventListener('click', openTaskShareModal);
+    const exportButton = document.querySelector('.task-export-button');
+    (exportButton?.parentElement || document.querySelector('.section-head'))?.append(button);
+  }
+  updateTaskShareButton();
+}
+
+function closeTaskShareModal() {
+  if (!taskShareModal || taskShareModal.hidden) return;
+  taskShareModal.hidden = true;
+  scheduleAutoRefresh();
+}
+
+function copyShareLink(value, button) {
+  const fallback = () => {
+    const input = document.createElement('textarea');
+    input.value = value;
+    input.style.cssText = 'position:fixed;opacity:0';
+    document.body.append(input);
+    input.select();
+    document.execCommand('copy');
+    input.remove();
+  };
+  const copied = navigator.clipboard?.writeText ? navigator.clipboard.writeText(value).catch(fallback) : Promise.resolve().then(fallback);
+  copied.then(() => { button.textContent = 'Copied'; }).catch(() => window.alert('Unable to copy the share link.'));
+}
+
+function ensureTaskShareModal() {
+  if (taskShareModal) return;
+  document.body.insertAdjacentHTML('beforeend', `
+    <div id="task-share-modal" class="play-modal" hidden>
+      <div class="play-modal-backdrop" data-task-share-close></div>
+      <div class="play-modal-card" role="dialog" aria-modal="true" aria-labelledby="task-share-modal-title">
+        <div class="play-modal-head"><div><h3 id="task-share-modal-title">Share videos with customer</h3><p id="task-share-summary" class="play-modal-sub">Selected tasks</p></div><button class="play-modal-close" type="button" data-task-share-close aria-label="Close">&times;</button></div>
+        <form id="task-share-form" class="task-share-form">
+          <label class="task-share-option"><input name="share-file" type="checkbox" value="output" checked> Processed output</label>
+          <label class="task-share-option"><input name="share-file" type="checkbox" value="input"> Source video</label>
+          <label class="task-share-expiry">Link expires in <input id="task-share-expiry" type="number" min="1" max="30" value="7" required> days</label>
+          <p id="task-share-message" class="play-modal-note">The customer will not need a Controller account. The link works only for the selected files.</p>
+          <div id="task-share-link-area" hidden><input id="task-share-link" class="task-share-link" type="text" readonly aria-label="Customer share link"><button id="task-share-copy" class="play-btn play-btn-open" type="button">Copy link</button></div>
+          <div class="play-modal-actions"><button id="task-share-submit" class="play-btn play-btn-open" type="submit">Create share link</button><button class="play-btn" type="button" data-task-share-close>Cancel</button></div>
+        </form>
+      </div>
+    </div>`);
+  taskShareModal = document.getElementById('task-share-modal');
+  taskShareModal.querySelectorAll('[data-task-share-close]').forEach(element => element.addEventListener('click', closeTaskShareModal));
+  taskShareModal.querySelector('#task-share-form').addEventListener('submit', submitTaskShare);
+  taskShareModal.querySelector('#task-share-copy').addEventListener('click', () => {
+    const input = taskShareModal.querySelector('#task-share-link');
+    copyShareLink(input.value, taskShareModal.querySelector('#task-share-copy'));
+  });
+}
+
+function openTaskShareModal() {
+  const taskIds = selectedTaskIdsForShare();
+  if (!taskIds.length) return;
+  ensureTaskShareModal();
+  taskShareModal.querySelector('#task-share-summary').textContent = `${taskIds.length} task${taskIds.length === 1 ? '' : 's'} selected`;
+  taskShareModal.querySelector('#task-share-message').textContent = 'The customer will not need a Controller account. The link works only for the selected files.';
+  taskShareModal.querySelector('#task-share-link-area').hidden = true;
+  taskShareModal.querySelector('#task-share-copy').textContent = 'Copy link';
+  taskShareModal.hidden = false;
+  pauseAutoRefresh();
+}
+
+async function submitTaskShare(event) {
+  event.preventDefault();
+  const taskIds = selectedTaskIdsForShare();
+  const files = [...taskShareModal.querySelectorAll('[name="share-file"]:checked')].map(input => input.value);
+  const expiry = Number(taskShareModal.querySelector('#task-share-expiry').value);
+  const message = taskShareModal.querySelector('#task-share-message');
+  const submit = taskShareModal.querySelector('#task-share-submit');
+  if (!files.length) { message.textContent = 'Select at least one file type.'; return; }
+  if (!Number.isInteger(expiry) || expiry < 1 || expiry > 30) { message.textContent = 'Expiry must be between 1 and 30 days.'; return; }
+  submit.disabled = true;
+  message.textContent = 'Creating customer link…';
+  try {
+    const response = await fetch('/api/dashboard/shares', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({task_ids: taskIds, files, expires_in_days: expiry}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    const link = new URL(payload.url, window.location.origin).href;
+    taskShareModal.querySelector('#task-share-link').value = link;
+    taskShareModal.querySelector('#task-share-link-area').hidden = false;
+    message.textContent = `Link created for ${payload.item_count} video file${payload.item_count === 1 ? '' : 's'}. It expires in ${expiry} days.`;
+  } catch (error) {
+    message.textContent = error instanceof Error ? error.message : 'Unable to create a share link.';
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+ensureTaskShareSelection();
+document.addEventListener('keydown', event => { if (event.key === 'Escape') closeTaskShareModal(); });
+
 function configureManualLabelFilters() {
   const form = document.getElementById('task-status-filter');
   const oldFilter = form?.querySelector('.annotation-filter');

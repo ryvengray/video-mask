@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Shared videos</title>
+  <style>
+    :root{color-scheme:light;--ink:#202124;--muted:#5f6368;--line:#dadce0;--surface:#fff;--canvas:#f8f9fa;--blue:#1a73e8;--blue-soft:#e8f0fe}
+    *{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:14px/1.45 Arial,Roboto,sans-serif}.top{background:var(--surface);border-bottom:1px solid var(--line);padding:18px max(20px,calc((100vw - 1180px)/2))}.brand{display:flex;align-items:center;gap:9px;font-size:18px;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:var(--blue)}.top p{margin:5px 0 0;color:var(--muted);font-size:13px}.shell{max-width:1180px;margin:0 auto;padding:24px 20px 44px}.notice{margin:0 0 18px;padding:10px 13px;border:1px solid #c9d8f5;border-radius:7px;background:var(--blue-soft);color:#174ea6;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}.card{overflow:hidden;background:var(--surface);border:1px solid var(--line);border-radius:9px;box-shadow:0 1px 2px rgba(60,64,67,.08)}video{display:block;width:100%;aspect-ratio:16/9;background:#101010}.body{padding:13px 14px 15px}.head{display:flex;align-items:center;gap:8px}.kind{padding:3px 8px;border-radius:12px;background:var(--blue-soft);color:#174ea6;font-size:12px;font-weight:600}.filename{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px Consolas,monospace}.task{margin:8px 0 13px;color:var(--muted);font:11px Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.actions{display:flex;gap:9px;flex-wrap:wrap}.button{display:inline-block;padding:7px 11px;border:1px solid var(--blue);border-radius:5px;color:var(--blue);background:#fff;text-decoration:none;font-size:13px;font-weight:500}.button:hover{background:var(--blue-soft)}.button.primary{background:var(--blue);color:#fff}.button.primary:hover{background:#1765cc}@media(max-width:500px){.shell{padding:16px 12px 28px}.top{padding:16px 12px}.grid{grid-template-columns:1fr;gap:12px}}
+  </style>
+</head>
+<body>
+  <header class="top"><div class="brand"><span class="dot"></span>Shared videos</div><p>Only the videos selected for this link are available here.</p></header>
+  <main class="shell">
+    <p class="notice">This link expires at {{ share.expires_at_display }} (server time).</p>
+    <section class="grid" aria-label="Shared videos">
+      {% for item in share["items"] %}
+      <article class="card">
+        <video controls playsinline preload="metadata" src="/share/{{ token | urlencode }}/files/{{ item.item_id | urlencode }}">Your browser does not support HTML5 video playback.</video>
+        <div class="body"><div class="head"><span class="kind">{{ 'Source' if item.file == 'input' else 'Processed output' }}</span><span class="filename" title="{{ item.filename }}">{{ item.filename }}</span></div><p class="task" title="{{ item.task_id }}">Task: {{ item.task_id }}</p><div class="actions"><a class="button primary" href="/share/{{ token | urlencode }}/files/{{ item.item_id | urlencode }}" target="_blank" rel="noopener">Open</a><a class="button" href="/share/{{ token | urlencode }}/files/{{ item.item_id | urlencode }}?download=true">Download</a></div></div>
+      </article>
+      {% endfor %}
+    </section>
+  </main>
+</body>
+</html>

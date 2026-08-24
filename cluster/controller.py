@@ -285,6 +285,12 @@ class ContentTagsRequest(FaceReviewRequest):
     tags: list[str] = Field(min_length=1, max_length=20)
 
 
+class VideoShareRequest(BaseModel):
+    task_ids: list[str] = Field(min_length=1, max_length=100)
+    files: list[str] = Field(min_length=1, max_length=2)
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                local_source_dir: Path | None = None, local_output_dir: Path | None = None,
                s3_ingestor: S3Ingestor | None = None,
@@ -511,6 +517,52 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         filename = Path(str(key or "")).name
         return filename or ("output.mp4" if file == "output" else "input.mp4")
 
+    def stream_task_playback(request: Request, task_id: str, task: dict[str, Any], file: str,
+                             download: bool = False, public: bool = False) -> StreamingResponse:
+        """Proxy S3 media without ever revealing its temporary URL to a client."""
+        url = task_playback_url(task_id, file)
+        upstream_headers = {"User-Agent": "video-mask-controller-playback/1.0"}
+        for header in ("range", "if-range"):
+            value = request.headers.get(header)
+            if value:
+                upstream_headers[header.title()] = value
+        try:
+            upstream = urllib.request.urlopen(urllib.request.Request(url, headers=upstream_headers), timeout=30)
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(status_code=exc.code, detail="S3 playback request failed") from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(status_code=502, detail="unable to reach S3 for playback") from exc
+
+        response_headers: dict[str, str] = {}
+        for header in ("Accept-Ranges", "Content-Length", "Content-Range", "Content-Type", "ETag", "Last-Modified"):
+            value = upstream.headers.get(header)
+            if value:
+                response_headers[header] = value
+        filename = task_playback_filename(task, file)
+        ascii_filename = filename.encode("ascii", "ignore").decode("ascii") or "video.mp4"
+        ascii_filename = ascii_filename.replace('"', "_").replace("\\", "_")
+        disposition = "attachment" if download else "inline"
+        response_headers["Content-Disposition"] = (
+            f'{disposition}; filename="{ascii_filename}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
+        )
+        # Range reads must arrive immediately for HTML5 startup and seeking.
+        response_headers["X-Accel-Buffering"] = "no"
+        if public:
+            response_headers["Cache-Control"] = "private, no-store"
+
+        def stream_video():
+            try:
+                while chunk := upstream.read(PLAYBACK_STREAM_CHUNK_BYTES):
+                    yield chunk
+            finally:
+                upstream.close()
+
+        media_type = response_headers.pop("Content-Type", None)
+        return StreamingResponse(
+            stream_video(), status_code=upstream.getcode(), headers=response_headers, media_type=media_type,
+        )
+
     frame_preview_root = database.parent / "frame-previews"
     frame_preview_jobs: set[tuple[str, str, str]] = set()
     frame_preview_lock = threading.Lock()
@@ -657,56 +709,45 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
-        url = task_playback_url(task_id, file)
-        upstream_headers = {"User-Agent": "video-mask-controller-playback/1.0"}
-        for header in ("range", "if-range"):
-            value = request.headers.get(header)
-            if value:
-                upstream_headers[header.title()] = value
+        return stream_task_playback(request, task_id, task, file, download)
+
+    @app.post("/api/dashboard/shares")
+    def create_dashboard_video_share(request: VideoShareRequest) -> dict[str, Any]:
+        """Create a public, expiring link for explicitly selected task media."""
         try:
-            upstream = urllib.request.urlopen(urllib.request.Request(url, headers=upstream_headers), timeout=30)
-        except urllib.error.HTTPError as exc:
-            raise HTTPException(status_code=exc.code, detail="S3 playback request failed") from exc
-        except urllib.error.URLError as exc:
-            raise HTTPException(status_code=502, detail="unable to reach S3 for playback") from exc
+            share = store.create_video_share(request.task_ids, request.files, request.expires_in_days)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        token = str(share.pop("token"))
+        return {**share, "url": f"/share/{urllib.parse.quote(token, safe='')}"}
 
-        response_headers: dict[str, str] = {}
-        for header in ("Accept-Ranges", "Content-Length", "Content-Range", "Content-Type", "ETag", "Last-Modified"):
-            value = upstream.headers.get(header)
-            if value:
-                response_headers[header] = value
-        filename = task_playback_filename(task, file)
-        ascii_filename = filename.encode("ascii", "ignore").decode("ascii") or "video.mp4"
-        ascii_filename = ascii_filename.replace('"', "_").replace("\\", "_")
-        disposition = "attachment" if download else "inline"
-        response_headers["Content-Disposition"] = (
-            f'{disposition}; filename="{ascii_filename}"; '
-            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
+    def public_share_or_404(token: str) -> dict[str, Any]:
+        share = store.video_share(token)
+        if share is None:
+            # Do not disclose whether this was expired, revoked, or never a
+            # real token.  All invalid public links deliberately look alike.
+            raise HTTPException(status_code=404, detail="shared video link is unavailable")
+        return share
+
+    @app.get("/share/{token}", response_class=HTMLResponse)
+    def public_video_share(request: Request, token: str):
+        share = public_share_or_404(token)
+        share["expires_at_display"] = datetime_local(float(share["expires_at"])).replace("T", " ")
+        response = templates.TemplateResponse(
+            request=request, name="share.html", context={"share": share, "token": token},
         )
-        # The dashboard sits behind Nginx.  Its normal proxy buffering is a
-        # good default for HTML/API responses, but it delays small byte-range
-        # reads that HTML5 players use while starting and seeking.  Tell the
-        # proxy to relay this response as it arrives instead.
-        response_headers["X-Accel-Buffering"] = "no"
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
-        def stream_video():
-            try:
-                # Do not wait for a whole MiB before returning the first data
-                # to the browser.  At a 4 MiB/s path that alone adds 250 ms to
-                # every range response, which makes seeking and startup look
-                # like buffering even when the transfer rate is adequate.
-                while chunk := upstream.read(PLAYBACK_STREAM_CHUNK_BYTES):
-                    yield chunk
-            finally:
-                upstream.close()
-
-        media_type = response_headers.pop("Content-Type", None)
-        return StreamingResponse(
-            stream_video(),
-            status_code=upstream.getcode(),
-            headers=response_headers,
-            media_type=media_type,
-        )
+    @app.get("/share/{token}/files/{item_id}")
+    def public_video_share_file(request: Request, token: str, item_id: str, download: bool = False):
+        item = store.video_share_item(token, item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared video link is unavailable")
+        task = store.task(str(item["task_id"]))
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared video link is unavailable")
+        return stream_task_playback(request, str(item["task_id"]), task, str(item["file"]), download, public=True)
 
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):
