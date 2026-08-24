@@ -443,7 +443,7 @@ class ClusterStore:
 
     @synchronized
     def claim_next_face_review(self, reviewer_id: str, lease_seconds: int) -> dict[str, Any] | None:
-        """Atomically reserve a random completed video missing content tags.
+        """Atomically reserve a random source video missing content tags.
 
         Face presence is a separate optional annotation and must never affect
         which task is selected by the content-label workflow.
@@ -455,8 +455,7 @@ class ClusterStore:
             self._expire_face_review_leases(stamp)
             row = self.conn.execute("""
                 SELECT task_id FROM tasks
-                WHERE status='completed' AND content_tags_json IS NULL
-                  AND source_object_key IS NOT NULL
+                WHERE content_tags_json IS NULL AND source_object_key IS NOT NULL
                   AND face_review_owner IS NULL
                 ORDER BY RANDOM()
                 LIMIT 1
@@ -477,7 +476,7 @@ class ClusterStore:
 
     @synchronized
     def claim_face_review(self, task_id: str, reviewer_id: str, lease_seconds: int) -> dict[str, Any]:
-        """Reserve one completed S3 task for editing its current face label."""
+        """Reserve one S3 source video for editing its current manual labels."""
         stamp = now()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -485,8 +484,8 @@ class ClusterStore:
             task = self.task(task_id)
             if task is None:
                 raise ValueError("task does not exist")
-            if task["status"] != "completed" or not task.get("source_object_key"):
-                raise ValueError("only completed S3 tasks can be manually labelled")
+            if not task.get("source_object_key"):
+                raise ValueError("only S3 source videos can be manually labelled")
             owner = task.get("face_review_owner")
             if owner not in {None, reviewer_id}:
                 raise ValueError("this video is currently being labelled by another browser")
@@ -530,7 +529,7 @@ class ClusterStore:
         cursor = self.conn.execute("""
             UPDATE tasks SET face_annotation=?, face_annotated_at=?, face_review_owner=NULL,
               face_review_lease_until=NULL, updated_at=?
-            WHERE task_id=? AND status='completed' AND face_review_owner=?
+            WHERE task_id=? AND face_review_owner=?
         """, (1 if has_face else 0, stamp, stamp, task_id, reviewer_id))
         if cursor.rowcount != 1:
             self.conn.commit()
@@ -569,7 +568,7 @@ class ClusterStore:
         self._expire_face_review_leases(stamp)
         cursor = self.conn.execute("""
             UPDATE tasks SET content_tags_json=?, content_tagged_at=?, updated_at=?
-            WHERE task_id=? AND status='completed' AND face_review_owner=?
+            WHERE task_id=? AND face_review_owner=?
         """, (json.dumps(normalised_tags, ensure_ascii=False), stamp, stamp, task_id, reviewer_id))
         if cursor.rowcount != 1:
             self.conn.commit()
@@ -654,7 +653,7 @@ class ClusterStore:
         return {"reviews": [
             {
                 "task_id": str(row[0]),
-                "reviewable": row[1] == "completed" and bool(row[2]),
+                "reviewable": bool(row[2]),
                 "has_face": None if row[3] is None else bool(row[3]),
                 "reviewing": bool(row[4] and float(row[5] or 0) > stamp),
                 "lease_until": float(row[5] or 0),

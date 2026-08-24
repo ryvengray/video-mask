@@ -1390,13 +1390,13 @@ if (faceReviewControl) {
 
   async function claimFaceReview() {
     setReviewControls(true);
-    setReviewMessage('Finding a random completed video needing content tags…');
+    setReviewMessage('Finding a random source video needing content tags…');
     try {
       const payload = await reviewRequest('/api/face-reviews/claim', {
         method: 'POST', body: JSON.stringify({reviewer_id: reviewerId}),
       });
       if (!payload.task) {
-        window.alert('No completed videos need content tags right now.');
+        window.alert('No source videos need content tags right now.');
         setReviewControls();
         return;
       }

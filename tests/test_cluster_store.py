@@ -81,12 +81,10 @@ def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypat
     second_payload["source_url"] = "https://storage.example/second.mov"
     second_payload["source_object_key"] = "source/inbox/second.mov"
     second = store.create_task(second_payload)
-    store.conn.execute("UPDATE tasks SET status='completed', finished_at=?", (clock[0],))
-    store.conn.commit()
-
     claimed_first = store.claim_next_face_review("browser-a-unique-id", 300)
     claimed_second = store.claim_next_face_review("browser-b-unique-id", 300)
     assert {claimed_first["task_id"], claimed_second["task_id"]} == {first["task_id"], second["task_id"]}
+    assert {claimed_first["status"], claimed_second["status"]} == {"pending"}
     assert store.claim_next_face_review("browser-c-unique-id", 300) is None
 
     labelled = store.annotate_content_tags(claimed_first["task_id"], "browser-a-unique-id", ["Laundry"])

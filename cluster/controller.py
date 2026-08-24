@@ -1016,7 +1016,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     @app.post("/api/face-reviews/{task_id}/open")
     def open_face_review(task_id: str, request: FaceReviewRequest) -> dict[str, Any]:
-        """Reserve a particular completed video so its label can be viewed or edited."""
+        """Reserve a particular source video so its manual labels can be viewed or edited."""
         try:
             task = store.claim_face_review(task_id, request.reviewer_id, FACE_REVIEW_LEASE_SECONDS)
         except ValueError as exc:
