@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Video library</title>
+  <style>
+    :root{--ink:#202124;--muted:#5f6368;--line:#dadce0;--surface:#fff;--canvas:#f8f9fa;--blue:#1a73e8;--soft:#e8f0fe}*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:14px/1.45 Arial,Roboto,sans-serif}.top{padding:18px max(20px,calc((100vw - 1220px)/2));background:#fff;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:9px;font-size:18px;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:var(--blue)}.top p{margin:5px 0 0;color:var(--muted);font-size:13px}.shell{max-width:1220px;margin:0 auto;padding:22px 20px 44px}.tabs{display:flex;gap:8px;overflow:auto;margin:0 0 18px;padding-bottom:2px}.tab{flex:none;border:1px solid var(--line);border-radius:18px;padding:7px 13px;background:#fff;color:var(--ink);font:500 13px Arial;cursor:pointer}.tab.active{border-color:var(--blue);background:var(--soft);color:#174ea6}.panel[hidden]{display:none}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}.card{overflow:hidden;background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:0 1px 2px rgba(60,64,67,.08)}video{display:block;width:100%;aspect-ratio:16/9;background:#111}.body{padding:13px 14px 15px}.filename{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px Consolas,monospace}.task{margin:7px 0 13px;color:var(--muted);font:11px Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.actions{display:flex;gap:9px;flex-wrap:wrap}.button{display:inline-block;padding:7px 11px;border:1px solid var(--blue);border-radius:5px;background:#fff;color:var(--blue);text-decoration:none;font-size:13px;font-weight:500}.button.primary{background:var(--blue);color:#fff}.empty{padding:18px;background:#fff;border:1px solid var(--line);border-radius:8px;color:var(--muted)}@media(max-width:500px){.top{padding:16px 12px}.shell{padding:16px 12px 28px}.grid{grid-template-columns:1fr;gap:12px}}
+  </style>
+</head>
+<body>
+  <header class="top"><div class="brand"><span class="dot"></span>Video library</div><p>Browse shared completed videos by content category.</p></header>
+  <main class="shell">
+    {% if categories %}
+    <nav class="tabs" role="tablist" aria-label="Content categories">
+      {% for category in categories %}<button class="tab{% if loop.first %} active{% endif %}" type="button" role="tab" data-category="{{ category.category_id }}">{{ category.name }} ({{ category["videos"] | length }})</button>{% endfor %}
+    </nav>
+    {% for category in categories %}
+    <section class="panel" data-category-panel="{{ category.category_id }}"{% if not loop.first %} hidden{% endif %} role="tabpanel">
+      <div class="grid">
+        {% for video in category["videos"] %}
+        <article class="card"><video controls playsinline preload="none" src="/share/categories/{{ share_id | urlencode }}/videos/{{ video.task_id | urlencode }}">Your browser does not support HTML5 video playback.</video><div class="body"><div class="filename" title="{{ video.filename }}">{{ video.filename }}</div><p class="task" title="{{ video.task_id }}">Task: {{ video.task_id }}</p><div class="actions"><a class="button primary" href="/share/categories/{{ share_id | urlencode }}/videos/{{ video.task_id | urlencode }}" target="_blank" rel="noopener">Open</a><a class="button" href="/share/categories/{{ share_id | urlencode }}/videos/{{ video.task_id | urlencode }}?download=true">Download</a></div></div></article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endfor %}
+    {% else %}<p class="empty">No categorized completed videos are available yet.</p>{% endif %}
+  </main>
+  <script>
+    document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(item => item.classList.toggle('active', item === tab));
+      document.querySelectorAll('[data-category-panel]').forEach(panel => { panel.hidden = panel.dataset.categoryPanel !== tab.dataset.category; });
+    }));
+  </script>
+</body>
+</html>

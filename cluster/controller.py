@@ -291,6 +291,18 @@ class VideoShareRequest(BaseModel):
     expires_in_days: int = Field(default=7, ge=1, le=30)
 
 
+class ContentCategoryRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+
+class TaskContentCategoryRequest(BaseModel):
+    category_id: int | None = Field(default=None, ge=1)
+
+
+class ContentCategoryShareRequest(BaseModel):
+    share_id: str = Field(min_length=16, max_length=64)
+
+
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                local_source_dir: Path | None = None, local_output_dir: Path | None = None,
                s3_ingestor: S3Ingestor | None = None,
@@ -748,6 +760,71 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if task is None:
             raise HTTPException(status_code=404, detail="shared video link is unavailable")
         return stream_task_playback(request, str(item["task_id"]), task, str(item["file"]), download, public=True)
+
+    def public_category_catalog_or_404(share_id: str) -> list[dict[str, Any]]:
+        categories = store.public_category_catalog(share_id)
+        if categories is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        return categories
+
+    @app.get("/share/categories/{share_id}", response_class=HTMLResponse)
+    def public_content_category_catalog(request: Request, share_id: str):
+        categories = public_category_catalog_or_404(share_id)
+        response = templates.TemplateResponse(
+            request=request, name="category-share.html",
+            context={"share_id": share_id, "categories": categories},
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.get("/share/categories/{share_id}/videos/{task_id}")
+    def public_content_category_video(request: Request, share_id: str, task_id: str, download: bool = False):
+        item = store.public_category_catalog_item(share_id, task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        return stream_task_playback(request, task_id, task, str(item["file"]), download, public=True)
+
+    @app.get("/api/dashboard/content-categories")
+    def list_content_categories(task_ids: str = "") -> dict[str, Any]:
+        selected = tuple(dict.fromkeys(value for value in task_ids.split(",") if value))[:100]
+        return {
+            "categories": store.content_categories(),
+            "assignments": store.task_content_categories(selected),
+            "share_id": store.category_share_id(),
+        }
+
+    @app.post("/api/dashboard/content-categories")
+    def create_content_category(request: ContentCategoryRequest) -> dict[str, Any]:
+        try:
+            return store.create_content_category(request.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/dashboard/content-categories/{category_id}")
+    def delete_content_category(category_id: int) -> dict[str, bool]:
+        try:
+            store.delete_content_category(category_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"deleted": True}
+
+    @app.put("/api/dashboard/tasks/{task_id}/content-category")
+    def set_dashboard_task_content_category(task_id: str, request: TaskContentCategoryRequest) -> dict[str, Any]:
+        try:
+            return store.set_task_content_category(task_id, request.category_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/dashboard/content-category-share")
+    def set_content_category_share(request: ContentCategoryShareRequest) -> dict[str, str]:
+        try:
+            share_id = store.set_category_share_id(request.share_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"share_id": share_id, "url": f"/share/categories/{urllib.parse.quote(share_id, safe='')}"}
 
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):

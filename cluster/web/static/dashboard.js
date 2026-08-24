@@ -571,6 +571,212 @@ async function submitTaskShare(event) {
 ensureTaskShareSelection();
 document.addEventListener('keydown', event => { if (event.key === 'Escape') closeTaskShareModal(); });
 
+let contentCategoryState = {categories: [], assignments: {}, shareId: ''};
+let contentCategoryModal;
+
+function contentCategoryTaskIds() {
+  return [...new Set([...document.querySelectorAll('.file-play[data-task-id]')]
+    .map(button => button.dataset.taskId).filter(Boolean))];
+}
+
+function renderContentCategoryCells() {
+  document.querySelectorAll('.content-category-cell').forEach(cell => {
+    const taskId = cell.dataset.taskId;
+    const selected = contentCategoryState.assignments[taskId];
+    const select = document.createElement('select');
+    select.className = 'content-category-select';
+    select.setAttribute('aria-label', `Set content category for task ${taskId}`);
+    select.append(new Option('Unclassified', ''));
+    contentCategoryState.categories.forEach(category => {
+      select.append(new Option(category.name, String(category.category_id), false,
+        Number(selected) === Number(category.category_id)));
+    });
+    select.addEventListener('change', async () => {
+      select.disabled = true;
+      try {
+        const response = await fetch(`/api/dashboard/tasks/${encodeURIComponent(taskId)}/content-category`, {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({category_id: select.value ? Number(select.value) : null}),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+        contentCategoryState.assignments[taskId] = payload.content_category_id ?? null;
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : 'Unable to set content category.');
+        select.value = selected ? String(selected) : '';
+      } finally {
+        select.disabled = false;
+      }
+    });
+    cell.replaceChildren(select);
+  });
+}
+
+function ensureContentCategoryColumn() {
+  if (!taskTable) return;
+  const table = taskTable.querySelector('table');
+  const header = table?.querySelector('thead tr');
+  if (!table || !header) return;
+  if (!header.querySelector('.content-category-heading')) {
+    const cell = document.createElement('th');
+    cell.className = 'content-category-heading';
+    cell.textContent = 'Content category';
+    header.insertBefore(cell, header.children[2] || null);
+  }
+  table.querySelectorAll('tbody tr').forEach(row => {
+    if (row.querySelector('.content-category-cell')) return;
+    const playButton = row.querySelector('.file-play[data-task-id]');
+    if (!playButton) {
+      row.querySelector('td')?.setAttribute('colspan', String(header.children.length));
+      return;
+    }
+    const cell = document.createElement('td');
+    cell.className = 'content-category-cell';
+    cell.dataset.taskId = playButton.dataset.taskId;
+    row.insertBefore(cell, row.children[2] || null);
+  });
+}
+
+async function loadContentCategories() {
+  ensureContentCategoryColumn();
+  const taskIds = contentCategoryTaskIds();
+  try {
+    const response = await fetch(`/api/dashboard/content-categories?task_ids=${encodeURIComponent(taskIds.join(','))}`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    contentCategoryState = {
+      categories: Array.isArray(payload.categories) ? payload.categories : [],
+      assignments: payload.assignments || {}, shareId: payload.share_id || '',
+    };
+    renderContentCategoryCells();
+    renderContentCategoryManager();
+  } catch (error) {
+    console.warn('[video-mask] unable to load content categories', error);
+  }
+}
+
+function ensureContentCategoryManager() {
+  if (document.getElementById('content-category-manage')) return;
+  const button = document.createElement('button');
+  button.id = 'content-category-manage';
+  button.type = 'button';
+  button.className = 'task-search-button content-category-manage-button';
+  button.textContent = 'Manage content categories';
+  button.addEventListener('click', openContentCategoryModal);
+  const exportButton = document.querySelector('.task-export-button');
+  (exportButton?.parentElement || document.querySelector('.section-head'))?.append(button);
+}
+
+function closeContentCategoryModal() {
+  if (!contentCategoryModal || contentCategoryModal.hidden) return;
+  contentCategoryModal.hidden = true;
+  scheduleAutoRefresh();
+}
+
+function renderContentCategoryManager() {
+  if (!contentCategoryModal) return;
+  const list = contentCategoryModal.querySelector('#content-category-list');
+  list.replaceChildren();
+  if (!contentCategoryState.categories.length) {
+    list.textContent = 'No categories yet.';
+  } else {
+    contentCategoryState.categories.forEach(category => {
+      const row = document.createElement('div');
+      row.className = 'content-category-row';
+      const label = document.createElement('span');
+      label.textContent = `${category.name} (${category.task_count} task${category.task_count === 1 ? '' : 's'})`;
+      const remove = document.createElement('button');
+      remove.type = 'button'; remove.className = 'play-btn'; remove.textContent = 'Delete';
+      remove.disabled = category.task_count > 0;
+      remove.title = category.task_count ? 'Remove this category from its tasks before deleting it.' : 'Delete category';
+      remove.addEventListener('click', () => deleteContentCategory(category.category_id));
+      row.append(label, remove); list.append(row);
+    });
+  }
+  const shareInput = contentCategoryModal.querySelector('#content-category-share-id');
+  if (document.activeElement !== shareInput) shareInput.value = contentCategoryState.shareId;
+}
+
+function ensureContentCategoryModal() {
+  if (contentCategoryModal) return;
+  document.body.insertAdjacentHTML('beforeend', `
+    <div id="content-category-modal" class="play-modal" hidden>
+      <div class="play-modal-backdrop" data-content-category-close></div>
+      <div class="play-modal-card content-category-modal-card" role="dialog" aria-modal="true" aria-labelledby="content-category-modal-title">
+        <div class="play-modal-head"><div><h3 id="content-category-modal-title">Content categories</h3><p class="play-modal-sub">One category can be selected for each task.</p></div><button class="play-modal-close" type="button" data-content-category-close aria-label="Close">&times;</button></div>
+        <form id="content-category-add-form" class="content-category-add-form"><input id="content-category-name" type="text" maxlength="64" placeholder="e.g. Laundry" required><button class="play-btn play-btn-open" type="submit">Add category</button></form>
+        <div id="content-category-list" class="content-category-list"></div>
+        <section class="content-category-public"><h4>Public category page</h4><p class="play-modal-note">This page is public. Use a hard-to-guess ID (16–64 letters, numbers, hyphens, or underscores).</p><div class="content-category-share-entry"><input id="content-category-share-id" type="text" maxlength="64" placeholder="special share ID"><button id="content-category-share-generate" class="play-btn" type="button">Generate</button><button id="content-category-share-save" class="play-btn play-btn-open" type="button">Save</button></div><div id="content-category-share-link-area" hidden><input id="content-category-share-link" class="task-share-link" type="text" readonly aria-label="Public category page link"><button id="content-category-share-copy" class="play-btn play-btn-open" type="button">Copy link</button></div><p id="content-category-message" class="play-modal-note"></p></section>
+        <div class="play-modal-actions"><button class="play-btn" type="button" data-content-category-close>Close</button></div>
+      </div>
+    </div>`);
+  contentCategoryModal = document.getElementById('content-category-modal');
+  contentCategoryModal.querySelectorAll('[data-content-category-close]').forEach(item => item.addEventListener('click', closeContentCategoryModal));
+  contentCategoryModal.querySelector('#content-category-add-form').addEventListener('submit', createContentCategory);
+  contentCategoryModal.querySelector('#content-category-share-generate').addEventListener('click', () => {
+    const value = crypto.randomUUID ? crypto.randomUUID().replaceAll('-', '') : Math.random().toString(36).slice(2).padEnd(24, '0');
+    contentCategoryModal.querySelector('#content-category-share-id').value = value;
+  });
+  contentCategoryModal.querySelector('#content-category-share-save').addEventListener('click', saveContentCategoryShare);
+  contentCategoryModal.querySelector('#content-category-share-copy').addEventListener('click', () => {
+    const input = contentCategoryModal.querySelector('#content-category-share-link');
+    copyShareLink(input.value, contentCategoryModal.querySelector('#content-category-share-copy'));
+  });
+}
+
+function openContentCategoryModal() {
+  ensureContentCategoryModal();
+  renderContentCategoryManager();
+  contentCategoryModal.querySelector('#content-category-share-link-area').hidden = true;
+  contentCategoryModal.querySelector('#content-category-message').textContent = '';
+  contentCategoryModal.hidden = false;
+  pauseAutoRefresh();
+}
+
+async function createContentCategory(event) {
+  event.preventDefault();
+  const input = contentCategoryModal.querySelector('#content-category-name');
+  const message = contentCategoryModal.querySelector('#content-category-message');
+  try {
+    const response = await fetch('/api/dashboard/content-categories', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: input.value}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    input.value = ''; message.textContent = 'Category added.'; await loadContentCategories();
+  } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to add category.'; }
+}
+
+async function deleteContentCategory(categoryId) {
+  const message = contentCategoryModal.querySelector('#content-category-message');
+  try {
+    const response = await fetch(`/api/dashboard/content-categories/${encodeURIComponent(categoryId)}`, {method: 'DELETE'});
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    message.textContent = 'Category deleted.'; await loadContentCategories();
+  } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to delete category.'; }
+}
+
+async function saveContentCategoryShare() {
+  const input = contentCategoryModal.querySelector('#content-category-share-id');
+  const message = contentCategoryModal.querySelector('#content-category-message');
+  try {
+    const response = await fetch('/api/dashboard/content-category-share', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({share_id: input.value.trim()}),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    contentCategoryState.shareId = payload.share_id;
+    contentCategoryModal.querySelector('#content-category-share-link').value = new URL(payload.url, window.location.origin).href;
+    contentCategoryModal.querySelector('#content-category-share-link-area').hidden = false;
+    message.textContent = 'Public category page saved.';
+  } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to save public page.'; }
+}
+
+ensureContentCategoryManager();
+loadContentCategories();
+document.addEventListener('keydown', event => { if (event.key === 'Escape') closeContentCategoryModal(); });
+
 function configureManualLabelFilters() {
   const form = document.getElementById('task-status-filter');
   const oldFilter = form?.querySelector('.annotation-filter');

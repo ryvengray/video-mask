@@ -181,6 +181,37 @@ def test_video_share_is_opaque_expiring_and_can_be_revoked(tmp_path: Path, monke
     store.close()
 
 
+def test_content_categories_assign_one_per_task_and_build_public_catalog(tmp_path: Path):
+    store = new_store(tmp_path)
+    task = store.create_task(task_payload())
+    store.conn.execute(
+        "UPDATE tasks SET status='completed', output_object_key='output/masked/input.mp4' WHERE task_id=?",
+        (task["task_id"],),
+    )
+    store.conn.commit()
+    laundry = store.create_content_category("  Laundry ")
+    rooms = store.create_content_category("Tidy room")
+    updated = store.set_task_content_category(task["task_id"], laundry["category_id"])
+    assert updated["content_category_id"] == laundry["category_id"]
+    assert store.task_content_categories((task["task_id"],))[task["task_id"]] == laundry["category_id"]
+    assert [(item["name"], item["task_count"]) for item in store.content_categories()] == [
+        ("Laundry", 1), ("Tidy room", 0),
+    ]
+    with pytest.raises(ValueError, match="remove this category"):
+        store.delete_content_category(laundry["category_id"])
+
+    share_id = "customer_video_library_2026"
+    assert store.set_category_share_id(share_id) == share_id
+    catalog = store.public_category_catalog(share_id)
+    assert catalog is not None
+    assert catalog[0]["name"] == "Laundry"
+    assert catalog[0]["videos"][0]["file"] == "output"
+    assert store.public_category_catalog("wrong_share_id") is None
+    item = store.public_category_catalog_item(share_id, task["task_id"])
+    assert item and item["filename"] == "input.mp4"
+    store.close()
+
+
 def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     connection = sqlite3.connect(database)

@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import re
 from collections import Counter
 from functools import wraps
 from pathlib import Path
@@ -112,6 +113,11 @@ class ClusterStore:
             arguments_json TEXT NOT NULL DEFAULT '[]',
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS content_categories (
+            category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS video_shares (
             share_id TEXT PRIMARY KEY,
             token_hash TEXT NOT NULL UNIQUE,
@@ -148,6 +154,7 @@ class ClusterStore:
             ("face_annotated_at", "REAL"),
             ("content_tags_json", "TEXT"),
             ("content_tagged_at", "REAL"),
+            ("content_category_id", "INTEGER"),
             ("face_review_owner", "TEXT"),
             ("face_review_lease_until", "REAL"),
         ):
@@ -162,6 +169,10 @@ class ClusterStore:
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_content_review
               ON tasks(status, content_tags_json, face_review_owner, finished_at)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_content_category
+              ON tasks(content_category_id, status, finished_at)
         """)
         self.conn.commit()
 
@@ -712,6 +723,144 @@ class ClusterStore:
     @synchronized
     def task(self, task_id: str) -> dict[str, Any] | None:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
+
+    @staticmethod
+    def _normalise_content_category(name: str) -> str:
+        category = " ".join(str(name).split())
+        if not category or len(category) > 64:
+            raise ValueError("content category must contain 1 to 64 characters")
+        return category
+
+    @synchronized
+    def content_categories(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("""
+            SELECT categories.category_id, categories.name, COUNT(tasks.task_id) AS task_count
+            FROM content_categories AS categories
+            LEFT JOIN tasks ON tasks.content_category_id=categories.category_id
+            GROUP BY categories.category_id, categories.name
+            ORDER BY categories.name COLLATE NOCASE, categories.category_id
+        """).fetchall()
+        return [{"category_id": int(row[0]), "name": str(row[1]), "task_count": int(row[2])} for row in rows]
+
+    @synchronized
+    def create_content_category(self, name: str) -> dict[str, Any]:
+        category = self._normalise_content_category(name)
+        try:
+            cursor = self.conn.execute(
+                "INSERT INTO content_categories(name, created_at) VALUES(?, ?)", (category, now()),
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            self.conn.rollback()
+            raise ValueError("a content category with this name already exists") from exc
+        return {"category_id": int(cursor.lastrowid), "name": category, "task_count": 0}
+
+    @synchronized
+    def delete_content_category(self, category_id: int) -> None:
+        assigned = self.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE content_category_id=?", (category_id,)
+        ).fetchone()[0]
+        if assigned:
+            raise ValueError("remove this category from its tasks before deleting it")
+        cursor = self.conn.execute("DELETE FROM content_categories WHERE category_id=?", (category_id,))
+        self.conn.commit()
+        if cursor.rowcount != 1:
+            raise ValueError("content category does not exist")
+
+    @synchronized
+    def set_task_content_category(self, task_id: str, category_id: int | None) -> dict[str, Any]:
+        if self.task(task_id) is None:
+            raise ValueError("task does not exist")
+        if category_id is not None:
+            exists = self.conn.execute(
+                "SELECT 1 FROM content_categories WHERE category_id=?", (category_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError("content category does not exist")
+        self.conn.execute(
+            "UPDATE tasks SET content_category_id=?, updated_at=? WHERE task_id=?",
+            (category_id, now(), task_id),
+        )
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def task_content_categories(self, task_ids: tuple[str, ...]) -> dict[str, int | None]:
+        if not task_ids:
+            return {}
+        rows = self.conn.execute(
+            "SELECT task_id, content_category_id FROM tasks WHERE task_id IN ("
+            + ", ".join("?" for _ in task_ids) + ")", task_ids,
+        ).fetchall()
+        return {str(row[0]): (None if row[1] is None else int(row[1])) for row in rows}
+
+    @synchronized
+    def category_share_id(self) -> str:
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings WHERE setting_key='content_category_share_id'"
+        ).fetchone()
+        return str(row[0]) if row else ""
+
+    @synchronized
+    def set_category_share_id(self, share_id: str) -> str:
+        value = share_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", value):
+            raise ValueError("share ID must be 16 to 64 letters, numbers, hyphens, or underscores")
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES('content_category_share_id', ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (value, now()))
+        self.conn.commit()
+        return value
+
+    @synchronized
+    def public_category_catalog(self, share_id: str) -> list[dict[str, Any]] | None:
+        configured = self.category_share_id()
+        if not configured or configured != share_id:
+            return None
+        rows = self.conn.execute("""
+            SELECT categories.category_id, categories.name, tasks.task_id,
+              tasks.source_object_key, tasks.output_object_key
+            FROM content_categories AS categories
+            JOIN tasks ON tasks.content_category_id=categories.category_id
+            WHERE tasks.status='completed'
+              AND (tasks.source_object_key IS NOT NULL OR tasks.output_object_key IS NOT NULL)
+            ORDER BY categories.name COLLATE NOCASE, tasks.finished_at DESC, tasks.task_id DESC
+        """).fetchall()
+        grouped: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            category_id = int(row[0])
+            category = grouped.setdefault(category_id, {
+                "category_id": category_id, "name": str(row[1]), "videos": [],
+            })
+            file = "output" if row[4] else "input"
+            key = row[4] if file == "output" else row[3]
+            if not key:
+                continue
+            category["videos"].append({
+                "task_id": str(row[2]), "file": file,
+                "filename": Path(str(key)).name or "video.mp4",
+            })
+        return list(grouped.values())
+
+    @synchronized
+    def public_category_catalog_item(self, share_id: str, task_id: str) -> dict[str, Any] | None:
+        configured = self.category_share_id()
+        if not configured or configured != share_id:
+            return None
+        row = self.conn.execute("""
+            SELECT tasks.source_object_key, tasks.output_object_key
+            FROM tasks
+            WHERE task_id=? AND status='completed' AND content_category_id IS NOT NULL
+              AND (source_object_key IS NOT NULL OR output_object_key IS NOT NULL)
+        """, (task_id,)).fetchone()
+        if row is None:
+            return None
+        file = "output" if row[1] else "input"
+        key = row[1] if file == "output" else row[0]
+        return {"task_id": task_id, "file": file, "filename": Path(str(key)).name or "video.mp4"}
 
     @synchronized
     def create_video_share(self, task_ids: list[str], files: list[str],
