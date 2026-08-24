@@ -108,22 +108,40 @@ class S3Ingestor:
         with self._lock:
             if time.monotonic() - self._last_scan < self.poll_seconds:
                 return 0
-            created = self._scan()
+            created = self._scan(self.source_prefix)
             self._last_scan = time.monotonic()
             return created
 
     def scan(self) -> int:
-        """Scan immediately, serializing with scheduled and request-triggered scans."""
+        """Scan the configured source prefix immediately."""
         with self._lock:
-            created = self._scan()
+            created = self._scan(self.source_prefix)
             self._last_scan = time.monotonic()
             return created
 
-    def _scan(self) -> int:
+    @staticmethod
+    def normalise_scan_prefix(value: str) -> str:
+        """Turn a human-friendly S3 folder into a safe S3 listing prefix."""
+        prefix = value.strip().strip("/")
+        if len(prefix) > 1024 or "\x00" in prefix:
+            raise ValueError("source prefix is invalid")
+        return prefix
+
+    def scan_prefix(self, source_prefix: str = "") -> int:
+        """Run a one-off scan under ``source_prefix`` without changing scheduled scans.
+
+        An empty value deliberately means the entire source bucket, even when
+        the Controller's scheduled scanner has a configured base prefix.
+        """
+        prefix = self.normalise_scan_prefix(source_prefix)
+        with self._lock:
+            return self._scan(prefix)
+
+    def _scan(self, source_prefix: str) -> int:
         """Scan while ``_lock`` is held by the caller."""
         created = 0
         paginator = self.source_client.get_paginator("list_objects_v2")
-        prefix = f"{self.source_prefix}/" if self.source_prefix else ""
+        prefix = f"{source_prefix}/" if source_prefix else ""
         for page in paginator.paginate(Bucket=self.source_bucket, Prefix=prefix):
             for object_info in page.get("Contents", []):
                 key = str(object_info["Key"])

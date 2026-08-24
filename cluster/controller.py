@@ -1127,13 +1127,17 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return {"configured": True, "enabled": s3_ingest_enabled}
 
     @app.post("/api/admin/s3-ingest/scan")
-    def scan_s3_ingest_once() -> dict[str, bool | int]:
-        """Run one S3 discovery pass even while scheduled ingestion is paused."""
+    def scan_s3_ingest_once(source_prefix: str = "") -> dict[str, bool | int | str]:
+        """Run one S3 discovery pass, optionally restricted to a source-bucket folder."""
         if not s3_ingestor:
             raise HTTPException(status_code=409, detail="S3 ingestion is not configured on this Controller")
-        created = s3_ingestor.scan()
-        logger.warning("S3 ingestion manual scan created %d task(s)", created)
-        return {"configured": True, "enabled": s3_ingest_is_enabled(), "created": created}
+        try:
+            prefix = s3_ingestor.normalise_scan_prefix(source_prefix)
+            created = s3_ingestor.scan_prefix(prefix)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.warning("S3 ingestion manual scan prefix=%r created %d task(s)", prefix or "/", created)
+        return {"configured": True, "enabled": s3_ingest_is_enabled(), "source_prefix": prefix, "created": created}
 
     @app.get("/api/tasks")
     def list_tasks(limit: int = 100, offset: int = 0, status: str | None = None,

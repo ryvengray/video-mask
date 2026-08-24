@@ -78,6 +78,35 @@ def test_s3_output_key_preserves_source_relative_directories(tmp_path: Path):
     store.close()
 
 
+def test_manual_s3_scan_prefix_is_normalised_and_does_not_change_scheduled_prefix(tmp_path: Path):
+    class TrackingPaginator(FakePaginator):
+        def __init__(self):
+            self.calls = []
+
+        def paginate(self, **kwargs):
+            self.calls.append(kwargs)
+            return super().paginate(**kwargs)
+
+    class TrackingS3(FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.paginator = TrackingPaginator()
+
+        def get_paginator(self, name):
+            assert name == "list_objects_v2"
+            return self.paginator
+
+    store = ClusterStore(tmp_path / "controller.sqlite3")
+    client = TrackingS3()
+    ingestor = S3Ingestor(store, "source-bucket", "incoming/", "output-bucket", "masked/",
+                          "us-east-2", client=client)
+    assert ingestor.scan_prefix("/test/v3/") == 1
+    assert client.paginator.calls[-1] == {"Bucket": "source-bucket", "Prefix": "test/v3/"}
+    # The temporary scan target does not replace the scheduled source prefix.
+    assert ingestor.source_prefix == "incoming"
+    store.close()
+
+
 def test_s3_separate_output_region_uses_its_own_client(tmp_path: Path):
     store = ClusterStore(tmp_path / "controller.sqlite3")
     ingestor = S3Ingestor(store, "source-bucket", "incoming/", "output-bucket", "masked/",
@@ -181,7 +210,12 @@ def test_controller_manual_s3_scan_runs_while_scheduled_ingestion_is_paused(tmp_
         def __init__(self):
             self.scans = 0
 
-        def scan(self):
+        @staticmethod
+        def normalise_scan_prefix(value):
+            return value.strip().strip("/")
+
+        def scan_prefix(self, source_prefix):
+            assert source_prefix == "test/v3"
             self.scans += 1
             return 3
 
@@ -193,5 +227,7 @@ def test_controller_manual_s3_scan_runs_while_scheduled_ingestion_is_paused(tmp_
     app = create_app(database, "a" * 16, s3_ingestor=ingestor)  # type: ignore[arg-type]
     route = next(route for route in app.routes if route.path == "/api/admin/s3-ingest/scan")
 
-    assert route.endpoint() == {"configured": True, "enabled": False, "created": 3}
+    assert route.endpoint("/test/v3/") == {
+        "configured": True, "enabled": False, "source_prefix": "test/v3", "created": 3,
+    }
     assert ingestor.scans == 1
