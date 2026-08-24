@@ -901,6 +901,8 @@ if (faceReviewControl) {
   const contentTagOptions = document.getElementById('content-tag-options');
   const contentTagSuggestions = document.getElementById('content-tag-suggestions');
   const contentTagMessage = document.getElementById('content-tag-message');
+  const reviewContentCategory = document.getElementById('face-review-content-category');
+  const reviewContentCategoryMessage = document.getElementById('face-review-content-category-message');
   const modalAnnotation = document.getElementById('play-modal-annotation');
   const modalAnnotationStatus = document.getElementById('play-modal-annotation-status');
   const modalHasFaceButton = document.getElementById('play-modal-has-face');
@@ -913,6 +915,9 @@ if (faceReviewControl) {
   const modalContentTagOptions = document.getElementById('play-modal-content-tag-options');
   const modalContentTagSuggestions = document.getElementById('play-modal-content-tag-suggestions');
   const modalContentTagMessage = document.getElementById('play-modal-content-tag-message');
+  const modalCategoryControl = document.getElementById('play-modal-category-control');
+  const modalContentCategory = document.getElementById('play-modal-content-category');
+  const modalContentCategoryMessage = document.getElementById('play-modal-content-category-message');
   let heartbeatTimer;
   let framePreviewTimer;
   let modalHeartbeatTimer;
@@ -944,6 +949,7 @@ if (faceReviewControl) {
     contentTagInput.disabled = busy || !activeFaceReview;
     contentTagAddButton.disabled = busy || !activeFaceReview;
     contentTagsSaveButton.disabled = busy || !activeFaceReview || !selectedContentTags.length;
+    reviewContentCategory.disabled = busy || !activeFaceReview;
   }
 
   function normaliseContentTag(value) {
@@ -1035,6 +1041,70 @@ if (faceReviewControl) {
     modalContentTagInput.disabled = !enabled;
     modalContentTagAddButton.disabled = !enabled;
     modalContentTagsSaveButton.disabled = !enabled || !selectedModalContentTags.length;
+    modalContentCategory.disabled = !enabled;
+  }
+
+  function renderReviewContentCategoryOptions(select, selectedCategoryId) {
+    if (!select) return;
+    const selected = selectedCategoryId == null ? '' : String(selectedCategoryId);
+    select.replaceChildren(new Option('未分类', ''));
+    contentCategoryState.categories.forEach(category => {
+      select.append(new Option(category.name, String(category.category_id)));
+    });
+    select.value = selected;
+  }
+
+  async function loadReviewContentCategory(task, select, message, refreshControls) {
+    if (!task?.task_id) return;
+    const taskId = task.task_id;
+    select.disabled = true;
+    message.textContent = '加载分类中…';
+    try {
+      const response = await fetch(
+        `/api/dashboard/content-categories?task_ids=${encodeURIComponent(taskId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+      contentCategoryState.categories = Array.isArray(payload.categories) ? payload.categories : [];
+      Object.assign(contentCategoryState.assignments, payload.assignments || {});
+      contentCategoryState.shareId = payload.share_id || contentCategoryState.shareId;
+      task.content_category_id = payload.assignments?.[taskId] ?? null;
+      renderContentCategoryCells();
+      renderReviewContentCategoryOptions(select, task.content_category_id);
+      message.textContent = contentCategoryState.categories.length
+        ? '' : '请先在任务列表中创建内容分类。';
+    } catch (error) {
+      message.textContent = error instanceof Error ? error.message : '无法加载内容分类。';
+      renderReviewContentCategoryOptions(select, task.content_category_id);
+    } finally {
+      refreshControls();
+    }
+  }
+
+  async function saveReviewContentCategory(task, select, message, refreshControls) {
+    if (!task?.task_id) return;
+    const taskId = task.task_id;
+    const previous = task.content_category_id ?? null;
+    select.disabled = true;
+    message.textContent = '保存分类中…';
+    try {
+      const response = await fetch(`/api/dashboard/tasks/${encodeURIComponent(taskId)}/content-category`, {
+        method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({category_id: select.value ? Number(select.value) : null}),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+      task.content_category_id = payload.content_category_id ?? null;
+      contentCategoryState.assignments[taskId] = task.content_category_id;
+      renderContentCategoryCells();
+      renderReviewContentCategoryOptions(select, task.content_category_id);
+      message.textContent = '内容分类已保存。';
+    } catch (error) {
+      renderReviewContentCategoryOptions(select, previous);
+      message.textContent = error instanceof Error ? error.message : '无法保存内容分类。';
+    } finally {
+      refreshControls();
+    }
   }
 
   function renderModalContentTags() {
@@ -1127,7 +1197,7 @@ if (faceReviewControl) {
         {method: 'POST', body: JSON.stringify({reviewer_id: reviewerId})},
       );
       modalAnnotationStatus.textContent = modalAnnotationText(task.face_annotation);
-      activeModalReview = {task_id: reopened.task.task_id};
+      activeModalReview = {...activeModalReview, ...reopened.task};
       setSelectedModalContentTags(reopened.task.content_tags || []);
       refreshFaceReviewStatuses();
     } catch (error) {
@@ -1168,8 +1238,10 @@ if (faceReviewControl) {
     activeModalReview = null;
     modalAnnotation.hidden = false;
     modalContentTags.hidden = false;
+    modalCategoryControl.hidden = false;
     modalAnnotationStatus.textContent = 'Opening manual label…';
     modalContentTagMessage.textContent = 'Opening content labels…';
+    modalContentCategoryMessage.textContent = 'Opening content category…';
     setSelectedModalContentTags([]);
     setModalAnnotationControls(false);
     try {
@@ -1183,11 +1255,16 @@ if (faceReviewControl) {
         });
         return;
       }
-      activeModalReview = {task_id: taskId};
+      activeModalReview = {...payload.task};
       modalAnnotationStatus.textContent = modalAnnotationText(payload.task.face_annotation);
       setSelectedModalContentTags(payload.task.content_tags || []);
       modalContentTagMessage.textContent = 'Choose an existing tag or enter a new one. Multiple tags are supported.';
       setModalAnnotationControls(true);
+      await loadReviewContentCategory(
+        activeModalReview, modalContentCategory, modalContentCategoryMessage,
+        () => setModalAnnotationControls(Boolean(activeModalReview)),
+      );
+      if (token !== modalReviewToken || playModal.hidden || !activeModalReview) return;
       modalHeartbeatTimer = window.setInterval(heartbeatModalReview, 30_000);
     } catch (error) {
       modalAnnotationStatus.textContent = error instanceof Error
@@ -1204,7 +1281,10 @@ if (faceReviewControl) {
     activeModalReview = null;
     modalAnnotation.hidden = true;
     modalContentTags.hidden = true;
+    modalCategoryControl.hidden = true;
     setSelectedModalContentTags([]);
+    renderReviewContentCategoryOptions(modalContentCategory, null);
+    modalContentCategoryMessage.textContent = '';
     setModalAnnotationControls(false);
     if (!review) return;
     fetch(`/api/face-reviews/${encodeURIComponent(review.task_id)}/release`, {
@@ -1227,6 +1307,8 @@ if (faceReviewControl) {
     reviewDetails.hidden = true;
     activeFaceReview = null;
     setSelectedContentTags([]);
+    renderReviewContentCategoryOptions(reviewContentCategory, null);
+    reviewContentCategoryMessage.textContent = '';
     activeBadge.className = 'badge muted';
     activeBadge.textContent = 'No active review';
     setReviewControls();
@@ -1329,6 +1411,11 @@ if (faceReviewControl) {
         : (payload.task.source_object_key || 'input video');
       setReviewMessage(`Reserved for this browser. Playing ${payload.playback_file} video: ${filename}`);
       setReviewControls();
+      await loadReviewContentCategory(
+        activeFaceReview, reviewContentCategory, reviewContentCategoryMessage,
+        () => setReviewControls(),
+      );
+      if (!activeFaceReview || activeFaceReview.task_id !== payload.task.task_id) return;
       pauseAutoRefresh();
       heartbeatTimer = window.setInterval(heartbeatFaceReview, 30_000);
       showFaceReviewTab('video');
@@ -1470,6 +1557,9 @@ if (faceReviewControl) {
     }
   });
   contentTagsSaveButton.addEventListener('click', saveContentTags);
+  reviewContentCategory.addEventListener('change', () => saveReviewContentCategory(
+    activeFaceReview, reviewContentCategory, reviewContentCategoryMessage, () => setReviewControls(),
+  ));
   releaseButton.addEventListener('click', releaseFaceReview);
   modalHasFaceButton.addEventListener('click', () => saveModalAnnotation(true));
   modalNoFaceButton.addEventListener('click', () => saveModalAnnotation(false));
@@ -1481,6 +1571,10 @@ if (faceReviewControl) {
     }
   });
   modalContentTagsSaveButton.addEventListener('click', saveModalContentTags);
+  modalContentCategory.addEventListener('change', () => saveReviewContentCategory(
+    activeModalReview, modalContentCategory, modalContentCategoryMessage,
+    () => setModalAnnotationControls(Boolean(activeModalReview)),
+  ));
   window.addEventListener('pagehide', () => {
     if (!activeFaceReview) return;
     fetch(`/api/face-reviews/${encodeURIComponent(activeFaceReview.task_id)}/release`, {
