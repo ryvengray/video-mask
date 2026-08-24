@@ -587,6 +587,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
     frame_preview_root = database.parent / "frame-previews"
     frame_preview_jobs: set[tuple[str, str, str]] = set()
     frame_preview_lock = threading.Lock()
+    category_cover_root = database.parent / "category-share-covers"
+    category_cover_jobs: set[tuple[str, str, str]] = set()
+    category_cover_lock = threading.Lock()
 
     def frame_preview_dir(task_id: str, file: str) -> Path:
         # Task IDs originate from an API, so keep cache paths independent of
@@ -668,6 +671,95 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         finally:
             with frame_preview_lock:
                 frame_preview_jobs.discard(job_key)
+
+    def category_cover_dir(task_id: str, file: str) -> Path:
+        return category_cover_root / hashlib.sha256(task_id.encode("utf-8")).hexdigest() / file
+
+    def category_cover_fingerprint(task: dict[str, Any], file: str) -> str:
+        return "|".join(str(value or "") for value in (
+            file, task.get("output_object_key") if file == "output" else task.get("source_object_key"),
+            task.get("output_sha256") if file == "output" else task.get("source_sha256"),
+            task.get("finished_at") if file == "output" else task.get("created_at"),
+        ))
+
+    def category_cover_manifest(directory: Path) -> dict[str, Any]:
+        try:
+            return json.loads((directory / "manifest.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def write_category_cover_manifest(directory: Path, payload: dict[str, Any]) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / "manifest.json.partial"
+        temporary.write_text(json.dumps(payload, separators=(",", ":")))
+        temporary.replace(directory / "manifest.json")
+
+    def generate_category_cover(task_id: str, file: str, source_url: str, fingerprint: str,
+                                duration_hint: float | None) -> None:
+        """Generate one share-page poster frame, never exposing the S3 URL."""
+        directory = category_cover_dir(task_id, file)
+        job_key = (task_id, file, fingerprint)
+        manifest: dict[str, Any] = {"state": "running", "fingerprint": fingerprint}
+        try:
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True, exist_ok=True)
+            duration_seconds = duration_hint
+            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", source_url],
+                    text=True, capture_output=True, check=False, timeout=60,
+                )
+                try:
+                    duration_seconds = float(probe.stdout.strip())
+                except ValueError as exc:
+                    raise RuntimeError("unable to determine video duration for share cover") from exc
+            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+                raise RuntimeError("video duration is empty")
+            # Sampling slightly into the video avoids the frequent black first frame.
+            timestamp = min(max(0.0, float(duration_seconds) - 0.1), max(0.0, float(duration_seconds) * 0.1))
+            image = directory / "cover.jpg"
+            completed = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.3f}",
+                 "-i", source_url, "-map", "0:v:0", "-frames:v", "1",
+                 "-vf", "scale=-2:360", "-q:v", "6", "-y", str(image)],
+                text=True, capture_output=True, check=False, timeout=90,
+            )
+            if completed.returncode or not image.is_file():
+                raise RuntimeError("ffmpeg could not extract a share cover frame")
+            manifest.update({"state": "ready", "timestamp_seconds": round(timestamp, 1)})
+            write_category_cover_manifest(directory, manifest)
+        except Exception as exc:
+            logger.warning("Share cover generation failed for %s: %s", task_id, exc)
+            manifest.update({"state": "error", "error": str(exc)[:500]})
+            write_category_cover_manifest(directory, manifest)
+        finally:
+            with category_cover_lock:
+                category_cover_jobs.discard(job_key)
+
+    def category_cover_state(task: dict[str, Any], file: str, start: bool = True) -> dict[str, Any]:
+        fingerprint = category_cover_fingerprint(task, file)
+        directory = category_cover_dir(str(task["task_id"]), file)
+        manifest = category_cover_manifest(directory)
+        image = directory / "cover.jpg"
+        if manifest.get("fingerprint") == fingerprint and manifest.get("state") == "ready" and image.is_file():
+            return {"state": "ready", "image": image}
+        if manifest.get("fingerprint") == fingerprint and manifest.get("state") in {"running", "error"}:
+            return {"state": str(manifest["state"]), "error": str(manifest.get("error") or "")}
+        if not start:
+            return {"state": "missing"}
+        job_key = (str(task["task_id"]), file, fingerprint)
+        source_url = task_playback_url(str(task["task_id"]), file)
+        with category_cover_lock:
+            if job_key not in category_cover_jobs:
+                category_cover_jobs.add(job_key)
+                duration_hint = task.get("output_duration_seconds") if file == "output" else task.get("source_duration_seconds")
+                threading.Thread(
+                    target=generate_category_cover,
+                    args=(str(task["task_id"]), file, source_url, fingerprint, duration_hint),
+                    name=f"category-cover-{str(task['task_id'])[:8]}", daemon=True,
+                ).start()
+        return {"state": "running"}
 
     @app.get("/api/tasks/{task_id}/frame-previews")
     def get_frame_previews(task_id: str) -> dict[str, Any]:
@@ -798,6 +890,39 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         if task is None:
             raise HTTPException(status_code=404, detail="shared category page is unavailable")
         return stream_task_playback(request, task_id, task, str(item["file"]), download, public=True)
+
+    @app.get("/share/categories/{share_id}/videos/{task_id}/cover")
+    def public_content_category_cover(share_id: str, task_id: str) -> JSONResponse:
+        item = store.public_category_catalog_item(share_id, task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        state = category_cover_state(task, str(item["file"]))
+        response: dict[str, Any] = {"state": state["state"]}
+        if state["state"] == "ready":
+            response["url"] = (
+                f"/share/categories/{urllib.parse.quote(share_id, safe='')}/videos/"
+                f"{urllib.parse.quote(task_id, safe='')}/cover.jpg"
+            )
+        elif state.get("error"):
+            response["error"] = state["error"]
+        return JSONResponse(response, headers={"Cache-Control": "private, no-store"})
+
+    @app.get("/share/categories/{share_id}/videos/{task_id}/cover.jpg")
+    def public_content_category_cover_file(share_id: str, task_id: str):
+        item = store.public_category_catalog_item(share_id, task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        state = category_cover_state(task, str(item["file"]), start=False)
+        image = state.get("image")
+        if state.get("state") != "ready" or not isinstance(image, Path) or not image.is_file():
+            raise HTTPException(status_code=404, detail="shared video cover is not available")
+        return FileResponse(image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
     @app.get("/api/dashboard/content-categories")
     def list_content_categories(task_ids: str = "") -> dict[str, Any]:
