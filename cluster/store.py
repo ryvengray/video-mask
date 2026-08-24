@@ -992,7 +992,8 @@ class ClusterStore:
     def _task_filter_conditions(statuses: tuple[str, ...] | None,
                                 search: str | None,
                                 face_annotations: tuple[str, ...] | None = None,
-                                content_tags: tuple[str, ...] | None = None) -> tuple[str, list[Any]]:
+                                content_tags: tuple[str, ...] | None = None,
+                                content_category_ids: tuple[int, ...] | None = None) -> tuple[str, list[Any]]:
         """Build a WHERE clause from optional task, label, and text filters."""
         conditions: list[str] = []
         values: list[Any] = []
@@ -1024,14 +1025,20 @@ class ClusterStore:
                 tag_conditions.append("IFNULL(content_tags_json, '') LIKE ? ESCAPE '\\'")
                 values.append(f"%{escaped_tag}%")
             conditions.append("(" + " OR ".join(tag_conditions) + ")")
+        if content_category_ids:
+            conditions.append("content_category_id IN (" + ", ".join("?" for _ in content_category_ids) + ")")
+            values.extend(content_category_ids)
         return (" WHERE " + " AND ".join(conditions)) if conditions else "", values
 
     @synchronized
     def count_tasks(self, statuses: tuple[str, ...] | None = None,
                     search: str | None = None,
                     face_annotations: tuple[str, ...] | None = None,
-                    content_tags: tuple[str, ...] | None = None) -> int:
-        where, values = self._task_filter_conditions(statuses, search, face_annotations, content_tags)
+                    content_tags: tuple[str, ...] | None = None,
+                    content_category_ids: tuple[int, ...] | None = None) -> int:
+        where, values = self._task_filter_conditions(
+            statuses, search, face_annotations, content_tags, content_category_ids,
+        )
         return int(self.conn.execute("SELECT COUNT(*) FROM tasks" + where, values).fetchone()[0])
 
     @synchronized
@@ -1050,8 +1057,11 @@ class ClusterStore:
                    statuses: tuple[str, ...] | None = None,
                    search: str | None = None,
                    face_annotations: tuple[str, ...] | None = None,
-                   content_tags: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
-        where, values = self._task_filter_conditions(statuses, search, face_annotations, content_tags)
+                   content_tags: tuple[str, ...] | None = None,
+                   content_category_ids: tuple[int, ...] | None = None) -> list[dict[str, Any]]:
+        where, values = self._task_filter_conditions(
+            statuses, search, face_annotations, content_tags, content_category_ids,
+        )
         values.extend((limit, max(0, offset)))
         rows = self.conn.execute(
             "SELECT * FROM tasks" + where + " ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?",

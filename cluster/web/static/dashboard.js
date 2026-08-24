@@ -798,6 +798,7 @@ function configureManualLabelFilters() {
   faceOptions.forEach(option => faceSelect.add(new Option(option.label, option.value, false, option.selected)));
 
   const selectedTags = new Set(new URLSearchParams(window.location.search).getAll('content_tag'));
+  const selectedCategories = new Set(new URLSearchParams(window.location.search).getAll('content_category'));
   const tagFilter = document.createElement('details');
   tagFilter.className = 'content-tag-filter';
   tagFilter.open = selectedTags.size > 0;
@@ -807,7 +808,16 @@ function configureManualLabelFilters() {
   options.className = 'content-tag-filter-options';
   options.textContent = 'Loading tags…';
   tagFilter.append(summary, options);
-  oldFilter.replaceWith(faceLabel, faceSelect, tagFilter);
+  const categoryFilter = document.createElement('details');
+  categoryFilter.className = 'content-tag-filter';
+  categoryFilter.open = selectedCategories.size > 0;
+  const categorySummary = document.createElement('summary');
+  categorySummary.textContent = selectedCategories.size ? `Content categories (${selectedCategories.size})` : 'Content categories';
+  const categoryOptions = document.createElement('div');
+  categoryOptions.className = 'content-tag-filter-options';
+  categoryOptions.textContent = 'Loading categories…';
+  categoryFilter.append(categorySummary, categoryOptions);
+  oldFilter.replaceWith(faceLabel, faceSelect, tagFilter, categoryFilter);
 
   fetch('/api/content-tags').then(async response => {
     const payload = await response.json().catch(() => ({}));
@@ -831,6 +841,30 @@ function configureManualLabelFilters() {
     });
   }).catch(() => {
     options.textContent = 'Unable to load content tags';
+  });
+
+  fetch('/api/dashboard/content-categories').then(async response => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || 'Unable to load content categories');
+    return Array.isArray(payload.categories) ? payload.categories : [];
+  }).then(categories => {
+    categoryOptions.replaceChildren();
+    if (!categories.length) {
+      categoryOptions.textContent = 'No content categories yet';
+      return;
+    }
+    categories.forEach(category => {
+      const label = document.createElement('label');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.name = 'content_category';
+      checkbox.value = String(category.category_id);
+      checkbox.checked = selectedCategories.has(checkbox.value);
+      label.append(checkbox, document.createTextNode(`${category.name} (${category.task_count})`));
+      categoryOptions.append(label);
+    });
+  }).catch(() => {
+    categoryOptions.textContent = 'Unable to load content categories';
   });
 }
 

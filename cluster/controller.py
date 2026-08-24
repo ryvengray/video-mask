@@ -1167,11 +1167,23 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         ))
         if len(selected_content_tags) > 20 or any(len(value) > 64 for value in selected_content_tags):
             raise HTTPException(status_code=400, detail="invalid content tag filter")
+        raw_content_categories = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_category") if value.strip()
+        ))
+        if len(raw_content_categories) > 100:
+            raise HTTPException(status_code=400, detail="too many content category filters")
+        try:
+            selected_content_categories = tuple(int(value) for value in raw_content_categories)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content category filter") from exc
+        if any(value < 1 for value in selected_content_categories):
+            raise HTTPException(status_code=400, detail="invalid content category filter")
         selected_search = q.strip()[:200] or None
         total = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None,
-                                  selected_content_tags or None)
+                                  selected_content_tags or None, selected_content_categories or None)
         tasks = store.list_tasks(max(1, total), 0, selected_statuses, selected_search,
-                                 selected_face_annotations or None, selected_content_tags or None)
+                                 selected_face_annotations or None, selected_content_tags or None,
+                                 selected_content_categories or None)
 
         def timestamp(value: Any) -> str:
             try:
@@ -1255,20 +1267,33 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         ))
         if len(selected_content_tags) > 20 or any(len(value) > 64 for value in selected_content_tags):
             raise HTTPException(status_code=400, detail="invalid content tag filter")
+        raw_content_categories = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_category") if value.strip()
+        ))
+        if len(raw_content_categories) > 100:
+            raise HTTPException(status_code=400, detail="too many content category filters")
+        try:
+            selected_content_categories = tuple(int(value) for value in raw_content_categories)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content category filter") from exc
+        if any(value < 1 for value in selected_content_categories):
+            raise HTTPException(status_code=400, detail="invalid content category filter")
         selected_search = q.strip()[:200] or None
         task_filter_query = urllib.parse.urlencode([
             *([("task_status", selected_task_status)] if selected_task_status else []),
             *(("face_annotation", value) for value in selected_face_annotations),
             *(("content_tag", value) for value in selected_content_tags),
+            *(("content_category", value) for value in selected_content_categories),
             *([("q", selected_search)] if selected_search else []),
         ])
         page_size = 50
         total_tasks = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None,
-                                        selected_content_tags or None)
+                                        selected_content_tags or None, selected_content_categories or None)
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
         rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses, selected_search,
-                                selected_face_annotations or None, selected_content_tags or None)
+                                selected_face_annotations or None, selected_content_tags or None,
+                                selected_content_categories or None)
 
         def byte_size(value: Any) -> str:
             try:

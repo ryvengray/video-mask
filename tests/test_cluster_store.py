@@ -212,6 +212,23 @@ def test_content_categories_assign_one_per_task_and_build_public_catalog(tmp_pat
     store.close()
 
 
+def test_task_list_can_filter_by_content_category(tmp_path: Path):
+    store = new_store(tmp_path)
+    laundry_task = store.create_task(task_payload())
+    room_payload = task_payload()
+    room_payload["source_url"] = "https://storage.example/room.mov"
+    room_task = store.create_task(room_payload)
+    laundry = store.create_content_category("Laundry")
+    room = store.create_content_category("Tidy room")
+    store.set_task_content_category(laundry_task["task_id"], laundry["category_id"])
+    store.set_task_content_category(room_task["task_id"], room["category_id"])
+
+    selected = store.list_tasks(content_category_ids=(laundry["category_id"],))
+    assert [task["task_id"] for task in selected] == [laundry_task["task_id"]]
+    assert store.count_tasks(content_category_ids=(room["category_id"],)) == 1
+    store.close()
+
+
 def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     connection = sqlite3.connect(database)
