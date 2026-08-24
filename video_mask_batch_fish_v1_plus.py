@@ -66,6 +66,13 @@ FACE_BACKFILL = 5             # 双模型确认后，最多回补此前5帧的�
 FACE_BURST = 5                # 检测人数变化后，接下来5帧逐帧检测
 FACE_ACTIVE_HOLD = 10         # 已出现人脸后，轨迹短暂丢失仍保持主动扫描的帧数
 FACE_VISIBLE_HOLD = 2         # 已确认轨迹允许用上一可靠框保活的连续帧数
+HARD_FACE_CONF = 0.20
+HARD_FACE_MIN_SIZE = 100
+HARD_FACE_EDGE_RATIO = 0.16
+HARD_FACE_ROI_SCALE = 3.0
+HARD_FACE_MAX_ROIS = 3             # 每帧最多二检的困难框数量(防止推理爆炸)
+HARD_FACE_ROI_SIZE = 320           # ROI 二检推理尺寸(比主检测 640 小一倍, 提速~75%)
+HARD_FACE_FULL_SCAN_CONF = 0.15    # 全帧低阈值扫描置信度(低于主检测, 独立捕获遗漏人脸)
 SCRFD_ADAPTIVE_VERIFY_MARGIN = 0.15  # 新候选进入10g复核区间的分数增量
 SCRFD_ADAPTIVE_VERIFY_IOU = 0.25     # 10g复核框与候选框的最低IoU
 SCRFD_VERIFIER_MAX_SCORE_DROP = 0.02  # 复核时10g相对候选模型允许的最大分差
@@ -1740,6 +1747,103 @@ def _log_scrfd_timing(detectors, log):
         )
 
 
+class HardFaceRecall:
+    def __init__(self, conf=HARD_FACE_CONF, min_size=HARD_FACE_MIN_SIZE,
+                 edge_ratio=HARD_FACE_EDGE_RATIO, roi_scale=HARD_FACE_ROI_SCALE,
+                 max_rois=HARD_FACE_MAX_ROIS, roi_size=HARD_FACE_ROI_SIZE):
+        self.conf = max(0.0, float(conf))
+        self.min_size = max(1, int(min_size))
+        self.edge_ratio = min(0.49, max(0.0, float(edge_ratio)))
+        self.roi_scale = max(1.0, float(roi_scale))
+        self.max_rois = max(1, int(max_rois))
+        self.roi_size = max(160, int(roi_size))
+
+    @staticmethod
+    def _iou(a, b):
+        x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+        x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+        area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _is_difficult(self, box, width, height):
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        if min(bw, bh) < self.min_size:
+            return True
+        margin_x, margin_y = width * self.edge_ratio, height * self.edge_ratio
+        return (box[0] < margin_x or box[1] < margin_y
+                or box[2] > width - margin_x or box[3] > height - margin_y)
+
+    def _difficulty_score(self, box, width, height):
+        """困难程度评分: 越小越困难, 优先处理最困难的候选。"""
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        min_dim = min(bw, bh)
+        # 小脸优先: 归一化到 [0, 2], 越小分数越低
+        size_score = min_dim / max(self.min_size, 1)
+        # 边缘优先: 归一化到 [0, 1], 越近边缘分数越低
+        margin_x, margin_y = width * self.edge_ratio, height * self.edge_ratio
+        dx = min(box[0], width - box[2]) / max(margin_x, 1)
+        dy = min(box[1], height - box[3]) / max(margin_y, 1)
+        edge_score = min(dx, dy)
+        return size_score + edge_score
+
+    def _roi(self, box, width, height):
+        cx, cy = (box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5
+        half_w = (box[2] - box[0]) * self.roi_scale * 0.5
+        half_h = (box[3] - box[1]) * self.roi_scale * 0.5
+        x1, y1 = max(0, int(cx - half_w)), max(0, int(cy - half_h))
+        x2, y2 = min(width, int(cx + half_w)), min(height, int(cy + half_h))
+        return x1, y1, x2, y2
+
+    def recall(self, detector, img, raw_candidates, existing_dets,
+               dual_iou, roi_detector=None):
+        """低分原始候选困难脸二检。
+
+        raw_candidates: 主检测器产出的原始候选列表, 仅使用 formal=False
+                        (低置信度, 未进入共识) 的候选作为种子。
+        existing_dets:  已有的共识检测结果, 用于去重。
+        roi_detector:   专用轻量检测器(如小尺寸 YOLOv8)。
+                        为 None 时回退到主检测器。
+        """
+        height, width = img.shape[:2]
+        recalled = []
+        # 收集低分困难候选并按困难程度排序(最困难优先)
+        difficult = []
+        for item in raw_candidates:
+            if item.get("formal", True):      # 只处理低分候选(未进入共识的)
+                continue
+            box = item["box"]
+            # 跳过与已有共识框重叠的(已处理过)
+            if any(self._iou(box, ed) >= 0.35 for ed in existing_dets):
+                continue
+            if not self._is_difficult(box, width, height):
+                continue
+            score = self._difficulty_score(box, width, height)
+            difficult.append((score, box))
+        difficult.sort(key=lambda x: x[0])
+        # 只处理最困难的前 max_rois 个, 防止推理爆炸
+        for _, box in difficult[:self.max_rois]:
+            x1, y1, x2, y2 = self._roi(box, width, height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            roi = img[y1:y2, x1:x2]
+            if roi_detector is not None:
+                boxes = roi_detector.detect(roi, conf=self.conf)
+            else:
+                boxes = detector.detect(roi, conf=self.conf)
+            for roi_box in boxes:
+                mapped = (roi_box[0] + x1, roi_box[1] + y1,
+                          roi_box[2] + x1, roi_box[3] + y1)
+                if any(self._iou(mapped, ed) >= 0.35 for ed in existing_dets):
+                    continue
+                if all(self._iou(mapped, existing) < 0.35
+                       for existing in recalled):
+                    recalled.append(mapped)
+        return recalled
+
+
 class FaceProcessor:
     """人脸检测+逐脸轨迹稳定：关键帧检测，中间帧 LK/模板跟踪。
 
@@ -1761,7 +1865,8 @@ class FaceProcessor:
                  box_smooth=FACE_BOX_SMOOTH, track_iou=0.2, track_dist=1.5,
                  backfill_frames=FACE_BACKFILL, burst_frames=FACE_BURST,
                  active_hold=FACE_ACTIVE_HOLD,
-                 visible_hold=FACE_VISIBLE_HOLD):
+                 visible_hold=FACE_VISIBLE_HOLD, hard_face_recall=None,
+                 roi_detector=None):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.empty_detect_int = max(1, empty_detect_int)
@@ -1789,6 +1894,8 @@ class FaceProcessor:
         self._force_detect = False
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
         self.dual_iou = dual_iou    # 双模型共识 IoU 阈值(仅 DualFaceDetector 使用)
+        self.hard_face_recall = hard_face_recall
+        self.roi_detector = roi_detector  # 困难脸二检专用轻量检测器(可选)
         # 优化 LK 参数: 更小搜索窗 + 更少金字塔层数 → 每帧 tracking 提速约 30-40%
         self.lk = dict(winSize=(21, 21), maxLevel=3,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03))
@@ -2284,18 +2391,32 @@ class FaceProcessor:
                     existing_boxes=[track["box"] for track in self.tracks
                                     if track.get("confirmed", True)],
                     frame_idx=frame_idx)
+                single_candidates = list(self.detector.last_candidates)
                 self.last_raw_debug_faces = list(self.detector.last_raw_candidates) if raw_debug else []
                 dets = [item["box"] for item in dual_dets]
                 debug_scores = [item["scores"] for item in dual_dets]
                 allow_new = [True] * len(dets)
                 debug_sources = [item.get("source", "D") for item in dual_dets]
+                if self.hard_face_recall is not None:
+                    raw_cands = list(self.detector.last_raw_candidates)
+                    hard_boxes = self.hard_face_recall.recall(
+                        self.detector, img, raw_cands, dets, self.dual_iou,
+                        roi_detector=self.roi_detector)
+                    self.detector.last_candidates = single_candidates
+                    for box in hard_boxes:
+                        if any(self._iou(box, existing) >= 0.35 for existing in dets):
+                            continue
+                        dets.append(box)
+                        debug_scores.append((("HardROI", self.hard_face_recall.conf),))
+                        allow_new.append(True)
+                        debug_sources.append("R")
                 self._update_backfill_candidates(
-                    frame_idx, dual_dets, self.detector.last_candidates)
-                detection_count = len(dual_dets)
+                    frame_idx, dual_dets, single_candidates)
+                detection_count = len(dets)
                 # 新人脸必须双模型共识；已确认人脸遇到运动模糊时，
                 # 允许 YOLO/SCRFD 任一模型续轨。这些框 allow_new=False，
                 # 因此不会把单模型误检建成新马赛克。
-                for item in self.detector.last_candidates:
+                for item in single_candidates:
                     box = item["box"]
                     if any(self._iou(box, confirmed["box"]) >= self.dual_iou
                            for confirmed in dual_dets):
@@ -2668,10 +2789,17 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   fisheye_downscale, fisheye_dual, fisheye_crop, log,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
-                  scrfd_nms=0.4, scrfd_gpu_id=0,
+                  scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
-                  face_backfill=FACE_BACKFILL, face_burst=FACE_BURST):
+                  face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
+                  hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                  hard_face_min_size=HARD_FACE_MIN_SIZE,
+                  hard_face_roi_scale=HARD_FACE_ROI_SCALE,
+                  hard_face_max_rois=HARD_FACE_MAX_ROIS,
+                  hard_face_roi_size=HARD_FACE_ROI_SIZE,
+                  hard_face_full_scan=False,
+                  hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -2725,12 +2853,32 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
+    # 困难召唤: 创建专用轻量 ROI 检测器(小尺寸 YOLOv8, 跳过双模型共识)
+    roi_detector = None
+    if hard_face_recall and face_on:
+        try:
+            roi_detector = YOLOFaceDetector(
+                model_dir=model_dir, yolo_size=hard_face_roi_size,
+                use_gpu=use_gpu)
+            log(f"  [困难召唤] ROI二检: YOLOv8@{roi_detector.yolo_size}px "
+                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf})")
+        except Exception as exc:
+            log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
+            roi_detector = None
     face_proc = FaceProcessor(fd, detect_int=face_int,
                               empty_detect_int=face_empty_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
                               grace=face_grace, box_smooth=face_smooth,
                               backfill_frames=face_backfill,
-                              burst_frames=face_burst) if face_on else None
+                              burst_frames=face_burst,
+                              hard_face_recall=(HardFaceRecall(
+                                  conf=hard_face_conf,
+                                  min_size=hard_face_min_size,
+                                  roi_scale=hard_face_roi_scale,
+                                  max_rois=hard_face_max_rois,
+                                  roi_size=hard_face_roi_size)
+                                  if hard_face_recall else None),
+                              roi_detector=roi_detector) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
             f"(有人检测间隔={face_proc.detect_int}, "
@@ -2952,6 +3100,19 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             faces = []
             if face_on:
                 faces = face_proc.process(img, frame_idx, raw_debug=raw_debug)
+                # 双鱼眼镜像打码: 一侧检出人脸 → 另一侧同步打码
+                if dual_mirror and fisheye and fisheye_dual != "false":
+                    out_h, out_w = img.shape[:2]
+                    mid = out_w // 2
+                    if mid >= 2 and out_w >= 2 * out_h:
+                        mirrored = list(faces)
+                        for (x1, y1, x2, y2) in faces:
+                            cx = (x1 + x2) / 2
+                            if cx < mid:
+                                mirrored.append((x1 + mid, y1, x2 + mid, y2))
+                            else:
+                                mirrored.append((x1 - mid, y1, x2 - mid, y2))
+                        faces = mirrored
                 if faces:
                     # np.frombuffer(raw_bytes) 是只读视图；只在人脸帧需要打码时
                     # 才复制为可写数组，空场景仍保持零拷贝。
@@ -3056,10 +3217,17 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    fisheye_downscale, fisheye_dual, fisheye_crop, log,
                    scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                    dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
-                   scrfd_nms=0.4, scrfd_gpu_id=0,
+                   scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
                    face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                    scrfd_landmark_filter=True, debug=False, raw_debug=False,
-                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST):
+                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
+                   hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                   hard_face_min_size=HARD_FACE_MIN_SIZE,
+                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
+                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
+                   hard_face_roi_size=HARD_FACE_ROI_SIZE,
+                   hard_face_full_scan=False,
+                   hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
     """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
 
     frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
@@ -3120,12 +3288,31 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
+    roi_detector = None
+    if hard_face_recall and face_on:
+        try:
+            roi_detector = YOLOFaceDetector(
+                model_dir=model_dir, yolo_size=hard_face_roi_size,
+                use_gpu=use_gpu)
+            log(f"  [困难召唤] ROI二检: YOLOv8@{roi_detector.yolo_size}px "
+                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf})")
+        except Exception as exc:
+            log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
+            roi_detector = None
     face_proc = FaceProcessor(fd, detect_int=face_int,
                               empty_detect_int=face_empty_int, conf=face_conf,
                               scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
                               grace=face_grace, box_smooth=face_smooth,
                               backfill_frames=face_backfill,
-                              burst_frames=face_burst) if face_on else None
+                              burst_frames=face_burst,
+                              hard_face_recall=(HardFaceRecall(
+                                  conf=hard_face_conf,
+                                  min_size=hard_face_min_size,
+                                  roi_scale=hard_face_roi_scale,
+                                  max_rois=hard_face_max_rois,
+                                  roi_size=hard_face_roi_size)
+                                  if hard_face_recall else None),
+                              roi_detector=roi_detector) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
             f"(有人检测间隔={face_proc.detect_int}, "
@@ -3153,6 +3340,19 @@ def _process_files(src, dst, face_on, model_dir, face_size,
         faces = []
         if face_on:
             faces = face_proc.process(img, i, raw_debug=raw_debug)
+            # 双鱼眼镜像打码: 一侧检出人脸 → 另一侧同步打码
+            if dual_mirror and fisheye and fisheye_dual != "false":
+                fh, fw = img.shape[:2]
+                mid = fw // 2
+                if mid >= 2 and fw >= 2 * fh:
+                    mirrored = list(faces)
+                    for (x1, y1, x2, y2) in faces:
+                        cx = (x1 + x2) / 2
+                        if cx < mid:
+                            mirrored.append((x1 + mid, y1, x2 + mid, y2))
+                        else:
+                            mirrored.append((x1 - mid, y1, x2 - mid, y2))
+                    faces = mirrored
             for (x1, y1, x2, y2) in faces:
                 bw, bh = x2 - x1, y2 - y1
                 ex1, ey1 = int(x1 - FACE_EXPAND * bw), int(y1 - FACE_EXPAND * bh)
@@ -3223,11 +3423,18 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   fisheye_downscale=2, fisheye_dual="auto", fisheye_crop=1.0, log=print,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
-                  scrfd_nms=0.4, scrfd_gpu_id=0,
+                  scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
                   face_empty_int=FACE_EMPTY_DETECT_INT,
-                  face_backfill=FACE_BACKFILL, face_burst=FACE_BURST):
+                  face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
+                  hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                  hard_face_min_size=HARD_FACE_MIN_SIZE,
+                  hard_face_roi_scale=HARD_FACE_ROI_SCALE,
+                  hard_face_max_rois=HARD_FACE_MAX_ROIS,
+                  hard_face_roi_size=HARD_FACE_ROI_SIZE,
+                  hard_face_full_scan=False,
+                  hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
     """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
     if use_pipe:
         try:
@@ -3239,10 +3446,14 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                  fisheye_dual, fisheye_crop, log,
                                  scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
                                  dual_iou, scrfd_model, scrfd_device,
-                                 scrfd_nms, scrfd_gpu_id,
+                                 scrfd_nms, scrfd_gpu_id, dual_mirror,
                                  face_grace, face_smooth,
                                  scrfd_landmark_filter, debug, raw_debug,
-                                 face_backfill, face_burst)
+                                 face_backfill, face_burst,
+                                 hard_face_recall, hard_face_conf,
+                                 hard_face_min_size, hard_face_roi_scale,
+                                 hard_face_max_rois, hard_face_roi_size,
+                                 hard_face_full_scan, hard_face_full_scan_conf)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
     return _process_files(src, dst, face_on, model_dir, face_size,
@@ -3253,10 +3464,14 @@ def process_video(src, dst, face_on=True, model_dir=None,
                           fisheye_dual, fisheye_crop, log,
                           scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
                           dual_iou, scrfd_model, scrfd_device,
-                          scrfd_nms, scrfd_gpu_id,
+                          scrfd_nms, scrfd_gpu_id, dual_mirror,
                           face_grace, face_smooth,
                           scrfd_landmark_filter, debug, raw_debug,
-                          face_backfill, face_burst)
+                          face_backfill, face_burst,
+                          hard_face_recall, hard_face_conf,
+                          hard_face_min_size, hard_face_roi_scale,
+                          hard_face_max_rois, hard_face_roi_size,
+                          hard_face_full_scan, hard_face_full_scan_conf)
 
 
 def expand_inputs(inputs):
@@ -3323,6 +3538,9 @@ def main():
     ap.add_argument("--fisheye-crop", type=float, default=1.0, metavar="RATIO",
                     help="鱼眼矫正后裁剪比例(默认1.0=不裁剪; 0.8=保留中心80%%, 四周各裁10%%; "
                          "仅--fisheye启用时生效, 输出分辨率同步缩小)")
+    ap.add_argument("--dual-mirror", action="store_true",
+                    help="双鱼眼镜像打码: 一侧检出人脸后另一侧同步打码"
+                         "(仅双鱼眼视频生效, 避免单侧漏检导致另一侧未打码)")
     ap.add_argument("--scrfd-verify", action="store_true",
                     help="SCRFD二次验证: YOLO检出后用SCRFD关键点模型确认, 过滤手/玩具误检 "
                          "(高conf框不验证, 低conf框才验证; 要求全部框均由SCRFD确认请使用"
@@ -3346,6 +3564,22 @@ def main():
                     help="YOLO conf≥此值直接保留不验证(默认0.35; 避免SCRFD漏检误伤高置信度真脸)")
     ap.add_argument("--face-conf", type=float, default=FACE_CONF,
                     help=f"人脸置信度阈值(默认{FACE_CONF}; 降底如0.25可检出更多侧脸/遮挡, 可能增误检)")
+    ap.add_argument("--hard-face-recall", action="store_true",
+                    help="启用困难脸ROI二检：对小脸/边缘候选放大区域后低阈值复检")
+    ap.add_argument("--hard-face-conf", type=float, default=HARD_FACE_CONF,
+                    help=f"困难脸ROI二检阈值(默认{HARD_FACE_CONF})")
+    ap.add_argument("--hard-face-min-size", type=int, default=HARD_FACE_MIN_SIZE,
+                    help=f"候选最小边小于该值时进入困难ROI二检(默认{HARD_FACE_MIN_SIZE}px)")
+    ap.add_argument("--hard-face-roi-scale", type=float, default=HARD_FACE_ROI_SCALE,
+                    help=f"困难候选ROI外扩倍数(默认{HARD_FACE_ROI_SCALE})")
+    ap.add_argument("--hard-face-max-rois", type=int, default=HARD_FACE_MAX_ROIS,
+                    help=f"每帧最多二检的困难框数(默认{HARD_FACE_MAX_ROIS}; 防止推理爆炸)")
+    ap.add_argument("--hard-face-roi-size", type=int, default=HARD_FACE_ROI_SIZE,
+                    help=f"ROI二检推理尺寸(默认{HARD_FACE_ROI_SIZE}px; 比主检测小一倍提速~75%%)")
+    ap.add_argument("--hard-face-full-scan", action="store_true",
+                    help="全帧低阈值扫描: ROI检测器独立扫描全帧, 主动发现主检测遗漏的人脸(需要--hard-face-recall同时开启)")
+    ap.add_argument("--hard-face-full-scan-conf", type=float, default=HARD_FACE_FULL_SCAN_CONF,
+                    help=f"全帧扫描阈值(默认{HARD_FACE_FULL_SCAN_CONF}; 低于主检测阈值, 独立捕获漏检人脸)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
                     help="【抽帧频率】跳过间隔(默认1=逐帧; 2=隔1抽1提速2x; 3=每3帧抽1提速3x; 配合--face-int效果叠加)")
     ap.add_argument("--no-pipe", action="store_true",
@@ -3370,6 +3604,20 @@ def main():
         ap.error("--face-backfill 必须 >= 0")
     if args.face_burst < 0:
         ap.error("--face-burst 必须 >= 0")
+    if not 0 <= args.hard_face_conf <= 1:
+        ap.error("--hard-face-conf 必须在 0~1 之间")
+    if args.hard_face_min_size < 1:
+        ap.error("--hard-face-min-size 必须 >= 1")
+    if args.hard_face_roi_scale < 1:
+        ap.error("--hard-face-roi-scale 必须 >= 1")
+    if args.hard_face_max_rois < 1:
+        ap.error("--hard-face-max-rois 必须 >= 1")
+    if not 160 <= args.hard_face_roi_size <= 640:
+        ap.error("--hard-face-roi-size 必须在 160~640 之间")
+    if not 0 <= args.hard_face_full_scan_conf <= 1:
+        ap.error("--hard-face-full-scan-conf 必须在 0~1 之间")
+    if args.hard_face_full_scan and not args.hard_face_recall:
+        print("  [警告] --hard-face-full-scan 需要 --hard-face-recall 同时开启, 已忽略")
 
     files = expand_inputs(args.inputs)
     if not files:
@@ -3388,6 +3636,14 @@ def main():
                          face_empty_int=args.face_empty_int,
                          face_backfill=args.face_backfill,
                          face_burst=args.face_burst,
+                         hard_face_recall=args.hard_face_recall,
+                         hard_face_conf=args.hard_face_conf,
+                         hard_face_min_size=args.hard_face_min_size,
+                         hard_face_roi_scale=args.hard_face_roi_scale,
+                         hard_face_max_rois=args.hard_face_max_rois,
+                         hard_face_roi_size=args.hard_face_roi_size,
+                         hard_face_full_scan=args.hard_face_full_scan,
+                         hard_face_full_scan_conf=args.hard_face_full_scan_conf,
                          face_conf=args.face_conf, face_model=args.face_model,
                          use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
                          force_h264=args.force_h264, use_gpu=not args.no_gpu,
@@ -3402,6 +3658,7 @@ def main():
                          scrfd_iou=args.scrfd_iou,
                          scrfd_keep_conf=args.scrfd_keep_conf,
                          dual_iou=args.dual_iou,
+                         dual_mirror=args.dual_mirror,
                          scrfd_model=args.scrfd_model,
                          scrfd_device=args.scrfd_device,
                          scrfd_nms=args.scrfd_nms,
