@@ -170,6 +170,22 @@ def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path
     reopened.close()
 
 
+def test_paused_task_dispatch_keeps_pending_tasks_unclaimed(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    task = store.create_task(task_payload())
+
+    assert store.set_boolean_setting("task_dispatch_enabled", False) is False
+    assert store.claim("worker-01", TOKEN) is None
+    assert store.task(task["task_id"])["status"] == "pending"
+
+    assert store.set_boolean_setting("task_dispatch_enabled", True) is True
+    claimed = store.claim("worker-01", TOKEN)
+    assert claimed and claimed["task_id"] == task["task_id"]
+    store.close()
+
+
 def test_video_share_is_opaque_expiring_and_can_be_revoked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     store = new_store(tmp_path)
     clock = [1_700_000_000.0]

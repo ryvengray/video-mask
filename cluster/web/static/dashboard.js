@@ -130,6 +130,50 @@ if (s3IngestControl) {
   }
 }
 
+const taskDispatchControl = document.getElementById('task-dispatch-control');
+if (taskDispatchControl) {
+  let enabled = taskDispatchControl.dataset.enabled === 'true';
+  const toggle = document.getElementById('task-dispatch-toggle');
+  const status = document.getElementById('task-dispatch-status');
+  const message = document.getElementById('task-dispatch-message');
+
+  function renderTaskDispatchState() {
+    const label = enabled ? 'Task dispatch enabled' : 'Task dispatch paused';
+    status.className = `s3-ingest-status-light ${enabled ? 'enabled' : 'paused'}`;
+    status.setAttribute('aria-label', label);
+    status.title = label;
+    toggle.textContent = enabled ? 'Pause task dispatch' : 'Resume task dispatch';
+  }
+
+  toggle.addEventListener('click', async () => {
+    const nextEnabled = !enabled;
+    const action = nextEnabled ? 'resume' : 'pause';
+    const detail = nextEnabled
+      ? 'Pending tasks will be available to Workers again.'
+      : 'Running tasks continue, but Workers will not receive any new pending tasks.';
+    if (!window.confirm(`Do you want to ${action} task dispatch? ${detail}`)) return;
+    toggle.disabled = true;
+    message.textContent = '';
+    try {
+      const response = await fetch('/api/admin/task-dispatch', {
+        method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: nextEnabled}),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+      enabled = Boolean(payload.enabled);
+      renderTaskDispatchState();
+      message.textContent = enabled
+        ? 'Task dispatch is enabled. Pending tasks may now be claimed.'
+        : 'Task dispatch is paused. Running tasks continue normally.';
+    } catch (error) {
+      message.textContent = error instanceof Error ? error.message : 'Unable to update task dispatch.';
+    } finally {
+      toggle.disabled = false;
+    }
+  });
+}
+
 const manualTaskControl = document.getElementById('manual-task-control');
 if (manualTaskControl?.dataset.s3Configured === 'true') {
   const manualTaskForm = document.getElementById('manual-task-form');

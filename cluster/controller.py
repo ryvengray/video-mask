@@ -263,6 +263,10 @@ class S3IngestSwitchRequest(BaseModel):
     enabled: bool
 
 
+class TaskDispatchSwitchRequest(BaseModel):
+    enabled: bool
+
+
 class AlgorithmDefaultsRequest(BaseModel):
     algorithm: str = Field(min_length=1, max_length=255)
     arguments: list[str] | str = Field(default_factory=list)
@@ -322,6 +326,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     def s3_ingest_is_enabled() -> bool:
         return bool(s3_ingestor) and s3_ingest_enabled
+
+    def task_dispatch_is_enabled() -> bool:
+        return store.boolean_setting("task_dispatch_enabled", True)
 
     def model_data(model: BaseModel) -> dict[str, Any]:
         # FastAPI 0.110 uses Pydantic v2, while some supported deployments
@@ -395,7 +402,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         s3_ingested = s3_ingestor.scan_if_due() if s3_ingest_is_enabled() else 0
         return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested),
                 "s3_ingested": str(s3_ingested),
-                "s3_ingest_enabled": str(s3_ingest_is_enabled()).lower()}
+                "s3_ingest_enabled": str(s3_ingest_is_enabled()).lower(),
+                "task_dispatch_enabled": str(task_dispatch_is_enabled()).lower()}
 
     @app.post("/api/workers/register")
     def register_worker(request: WorkerRequest, http_request: Request):
@@ -1135,6 +1143,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         logger.warning("S3 ingestion %s by administrator", "enabled" if s3_ingest_enabled else "disabled")
         return {"configured": True, "enabled": s3_ingest_enabled}
 
+    @app.put("/api/admin/task-dispatch")
+    def set_task_dispatch_switch(request: TaskDispatchSwitchRequest) -> dict[str, bool]:
+        enabled = store.set_boolean_setting("task_dispatch_enabled", request.enabled)
+        logger.warning("Task dispatch %s by administrator", "enabled" if enabled else "paused")
+        return {"enabled": enabled}
+
     @app.post("/api/admin/s3-ingest/scan")
     def scan_s3_ingest_once(source_prefix: str = "") -> dict[str, bool | int | str]:
         """Run one S3 discovery pass, optionally restricted to a source-bucket folder."""
@@ -1460,6 +1474,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "status_tones": STATUS_TONES,
                 "s3_ingest_configured": bool(s3_ingestor),
                 "s3_ingest_enabled": s3_ingest_is_enabled(),
+                "task_dispatch_enabled": task_dispatch_is_enabled(),
                 "manual_task_default_algorithm": store.get_algorithm_defaults()["algorithm"],
                 "manual_task_default_arguments": store.get_algorithm_defaults()["arguments"],
                 "processing_statistics": processing_statistics,

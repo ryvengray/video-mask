@@ -1286,6 +1286,10 @@ class ClusterStore:
     @synchronized
     def claim(self, worker_id: str, token: str) -> dict[str, Any] | None:
         self.authenticate_worker(worker_id, token)
+        # Keep this check inside the store lock shared with the administrator
+        # switch, so a paused dispatch cannot race with a new Worker claim.
+        if not self.boolean_setting("task_dispatch_enabled", True):
+            return None
         stamp = now()
         # BEGIN IMMEDIATE serializes claims across concurrent API requests.
         self.conn.execute("BEGIN IMMEDIATE")
