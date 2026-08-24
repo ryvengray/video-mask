@@ -41,6 +41,7 @@ video_mask_batch_fish_v1_plus.py — 视频批量打码（仅人脸），SCRFD �
 """
 import argparse
 import glob
+import json
 import os
 import queue
 import select
@@ -3056,6 +3057,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     # 记警告并正常 break, 走后续完整性检查(输出文件已生成)。
     frame_idx = 0
     total_face = 0
+    frames_with_face = 0
     encoder_finished_early = False
     _PIPE_TIMEOUT = 5  # 秒, 队列超时阈值
     frame_buffer = []
@@ -3131,6 +3133,8 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                         draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
                     draw_face_debug_scores(img, face_proc.last_debug_faces)
                 total_face += len(faces)
+                if faces:
+                    frames_with_face += 1
 
             # 延迟若干帧再编码，使后续双模型确认能回改此前单模型候选帧。
             # face_backfill=0 时仍然即时零拷贝写入。
@@ -3207,8 +3211,14 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
             # 流式管道提前结束(<30%帧处理完成), 自动回退文件模式
             raise RuntimeError(
                 f"管道提前结束(仅处理{frame_idx}/{total_expected}帧, {actual_ratio:.0%}), 回退文件模式")
-    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}")
-    return encode.returncode == 0
+    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}  有人脸帧={frames_with_face}")
+    return {
+        "success": encode.returncode == 0,
+        "total_frames": frame_idx,
+        "frames_with_face": frames_with_face,
+        "total_face_detections": total_face,
+        "duration_seconds": round(elapsed, 2),
+    }
 
 
 def _process_files(src, dst, face_on, model_dir, face_size,
@@ -3324,6 +3334,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
             f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
     backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
     total_face = 0
+    frames_with_face = 0
     frame_buffer = []
     timing_snapshot = _model_timing_snapshot((fd, scrfd_verifier))
 
@@ -3363,6 +3374,8 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                     draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
                 draw_face_debug_scores(img, face_proc.last_debug_faces)
             total_face += len(faces)
+            if faces:
+                frames_with_face += 1
         frame_buffer.append({"frame_idx": i, "image": img, "filename": fn})
         if face_on and face_proc.last_backfill_events:
             total_face += apply_face_backfill(
@@ -3404,14 +3417,24 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     if r.returncode != 0:
         log("  [错误] ffmpeg 合成失败: " + r.stderr[-300:])
         shutil.rmtree(tmp, ignore_errors=True)
-        return False
+        return {"success": False, "total_frames": len(frames),
+                "frames_with_face": frames_with_face,
+                "total_face_detections": total_face,
+                "duration_seconds": round(time.time() - t0, 2)}
     if not keep_tmp:
         shutil.rmtree(tmp, ignore_errors=True)
     final_model_timing, _ = _format_model_timing((fd, scrfd_verifier))
     log(f"  [模型性能汇总] {final_model_timing}")
     _log_scrfd_timing((fd, scrfd_verifier), log)
-    log(f"  [完成] {dst}  耗时 {time.time()-t0:.0f}s  人脸帧次={total_face}")
-    return True
+    elapsed = time.time() - t0
+    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}  有人脸帧={frames_with_face}")
+    return {
+        "success": True,
+        "total_frames": len(frames),
+        "frames_with_face": frames_with_face,
+        "total_face_detections": total_face,
+        "duration_seconds": round(elapsed, 2),
+    }
 
 
 def process_video(src, dst, face_on=True, model_dir=None,
@@ -3435,43 +3458,52 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   hard_face_roi_size=HARD_FACE_ROI_SIZE,
                   hard_face_full_scan=False,
                   hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
-    """处理单个视频: 人脸打码, 保留音轨。返回是否成功。"""
+    """处理单个视频: 人脸打码, 保留音轨。返回处理结果 dict。"""
+    w, h, fps, _ = get_video_info(src)
+    result = None
     if use_pipe:
         try:
-            return _process_pipe(src, dst, face_on, model_dir, face_size,
-                                 face_int, face_empty_int, face_conf, face_model,
-                                 keep_tmp, force_h264, use_gpu,
-                                 frame_skip, fisheye, fisheye_strength,
-                                 fisheye_device, fisheye_downscale,
-                                 fisheye_dual, fisheye_crop, log,
-                                 scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                                 dual_iou, scrfd_model, scrfd_device,
-                                 scrfd_nms, scrfd_gpu_id, dual_mirror,
-                                 face_grace, face_smooth,
-                                 scrfd_landmark_filter, debug, raw_debug,
-                                 face_backfill, face_burst,
-                                 hard_face_recall, hard_face_conf,
-                                 hard_face_min_size, hard_face_roi_scale,
-                                 hard_face_max_rois, hard_face_roi_size,
-                                 hard_face_full_scan, hard_face_full_scan_conf)
+            result = _process_pipe(src, dst, face_on, model_dir, face_size,
+                                   face_int, face_empty_int, face_conf, face_model,
+                                   keep_tmp, force_h264, use_gpu,
+                                   frame_skip, fisheye, fisheye_strength,
+                                   fisheye_device, fisheye_downscale,
+                                   fisheye_dual, fisheye_crop, log,
+                                   scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
+                                   dual_iou, scrfd_model, scrfd_device,
+                                   scrfd_nms, scrfd_gpu_id, dual_mirror,
+                                   face_grace, face_smooth,
+                                   scrfd_landmark_filter, debug, raw_debug,
+                                   face_backfill, face_burst,
+                                   hard_face_recall, hard_face_conf,
+                                   hard_face_min_size, hard_face_roi_scale,
+                                   hard_face_max_rois, hard_face_roi_size,
+                                   hard_face_full_scan, hard_face_full_scan_conf)
         except Exception as e:
             log(f"  [警告] 管道模式失败({e}), 回退文件模式")
-    return _process_files(src, dst, face_on, model_dir, face_size,
-                          face_int, face_empty_int, face_conf, face_model,
-                          keep_tmp, force_h264, use_gpu,
-                          frame_skip, fisheye, fisheye_strength,
-                          fisheye_device, fisheye_downscale,
-                          fisheye_dual, fisheye_crop, log,
-                          scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                          dual_iou, scrfd_model, scrfd_device,
-                          scrfd_nms, scrfd_gpu_id, dual_mirror,
-                          face_grace, face_smooth,
-                          scrfd_landmark_filter, debug, raw_debug,
-                          face_backfill, face_burst,
-                          hard_face_recall, hard_face_conf,
-                          hard_face_min_size, hard_face_roi_scale,
-                          hard_face_max_rois, hard_face_roi_size,
-                          hard_face_full_scan, hard_face_full_scan_conf)
+    if result is None:
+        result = _process_files(src, dst, face_on, model_dir, face_size,
+                                face_int, face_empty_int, face_conf, face_model,
+                                keep_tmp, force_h264, use_gpu,
+                                frame_skip, fisheye, fisheye_strength,
+                                fisheye_device, fisheye_downscale,
+                                fisheye_dual, fisheye_crop, log,
+                                scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
+                                dual_iou, scrfd_model, scrfd_device,
+                                scrfd_nms, scrfd_gpu_id, dual_mirror,
+                                face_grace, face_smooth,
+                                scrfd_landmark_filter, debug, raw_debug,
+                                face_backfill, face_burst,
+                                hard_face_recall, hard_face_conf,
+                                hard_face_min_size, hard_face_roi_scale,
+                                hard_face_max_rois, hard_face_roi_size,
+                                hard_face_full_scan, hard_face_full_scan_conf)
+    result["input_file"] = src
+    result["output_file"] = dst
+    result["fps"] = round(fps, 2)
+    result["width"] = w
+    result["height"] = h
+    return result
 
 
 def expand_inputs(inputs):
@@ -3596,6 +3628,8 @@ def main():
                     help="关闭 GPU 加速(CUDA/MPS 均禁用, 强制 CPU)")
     ap.add_argument("--model-dir", default=None, help="人脸模型目录")
     ap.add_argument("--keep-tmp", action="store_true", help="保留中间帧")
+    ap.add_argument("--report", type=str, default=None,
+                    help="JSON处理报告输出路径(不指定则输出到stdout)")
     args = ap.parse_args()
 
     if args.face_int < 1 or args.face_empty_int < 1:
@@ -3626,50 +3660,74 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"待处理 {len(files)} 个视频 -> {args.out_dir}")
     ok = 0
+    reports = []
     for src in files:
         name = os.path.splitext(os.path.basename(src))[0]
         dst = os.path.join(args.out_dir, "masked_" + name + ".mp4")
         print(f"\n>>> {src}")
-        if process_video(src, dst, face_on=not args.no_face,
-                         model_dir=args.model_dir,
-                         face_size=args.face_size, face_int=args.face_int,
-                         face_empty_int=args.face_empty_int,
-                         face_backfill=args.face_backfill,
-                         face_burst=args.face_burst,
-                         hard_face_recall=args.hard_face_recall,
-                         hard_face_conf=args.hard_face_conf,
-                         hard_face_min_size=args.hard_face_min_size,
-                         hard_face_roi_scale=args.hard_face_roi_scale,
-                         hard_face_max_rois=args.hard_face_max_rois,
-                         hard_face_roi_size=args.hard_face_roi_size,
-                         hard_face_full_scan=args.hard_face_full_scan,
-                         hard_face_full_scan_conf=args.hard_face_full_scan_conf,
-                         face_conf=args.face_conf, face_model=args.face_model,
-                         use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
-                         force_h264=args.force_h264, use_gpu=not args.no_gpu,
-                         frame_skip=args.frame_skip,
-                         fisheye=args.fisheye, fisheye_strength=args.fisheye_strength,
-                         fisheye_device=args.fisheye_device,
-                         fisheye_downscale=args.fisheye_downscale,
-                         fisheye_dual=args.fisheye_dual,
-                         fisheye_crop=args.fisheye_crop,
-                         scrfd_verify=args.scrfd_verify,
-                         scrfd_conf=args.scrfd_conf,
-                         scrfd_iou=args.scrfd_iou,
-                         scrfd_keep_conf=args.scrfd_keep_conf,
-                         dual_iou=args.dual_iou,
-                         dual_mirror=args.dual_mirror,
-                         scrfd_model=args.scrfd_model,
-                         scrfd_device=args.scrfd_device,
-                         scrfd_nms=args.scrfd_nms,
-                         scrfd_gpu_id=args.scrfd_gpu_id,
-                         face_grace=args.face_grace,
-                         face_smooth=args.face_smooth,
-                         scrfd_landmark_filter=not args.no_scrfd_landmark_filter,
-                         debug=args.debug or args.debug_raw,
-                         raw_debug=args.debug_raw):
+        result = process_video(src, dst, face_on=not args.no_face,
+                               model_dir=args.model_dir,
+                               face_size=args.face_size, face_int=args.face_int,
+                               face_empty_int=args.face_empty_int,
+                               face_backfill=args.face_backfill,
+                               face_burst=args.face_burst,
+                               hard_face_recall=args.hard_face_recall,
+                               hard_face_conf=args.hard_face_conf,
+                               hard_face_min_size=args.hard_face_min_size,
+                               hard_face_roi_scale=args.hard_face_roi_scale,
+                               hard_face_max_rois=args.hard_face_max_rois,
+                               hard_face_roi_size=args.hard_face_roi_size,
+                               hard_face_full_scan=args.hard_face_full_scan,
+                               hard_face_full_scan_conf=args.hard_face_full_scan_conf,
+                               face_conf=args.face_conf, face_model=args.face_model,
+                               use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
+                               force_h264=args.force_h264, use_gpu=not args.no_gpu,
+                               frame_skip=args.frame_skip,
+                               fisheye=args.fisheye, fisheye_strength=args.fisheye_strength,
+                               fisheye_device=args.fisheye_device,
+                               fisheye_downscale=args.fisheye_downscale,
+                               fisheye_dual=args.fisheye_dual,
+                               fisheye_crop=args.fisheye_crop,
+                               scrfd_verify=args.scrfd_verify,
+                               scrfd_conf=args.scrfd_conf,
+                               scrfd_iou=args.scrfd_iou,
+                               scrfd_keep_conf=args.scrfd_keep_conf,
+                               dual_iou=args.dual_iou,
+                               dual_mirror=args.dual_mirror,
+                               scrfd_model=args.scrfd_model,
+                               scrfd_device=args.scrfd_device,
+                               scrfd_nms=args.scrfd_nms,
+                               scrfd_gpu_id=args.scrfd_gpu_id,
+                               face_grace=args.face_grace,
+                               face_smooth=args.face_smooth,
+                               scrfd_landmark_filter=not args.no_scrfd_landmark_filter,
+                               debug=args.debug or args.debug_raw,
+                               raw_debug=args.debug_raw)
+        reports.append(result)
+        if result["success"]:
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")
+    # 构建并输出 JSON 报告
+    report = {
+        "videos": reports,
+        "summary": {
+            "total_videos": len(files),
+            "success_count": ok,
+            "failed_count": len(files) - ok,
+            "total_frames": sum(r.get("total_frames", 0) for r in reports),
+            "total_frames_with_face": sum(r.get("frames_with_face", 0) for r in reports),
+            "total_duration_seconds": round(
+                sum(r.get("duration_seconds", 0) for r in reports), 2),
+        }
+    }
+    report_json = json.dumps(report, ensure_ascii=False, indent=2)
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as f:
+            f.write(report_json)
+        print(f"报告已写入: {args.report}")
+    else:
+        print(report_json)
+    return report
 
 
 if __name__ == "__main__":
