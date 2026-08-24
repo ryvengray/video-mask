@@ -1,7 +1,7 @@
 """Video Audit - Independent face detection review tool."""
 
-import asyncio
 import json
+import logging
 import os
 import urllib.parse
 import uuid
@@ -22,6 +22,7 @@ CONTROLLER_URL = os.environ.get("CONTROLLER_URL", "http://localhost:8000")
 CONTROLLER_TOKEN = os.environ.get("CONTROLLER_TOKEN", "")
 CONTROLLER_AUTH_USER = os.environ.get("CONTROLLER_AUTH_USER", "")
 CONTROLLER_AUTH_PASS = os.environ.get("CONTROLLER_AUTH_PASS", "")
+logger = logging.getLogger(__name__)
 
 
 def _controller_headers() -> dict[str, str]:
@@ -96,6 +97,14 @@ async def sync_task(task_id: int):
         raise HTTPException(status_code=404, detail="Task not found")
     controller_task_id = task["controller_task_id"]
     auth = _controller_auth()
+    task_info: dict = {}
+    DB.update_task(task_id, status="syncing")
+
+    # The metadata endpoint is an admin endpoint and requires the Controller
+    # Bearer token.  The playback endpoint intentionally does not: Nginx
+    # Basic Auth is sufficient for a video-audit deployment that only needs to
+    # retrieve video bytes.  Do not make an optional metadata lookup prevent a
+    # download that the playback endpoint permits.
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -103,40 +112,59 @@ async def sync_task(task_id: int):
                 headers=_controller_headers(),
                 auth=auth,
             )
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail="Failed to fetch from controller")
-            task_info = response.json()
-    except Exception as exc:
-        DB.update_task(task_id, status="error")
-        raise HTTPException(status_code=500, detail=f"Controller fetch failed: {exc}")
-    output_key = task_info.get("output_object_key") or task_info.get("source_object_key")
-    if output_key:
-        local_path = APP_DIR / "videos" / f"{controller_task_id}.mp4"
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{CONTROLLER_URL}/api/tasks/{controller_task_id}/play?file=output",
-                    headers=_controller_headers(),
-                    auth=auth,
+            if response.status_code == 200:
+                task_info = response.json()
+            else:
+                logger.info(
+                    "Controller metadata for %s was unavailable (%s); continuing with playback",
+                    controller_task_id, response.status_code,
                 )
-                if response.status_code == 200:
-                    local_path.write_bytes(response.content)
+    except httpx.HTTPError as exc:
+        logger.info("Controller metadata lookup for %s failed: %s", controller_task_id, exc)
+
+    local_path = APP_DIR / "videos" / f"{controller_task_id}.mp4"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = local_path.with_suffix(local_path.suffix + ".part")
+    last_status: int | None = None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=3600.0)) as client:
+            # Processed output is preferred for review.  A source-only or
+            # still-running task transparently falls back to its input video.
+            for file_kind in ("output", "input"):
+                url = f"{CONTROLLER_URL}/api/tasks/{controller_task_id}/play?file={file_kind}"
+                async with client.stream("GET", url, headers=_controller_headers(), auth=auth) as response:
+                    last_status = response.status_code
+                    if not 200 <= response.status_code < 300:
+                        if response.status_code in {401, 403}:
+                            break
+                        continue
+                    with temporary_path.open("wb") as destination:
+                        async for chunk in response.aiter_bytes(64 * 1024):
+                            destination.write(chunk)
+                    temporary_path.replace(local_path)
+                    info = dict(task_info)
+                    info["downloaded_file"] = file_kind
                     DB.update_task(
                         task_id,
                         status="ready",
                         local_video_path=str(local_path),
-                        controller_info=json.dumps(task_info),
+                        controller_info=json.dumps(info),
                     )
-                else:
-                    DB.update_task(task_id, status="error")
-                    raise HTTPException(status_code=500, detail="Failed to download video")
-        except Exception as exc:
-            DB.update_task(task_id, status="error")
-            raise HTTPException(status_code=500, detail=f"Video download failed: {exc}")
-    else:
+                    return DB.get_task(task_id)
+    except (httpx.HTTPError, OSError) as exc:
+        temporary_path.unlink(missing_ok=True)
         DB.update_task(task_id, status="error")
-        raise HTTPException(status_code=404, detail="No video available for this task")
-    return DB.get_task(task_id)
+        raise HTTPException(status_code=502, detail=f"Video download failed: {exc}") from exc
+
+    temporary_path.unlink(missing_ok=True)
+    DB.update_task(task_id, status="error")
+    if last_status in {401, 403}:
+        raise HTTPException(
+            status_code=502,
+            detail=("Controller playback rejected the configured credentials. "
+                    "Set CONTROLLER_AUTH_USER and CONTROLLER_AUTH_PASS for Nginx Basic Auth."),
+        )
+    raise HTTPException(status_code=404, detail="No output or source video is available for this task")
 
 
 @app.get("/api/tasks/{task_id}")
