@@ -139,6 +139,27 @@ def test_content_tags_are_saved_normalised_and_listed_for_reuse(tmp_path: Path):
     store.close()
 
 
+def test_random_content_label_claim_ignores_face_state(tmp_path: Path):
+    store = new_store(tmp_path)
+    tagged = store.create_task(task_payload())
+    needs_tags_payload = task_payload()
+    needs_tags_payload["source_url"] = "https://storage.example/needs-tags.mov"
+    needs_tags = store.create_task(needs_tags_payload)
+    store.conn.execute("UPDATE tasks SET status='completed', content_tags_json=? WHERE task_id=?", (
+        json.dumps(["Laundry"]), tagged["task_id"],
+    ))
+    # A missing face choice must not make this already content-tagged task
+    # eligible; a known face state must not exclude the task needing tags.
+    store.conn.execute(
+        "UPDATE tasks SET status='completed', face_annotation=1 WHERE task_id=?", (needs_tags["task_id"],)
+    )
+    store.conn.commit()
+
+    claimed = store.claim_next_face_review("browser-a-unique-id", 300)
+    assert claimed and claimed["task_id"] == needs_tags["task_id"]
+    store.close()
+
+
 def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     store = ClusterStore(database)

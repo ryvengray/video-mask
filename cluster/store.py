@@ -443,7 +443,11 @@ class ClusterStore:
 
     @synchronized
     def claim_next_face_review(self, reviewer_id: str, lease_seconds: int) -> dict[str, Any] | None:
-        """Atomically reserve a random completed video needing a manual label."""
+        """Atomically reserve a random completed video missing content tags.
+
+        Face presence is a separate optional annotation and must never affect
+        which task is selected by the content-label workflow.
+        """
         stamp = now()
         lease_until = stamp + lease_seconds
         self.conn.execute("BEGIN IMMEDIATE")
@@ -451,7 +455,7 @@ class ClusterStore:
             self._expire_face_review_leases(stamp)
             row = self.conn.execute("""
                 SELECT task_id FROM tasks
-                WHERE status='completed' AND (face_annotation IS NULL OR content_tags_json IS NULL)
+                WHERE status='completed' AND content_tags_json IS NULL
                   AND source_object_key IS NOT NULL
                   AND face_review_owner IS NULL
                 ORDER BY RANDOM()
