@@ -857,7 +857,7 @@ class ClusterStore:
             FROM content_categories AS categories
             JOIN tasks ON tasks.content_category_id=categories.category_id
             WHERE {status_filter}
-              AND """ + key_column + """ IS NOT NULL
+              AND {key_column} IS NOT NULL
             ORDER BY categories.name COLLATE NOCASE, {order_by}, tasks.task_id DESC
         """).fetchall()
         grouped: dict[int, dict[str, Any]] = {}
