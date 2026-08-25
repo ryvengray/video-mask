@@ -443,7 +443,7 @@ class ClusterStore:
 
     @synchronized
     def claim_next_face_review(self, reviewer_id: str, lease_seconds: int) -> dict[str, Any] | None:
-        """Atomically reserve a random source video missing content tags.
+        """Atomically reserve a random non-test source video missing content tags.
 
         Face presence is a separate optional annotation and must never affect
         which task is selected by the content-label workflow.
@@ -456,6 +456,8 @@ class ClusterStore:
             row = self.conn.execute("""
                 SELECT task_id FROM tasks
                 WHERE content_tags_json IS NULL AND source_object_key IS NOT NULL
+                  AND source_object_key NOT LIKE 'test/%'
+                  AND source_object_key NOT LIKE '/test/%'
                   AND face_review_owner IS NULL
                 ORDER BY RANDOM()
                 LIMIT 1

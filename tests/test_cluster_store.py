@@ -158,6 +158,25 @@ def test_random_content_label_claim_ignores_face_state(tmp_path: Path):
     store.close()
 
 
+def test_random_content_label_claim_excludes_test_source_prefix(tmp_path: Path):
+    store = new_store(tmp_path)
+    test_task = store.create_task({
+        **task_payload(),
+        "source_url": "https://storage.example/test.mov",
+        "source_object_key": "test/sample/test.mov",
+    })
+    production_task = store.create_task({
+        **task_payload(),
+        "source_url": "https://storage.example/production.mov",
+        "source_object_key": "cn-shanghai/video-capture/production.mov",
+    })
+
+    claimed = store.claim_next_face_review("browser-a-unique-id", 300)
+    assert claimed and claimed["task_id"] == production_task["task_id"]
+    assert store.task(test_task["task_id"])["face_review_owner"] is None
+    store.close()
+
+
 def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     store = ClusterStore(database)
