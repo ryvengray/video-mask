@@ -889,6 +889,7 @@ class ClusterStore:
             ORDER BY categories.name COLLATE NOCASE, {order_by}, tasks.task_id DESC
         """).fetchall()
         grouped: dict[int, dict[str, Any]] = {}
+        category_video_counts: dict[int, int] = {}
         for row in rows:
             category_id = int(row[0])
             category = grouped.setdefault(category_id, {
@@ -897,13 +898,18 @@ class ClusterStore:
             key = row[3] if file == "input" else row[4]
             if not key:
                 continue
+            category_video_counts[category_id] = category_video_counts.get(category_id, 0) + 1
             if len(category["videos"]) >= limit:
                 continue
             category["videos"].append({
                 "task_id": str(row[2]), "file": file,
                 "filename": Path(str(key)).name or "video.mp4",
             })
-        return list(grouped.values())
+        return sorted(
+            grouped.values(),
+            key=lambda category: (-category_video_counts[category["category_id"]],
+                                  str(category["name"]).casefold(), category["category_id"]),
+        )
 
     @synchronized
     def public_category_catalog_item(self, share_id: str, task_id: str) -> dict[str, Any] | None:

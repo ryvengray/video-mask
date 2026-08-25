@@ -305,6 +305,27 @@ def test_public_category_catalog_defaults_to_ten_and_hides_over_limit_items(tmp_
     store.close()
 
 
+def test_public_category_catalog_orders_categories_by_total_video_count(tmp_path: Path):
+    store = new_store(tmp_path)
+    fewer = store.create_content_category("Fewer videos")
+    more = store.create_content_category("More videos")
+    for index in range(3):
+        payload = task_payload()
+        payload["source_object_key"] = f"source/inbox/more-{index}.mov"
+        task = store.create_task(payload)
+        store.set_task_content_category(task["task_id"], more["category_id"])
+    task = store.create_task(task_payload())
+    store.set_task_content_category(task["task_id"], fewer["category_id"])
+    share_id = "public_category_order_test"
+    store.set_category_share_id(share_id)
+
+    catalog = store.public_category_catalog(share_id)
+
+    assert catalog is not None
+    assert [category["name"] for category in catalog] == ["More videos", "Fewer videos"]
+    store.close()
+
+
 def test_task_list_can_filter_by_content_category(tmp_path: Path):
     store = new_store(tmp_path)
     laundry_task = store.create_task(task_payload())
