@@ -730,10 +730,9 @@ function renderContentCategoryManager() {
       const label = document.createElement('span');
       label.textContent = `${category.name} (${category.task_count} task${category.task_count === 1 ? '' : 's'})`;
       const remove = document.createElement('button');
-      remove.type = 'button'; remove.className = 'play-btn'; remove.textContent = 'Delete';
-      remove.disabled = category.task_count > 0;
-      remove.title = category.task_count ? 'Remove this category from its tasks before deleting it.' : 'Delete category';
-      remove.addEventListener('click', () => deleteContentCategory(category.category_id));
+      remove.type = 'button'; remove.className = 'play-btn'; remove.textContent = 'Hide';
+      remove.title = category.task_count ? `Hide category while retaining its ${category.task_count} task assignment(s)` : 'Hide category';
+      remove.addEventListener('click', () => deleteContentCategory(category));
       row.append(label, remove); list.append(row);
     });
   }
@@ -795,13 +794,18 @@ async function createContentCategory(event) {
   } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to add category.'; }
 }
 
-async function deleteContentCategory(categoryId) {
+async function deleteContentCategory(category) {
+  const categoryId = category.category_id;
   const message = contentCategoryModal.querySelector('#content-category-message');
+  const detail = category.task_count ? ` Its ${category.task_count} task assignment(s) will be retained.` : '';
+  if (!window.confirm(`Hide category “${category.name}”?${detail}`)) return;
   try {
     const response = await fetch(`/api/dashboard/content-categories/${encodeURIComponent(categoryId)}`, {method: 'DELETE'});
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
-    message.textContent = 'Category deleted.'; await loadContentCategories();
+    const retained = Number(payload.retained_tasks) || 0;
+    message.textContent = retained ? `Category hidden; ${retained} task assignment(s) retained.` : 'Category hidden.';
+    await loadContentCategories();
   } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to delete category.'; }
 }
 

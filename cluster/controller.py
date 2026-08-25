@@ -944,12 +944,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.delete("/api/dashboard/content-categories/{category_id}")
-    def delete_content_category(category_id: int) -> dict[str, bool]:
+    def delete_content_category(category_id: int) -> dict[str, bool | int]:
         try:
-            store.delete_content_category(category_id)
+            retained_tasks = store.delete_content_category(category_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"deleted": True}
+        return {"deleted": True, "retained_tasks": retained_tasks}
 
     @app.put("/api/dashboard/tasks/{task_id}/content-category")
     def set_dashboard_task_content_category(task_id: str, request: TaskContentCategoryRequest) -> dict[str, Any]:

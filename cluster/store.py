@@ -116,7 +116,8 @@ class ClusterStore:
         CREATE TABLE IF NOT EXISTS content_categories (
             category_id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            deleted_at REAL
         );
         CREATE TABLE IF NOT EXISTS video_shares (
             share_id TEXT PRIMARY KEY,
@@ -147,6 +148,9 @@ class ClusterStore:
             WHERE NOT EXISTS (SELECT 1 FROM algorithm_defaults WHERE id = 1)
         """, (now(),))
         task_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(tasks)")}
+        category_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(content_categories)")}
+        if "deleted_at" not in category_columns:
+            self.conn.execute("ALTER TABLE content_categories ADD COLUMN deleted_at REAL")
         if "restarted_at" not in task_columns:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN restarted_at REAL")
         for column, definition in (
@@ -742,6 +746,7 @@ class ClusterStore:
             SELECT categories.category_id, categories.name, COUNT(tasks.task_id) AS task_count
             FROM content_categories AS categories
             LEFT JOIN tasks ON tasks.content_category_id=categories.category_id
+            WHERE categories.deleted_at IS NULL
             GROUP BY categories.category_id, categories.name
             ORDER BY categories.name COLLATE NOCASE, categories.category_id
         """).fetchall()
@@ -750,6 +755,22 @@ class ClusterStore:
     @synchronized
     def create_content_category(self, name: str) -> dict[str, Any]:
         category = self._normalise_content_category(name)
+        existing = self.conn.execute(
+            "SELECT category_id, name, deleted_at FROM content_categories WHERE name=? COLLATE NOCASE",
+            (category,),
+        ).fetchone()
+        if existing is not None:
+            if existing[2] is None:
+                raise ValueError("a content category with this name already exists")
+            category_id = int(existing[0])
+            self.conn.execute(
+                "UPDATE content_categories SET deleted_at=NULL WHERE category_id=?", (category_id,),
+            )
+            task_count = int(self.conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE content_category_id=?", (category_id,),
+            ).fetchone()[0])
+            self.conn.commit()
+            return {"category_id": category_id, "name": str(existing[1]), "task_count": task_count}
         try:
             cursor = self.conn.execute(
                 "INSERT INTO content_categories(name, created_at) VALUES(?, ?)", (category, now()),
@@ -761,16 +782,22 @@ class ClusterStore:
         return {"category_id": int(cursor.lastrowid), "name": category, "task_count": 0}
 
     @synchronized
-    def delete_content_category(self, category_id: int) -> None:
-        assigned = self.conn.execute(
+    def delete_content_category(self, category_id: int) -> int:
+        exists = self.conn.execute(
+            "SELECT 1 FROM content_categories WHERE category_id=? AND deleted_at IS NULL", (category_id,)
+        ).fetchone()
+        if exists is None:
+            raise ValueError("content category does not exist")
+        assigned = int(self.conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE content_category_id=?", (category_id,)
-        ).fetchone()[0]
-        if assigned:
-            raise ValueError("remove this category from its tasks before deleting it")
-        cursor = self.conn.execute("DELETE FROM content_categories WHERE category_id=?", (category_id,))
+        ).fetchone()[0])
+        cursor = self.conn.execute(
+            "UPDATE content_categories SET deleted_at=? WHERE category_id=?", (now(), category_id),
+        )
         self.conn.commit()
         if cursor.rowcount != 1:
             raise ValueError("content category does not exist")
+        return assigned
 
     @synchronized
     def set_task_content_category(self, task_id: str, category_id: int | None) -> dict[str, Any]:
@@ -778,7 +805,7 @@ class ClusterStore:
             raise ValueError("task does not exist")
         if category_id is not None:
             exists = self.conn.execute(
-                "SELECT 1 FROM content_categories WHERE category_id=?", (category_id,)
+                "SELECT 1 FROM content_categories WHERE category_id=? AND deleted_at IS NULL", (category_id,)
             ).fetchone()
             if exists is None:
                 raise ValueError("content category does not exist")
@@ -884,7 +911,8 @@ class ClusterStore:
               tasks.source_object_key, tasks.output_object_key
             FROM content_categories AS categories
             JOIN tasks ON tasks.content_category_id=categories.category_id
-            WHERE {status_filter}
+            WHERE categories.deleted_at IS NULL
+              AND {status_filter}
               AND {key_column} IS NOT NULL
             ORDER BY categories.name COLLATE NOCASE, {order_by}, tasks.task_id DESC
         """).fetchall()

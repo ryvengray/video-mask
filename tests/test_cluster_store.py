@@ -251,8 +251,13 @@ def test_content_categories_assign_one_per_task_and_build_public_catalog(tmp_pat
     assert [(item["name"], item["task_count"]) for item in store.content_categories()] == [
         ("Laundry", 1), ("Tidy room", 0),
     ]
-    with pytest.raises(ValueError, match="remove this category"):
-        store.delete_content_category(laundry["category_id"])
+    assert store.delete_content_category(laundry["category_id"]) == 1
+    assert store.task(task["task_id"])["content_category_id"] == laundry["category_id"]
+    assert [(item["name"], item["task_count"]) for item in store.content_categories()] == [
+        ("Tidy room", 0),
+    ]
+    restored = store.create_content_category("laundry")
+    assert restored == {"category_id": laundry["category_id"], "name": "Laundry", "task_count": 1}
 
     share_id = "customer_video_library_2026"
     assert store.set_category_share_id(share_id) == share_id
