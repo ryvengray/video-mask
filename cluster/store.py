@@ -816,6 +816,19 @@ class ClusterStore:
         return str(row[0]) if row and row[0] in {"input", "output"} else "input"
 
     @synchronized
+    def category_share_limit(self) -> int:
+        """Return the public page's per-category video limit (default 10)."""
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings "
+            "WHERE setting_key='content_category_share_limit'"
+        ).fetchone()
+        try:
+            value = int(str(row[0])) if row else 10
+        except (TypeError, ValueError):
+            value = 10
+        return value if 1 <= value <= 100 else 10
+
+    @synchronized
     def set_category_share_id(self, share_id: str) -> str:
         value = share_id.strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", value):
@@ -843,11 +856,26 @@ class ClusterStore:
         return file
 
     @synchronized
+    def set_category_share_limit(self, limit: int) -> int:
+        value = int(limit)
+        if not 1 <= value <= 100:
+            raise ValueError("shared category video limit must be between 1 and 100")
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES('content_category_share_limit', ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (str(value), now()))
+        self.conn.commit()
+        return value
+
+    @synchronized
     def public_category_catalog(self, share_id: str) -> list[dict[str, Any]] | None:
         configured = self.category_share_id()
         if not configured or configured != share_id:
             return None
         file = self.category_share_file()
+        limit = self.category_share_limit()
         key_column = "tasks.source_object_key" if file == "input" else "tasks.output_object_key"
         status_filter = "tasks.status='completed'" if file == "output" else "1=1"
         order_by = "tasks.finished_at DESC" if file == "output" else "tasks.created_at DESC"
@@ -869,6 +897,8 @@ class ClusterStore:
             key = row[3] if file == "input" else row[4]
             if not key:
                 continue
+            if len(category["videos"]) >= limit:
+                continue
             category["videos"].append({
                 "task_id": str(row[2]), "file": file,
                 "filename": Path(str(key)).name or "video.mp4",
@@ -877,22 +907,17 @@ class ClusterStore:
 
     @synchronized
     def public_category_catalog_item(self, share_id: str, task_id: str) -> dict[str, Any] | None:
-        configured = self.category_share_id()
-        if not configured or configured != share_id:
+        # Limit direct video/cover URLs to the same items that are visible in
+        # the public catalog.  Otherwise a hidden 11th item could still be
+        # accessed by guessing its task ID.
+        catalog = self.public_category_catalog(share_id)
+        if catalog is None:
             return None
-        file = self.category_share_file()
-        key_column = "source_object_key" if file == "input" else "output_object_key"
-        status_filter = "status='completed'" if file == "output" else "1=1"
-        row = self.conn.execute(f"""
-            SELECT tasks.source_object_key, tasks.output_object_key
-            FROM tasks
-            WHERE task_id=? AND {status_filter} AND content_category_id IS NOT NULL
-              AND """ + key_column + """ IS NOT NULL
-        """, (task_id,)).fetchone()
-        if row is None:
-            return None
-        key = row[0] if file == "input" else row[1]
-        return {"task_id": task_id, "file": file, "filename": Path(str(key)).name or "video.mp4"}
+        for category in catalog:
+            for item in category["videos"]:
+                if item["task_id"] == task_id:
+                    return dict(item)
+        return None
 
     @synchronized
     def create_video_share(self, task_ids: list[str], files: list[str],

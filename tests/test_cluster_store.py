@@ -274,6 +274,37 @@ def test_content_categories_assign_one_per_task_and_build_public_catalog(tmp_pat
     store.close()
 
 
+def test_public_category_catalog_defaults_to_ten_and_hides_over_limit_items(tmp_path: Path):
+    store = new_store(tmp_path)
+    category = store.create_content_category("Library")
+    task_ids = []
+    for index in range(11):
+        payload = task_payload()
+        payload["source_url"] = f"https://storage.example/{index}.mov"
+        payload["source_object_key"] = f"source/inbox/{index}.mov"
+        task = store.create_task(payload)
+        task_ids.append(task["task_id"])
+        store.conn.execute(
+            "UPDATE tasks SET status='completed', content_category_id=? WHERE task_id=?",
+            (category["category_id"], task["task_id"]),
+        )
+    store.conn.commit()
+    share_id = "public_category_limit_test"
+    store.set_category_share_id(share_id)
+
+    assert store.category_share_limit() == 10
+    catalog = store.public_category_catalog(share_id)
+    assert catalog and len(catalog[0]["videos"]) == 10
+    visible_ids = {item["task_id"] for item in catalog[0]["videos"]}
+    hidden_id = next(task_id for task_id in task_ids if task_id not in visible_ids)
+    assert store.public_category_catalog_item(share_id, hidden_id) is None
+
+    assert store.set_category_share_limit(2) == 2
+    limited = store.public_category_catalog(share_id)
+    assert limited and len(limited[0]["videos"]) == 2
+    store.close()
+
+
 def test_task_list_can_filter_by_content_category(tmp_path: Path):
     store = new_store(tmp_path)
     laundry_task = store.create_task(task_payload())

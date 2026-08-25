@@ -613,7 +613,7 @@ async function submitTaskShare(event) {
 ensureTaskShareSelection();
 document.addEventListener('keydown', event => { if (event.key === 'Escape') closeTaskShareModal(); });
 
-let contentCategoryState = {categories: [], assignments: {}, shareId: '', shareFile: 'input'};
+let contentCategoryState = {categories: [], assignments: {}, shareId: '', shareFile: 'input', shareLimit: 10};
 let contentCategoryModal;
 
 function contentCategoryTaskIds() {
@@ -690,6 +690,7 @@ async function loadContentCategories() {
       categories: Array.isArray(payload.categories) ? payload.categories : [],
       assignments: payload.assignments || {}, shareId: payload.share_id || '',
       shareFile: payload.share_file === 'output' ? 'output' : 'input',
+      shareLimit: Number(payload.share_max_videos_per_category) || 10,
     };
     renderContentCategoryCells();
     renderContentCategoryManager();
@@ -740,6 +741,8 @@ function renderContentCategoryManager() {
   if (document.activeElement !== shareInput) shareInput.value = contentCategoryState.shareId;
   const shareFile = contentCategoryModal.querySelector('#content-category-share-file');
   if (document.activeElement !== shareFile) shareFile.value = contentCategoryState.shareFile;
+  const shareLimit = contentCategoryModal.querySelector('#content-category-share-limit');
+  if (document.activeElement !== shareLimit) shareLimit.value = String(contentCategoryState.shareLimit || 10);
 }
 
 function ensureContentCategoryModal() {
@@ -751,7 +754,7 @@ function ensureContentCategoryModal() {
         <div class="play-modal-head"><div><h3 id="content-category-modal-title">Content categories</h3><p class="play-modal-sub">One category can be selected for each task.</p></div><button class="play-modal-close" type="button" data-content-category-close aria-label="Close">&times;</button></div>
         <form id="content-category-add-form" class="content-category-add-form"><input id="content-category-name" type="text" maxlength="64" placeholder="e.g. Laundry" required><button class="play-btn play-btn-open" type="submit">Add category</button></form>
         <div id="content-category-list" class="content-category-list"></div>
-        <section class="content-category-public"><h4>Public category page</h4><p class="play-modal-note">This page is public. Use a hard-to-guess ID (16–64 letters, numbers, hyphens, or underscores).</p><label class="content-category-share-file" for="content-category-share-file">Share video<select id="content-category-share-file"><option value="input">Source video</option><option value="output">Processed video</option></select></label><div class="content-category-share-entry"><input id="content-category-share-id" type="text" maxlength="64" placeholder="special share ID"><button id="content-category-share-generate" class="play-btn" type="button">Generate</button><button id="content-category-share-save" class="play-btn play-btn-open" type="button">Save</button></div><div id="content-category-share-link-area" hidden><input id="content-category-share-link" class="task-share-link" type="text" readonly aria-label="Public category page link"><button id="content-category-share-copy" class="play-btn play-btn-open" type="button">Copy link</button></div><p id="content-category-message" class="play-modal-note"></p></section>
+        <section class="content-category-public"><h4>Public category page</h4><p class="play-modal-note">This page is public. Use a hard-to-guess ID (16–64 letters, numbers, hyphens, or underscores).</p><label class="content-category-share-file" for="content-category-share-file">Share video<select id="content-category-share-file"><option value="input">Source video</option><option value="output">Processed video</option></select></label><label class="content-category-share-file" for="content-category-share-limit">Videos per category<input id="content-category-share-limit" type="number" min="1" max="100" value="10" required></label><div class="content-category-share-entry"><input id="content-category-share-id" type="text" maxlength="64" placeholder="special share ID"><button id="content-category-share-generate" class="play-btn" type="button">Generate</button><button id="content-category-share-save" class="play-btn play-btn-open" type="button">Save</button></div><div id="content-category-share-link-area" hidden><input id="content-category-share-link" class="task-share-link" type="text" readonly aria-label="Public category page link"><button id="content-category-share-copy" class="play-btn play-btn-open" type="button">Copy link</button></div><p id="content-category-message" class="play-modal-note"></p></section>
         <div class="play-modal-actions"><button class="play-btn" type="button" data-content-category-close>Close</button></div>
       </div>
     </div>`);
@@ -805,16 +808,19 @@ async function deleteContentCategory(categoryId) {
 async function saveContentCategoryShare() {
   const input = contentCategoryModal.querySelector('#content-category-share-id');
   const file = contentCategoryModal.querySelector('#content-category-share-file');
+  const limit = contentCategoryModal.querySelector('#content-category-share-limit');
   const message = contentCategoryModal.querySelector('#content-category-message');
   try {
     const response = await fetch('/api/dashboard/content-category-share', {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({share_id: input.value.trim(), file: file.value}),
+      body: JSON.stringify({share_id: input.value.trim(), file: file.value,
+        max_videos_per_category: Number(limit.value)}),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
     contentCategoryState.shareId = payload.share_id;
     contentCategoryState.shareFile = payload.share_file === 'output' ? 'output' : 'input';
+    contentCategoryState.shareLimit = Number(payload.max_videos_per_category) || 10;
     contentCategoryModal.querySelector('#content-category-share-link').value = new URL(payload.url, window.location.origin).href;
     contentCategoryModal.querySelector('#content-category-share-link-area').hidden = false;
     message.textContent = 'Public category page saved.';
