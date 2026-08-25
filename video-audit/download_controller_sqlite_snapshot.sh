@@ -19,7 +19,7 @@ Options:
   --user USER             SSH user (default: ubuntu)
   --remote-db PATH        Controller SQLite path
                           (default: /var/lib/video-mask-controller/controller.sqlite3)
-  --out-dir PATH          Local snapshot directory (default: ./controller-snapshots)
+  --out-dir PATH          Local snapshot directory (default: ~/data/controller-snapshots)
   --delete-remote         Delete the remote temporary snapshot after checksum verification
   -h, --help              Show this help
 
@@ -34,7 +34,7 @@ PEM_FILE=""
 CONTROLLER_HOST=""
 CONTROLLER_USER="ubuntu"
 REMOTE_DATABASE="/var/lib/video-mask-controller/controller.sqlite3"
-OUTPUT_DIR="./controller-snapshots"
+OUTPUT_DIR="${HOME}/data/controller-snapshots"
 DELETE_REMOTE=0
 
 while [[ $# -gt 0 ]]; do
