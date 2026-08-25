@@ -849,14 +849,16 @@ class ClusterStore:
             return None
         file = self.category_share_file()
         key_column = "tasks.source_object_key" if file == "input" else "tasks.output_object_key"
-        rows = self.conn.execute("""
+        status_filter = "tasks.status='completed'" if file == "output" else "1=1"
+        order_by = "tasks.finished_at DESC" if file == "output" else "tasks.created_at DESC"
+        rows = self.conn.execute(f"""
             SELECT categories.category_id, categories.name, tasks.task_id,
               tasks.source_object_key, tasks.output_object_key
             FROM content_categories AS categories
             JOIN tasks ON tasks.content_category_id=categories.category_id
-            WHERE tasks.status='completed'
+            WHERE {status_filter}
               AND """ + key_column + """ IS NOT NULL
-            ORDER BY categories.name COLLATE NOCASE, tasks.finished_at DESC, tasks.task_id DESC
+            ORDER BY categories.name COLLATE NOCASE, {order_by}, tasks.task_id DESC
         """).fetchall()
         grouped: dict[int, dict[str, Any]] = {}
         for row in rows:
@@ -880,10 +882,11 @@ class ClusterStore:
             return None
         file = self.category_share_file()
         key_column = "source_object_key" if file == "input" else "output_object_key"
-        row = self.conn.execute("""
+        status_filter = "status='completed'" if file == "output" else "1=1"
+        row = self.conn.execute(f"""
             SELECT tasks.source_object_key, tasks.output_object_key
             FROM tasks
-            WHERE task_id=? AND status='completed' AND content_category_id IS NOT NULL
+            WHERE task_id=? AND {status_filter} AND content_category_id IS NOT NULL
               AND """ + key_column + """ IS NOT NULL
         """, (task_id,)).fetchone()
         if row is None:
