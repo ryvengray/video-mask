@@ -60,7 +60,7 @@ class S3Ingestor:
 
         For example, with ``source_prefix=source/inbox`` and
         ``output_prefix=outputs``, ``source/inbox/s/s/m.mp4`` becomes
-        ``outputs/s/s/masked_m.mp4``.  Keeping the relative path prevents
+        ``outputs/s/s/m.mp4``.  Keeping the relative path prevents
         identically named videos in different source folders from overwriting
         one another in the output bucket.
         """
@@ -69,7 +69,11 @@ class S3Ingestor:
         if prefix and source_key.startswith(prefix):
             relative = source_key[len(prefix):]
         path = PurePosixPath(relative)
-        filename = f"masked_{path.stem}.mp4"
+        # S3 output keeps the source basename exactly as-is.  The Worker only
+        # uploads to the pre-signed URL supplied here, so this key controls the
+        # final target-bucket filename independently of its local masked_*.mp4
+        # working file.
+        filename = path.name
         parts = [part for part in (self.output_prefix, str(path.parent), filename) if part and part != "."]
         return "/".join(parts)
 
