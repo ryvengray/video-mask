@@ -165,6 +165,40 @@ def test_newly_pending_task_waits_for_ready_worker_to_claim(tmp_path: Path):
     assert actions == []
 
 
+def test_paused_task_dispatch_does_not_start_workers_for_queued_tasks(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path))
+    hosts = [PoolHost("172.31.35.195", "stopped", "slave-01")]
+    stamp = time.time()
+
+    actions = scaler.plan(hosts, [], pending=20, oldest_pending_created_at=stamp - 3600,
+                          state={"idle_since": {}, "start_requested_at": {}}, stamp=stamp,
+                          task_dispatch_enabled=False)
+
+    assert actions == []
+
+
+def test_queue_and_workers_requires_controller_dispatch_state(tmp_path: Path, monkeypatch):
+    scaler = Autoscaler(scaler_args(tmp_path))
+    monkeypatch.setattr(scaler, "api", lambda _path: {"total": 0, "workers": []})
+
+    with pytest.raises(RuntimeError, match="task_dispatch_enabled"):
+        scaler.queue_and_workers()
+
+
+def test_paused_task_dispatch_allows_idle_workers_to_shut_down(tmp_path: Path):
+    scaler = Autoscaler(scaler_args(tmp_path, min_running_hosts=0))
+    hosts = [PoolHost("172.31.35.195", "running", "slave-01")]
+    stamp = time.time()
+
+    actions = scaler.plan(
+        hosts, [worker("172.31.35.195")], pending=20, oldest_pending_created_at=stamp - 3600,
+        state={"idle_since": {"172.31.35.195": stamp - 3600}, "start_requested_at": {}}, stamp=stamp,
+        task_dispatch_enabled=False,
+    )
+
+    assert [(action.kind, action.host.private_ip) for action in actions] == [("stop", "172.31.35.195")]
+
+
 def test_stop_grace_skips_a_host_while_its_prior_stop_is_still_settling(tmp_path: Path):
     scaler = Autoscaler(scaler_args(tmp_path, min_running_hosts=0))
     hosts = [PoolHost("172.31.35.195", "running", "slave-01"),

@@ -1302,6 +1302,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "tasks": store.list_tasks(page_size, page_offset, statuses),
             "total": store.count_tasks(statuses),
             "oldest_created_at": store.oldest_task_created_at(statuses) if statuses else None,
+            "task_dispatch_enabled": task_dispatch_is_enabled(),
             "limit": page_size,
             "offset": page_offset,
         }
