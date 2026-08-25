@@ -163,9 +163,7 @@ if (taskDispatchControl) {
       if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
       enabled = Boolean(payload.enabled);
       renderTaskDispatchState();
-      message.textContent = enabled
-        ? 'Task dispatch is enabled. Pending tasks may now be claimed.'
-        : 'Task dispatch is paused. Running tasks continue normally.';
+      message.textContent = '';
     } catch (error) {
       message.textContent = error instanceof Error ? error.message : 'Unable to update task dispatch.';
     } finally {
