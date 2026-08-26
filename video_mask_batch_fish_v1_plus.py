@@ -74,6 +74,7 @@ HARD_FACE_ROI_SCALE = 3.0
 HARD_FACE_MAX_ROIS = 3             # 每帧最多二检的困难框数量(防止推理爆炸)
 HARD_FACE_ROI_SIZE = 320           # ROI 二检推理尺寸(比主检测 640 小一倍, 提速~75%)
 HARD_FACE_FULL_SCAN_CONF = 0.15    # 全帧低阈值扫描置信度(低于主检测, 独立捕获遗漏人脸)
+HARD_FACE_IMMEDIATE_CONF = 0.45    # ROI二检达到该分数立即确认; 低于则建pending轨迹等二次命中
 SCRFD_ADAPTIVE_VERIFY_MARGIN = 0.15  # 新候选进入10g复核区间的分数增量
 SCRFD_ADAPTIVE_VERIFY_IOU = 0.25     # 10g复核框与候选框的最低IoU
 SCRFD_VERIFIER_MAX_SCORE_DROP = 0.02  # 复核时10g相对候选模型允许的最大分差
@@ -127,7 +128,8 @@ def _ensure_writable_frame(img):
 
 
 def draw_face_debug_scores(img, debug_faces):
-    """绘制模型分值：D=双模型、V=10g、X=左右互证、S/T/H=轨迹稳定。"""
+    """绘制模型分值：D=双模型、V=10g、X=左右互证、S/T/H=轨迹稳定、
+    R=困难召唤ROI、P=pending待确认、U=pending升级确认。"""
     h, w = img.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.45, min(0.85, min(w, h) / 1100.0))
@@ -151,7 +153,8 @@ def draw_face_debug_scores(img, debug_faces):
         cv2.rectangle(img, (tx, top), (min(w - 1, tx + tw + 8), bottom), (0, 0, 0), -1)
         colors = {"D": (0, 255, 0), "V": (255, 0, 255),
                   "S": (255, 180, 0), "T": (0, 200, 255),
-                  "H": (0, 165, 255), "X": (255, 255, 0)}
+                  "H": (0, 165, 255), "X": (255, 255, 0),
+                  "R": (255, 0, 128), "P": (0, 0, 255), "U": (50, 205, 50)}
         color = colors.get(item.get("source"), (0, 200, 255))
         cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(img, text, (tx + 4, ty), font, scale, color, thickness, cv2.LINE_AA)
@@ -598,6 +601,49 @@ class YOLOFaceDetector:
         self._record_timing(time.perf_counter() - started)
         return out
 
+    def detect_batch_with_conf(self, images, conf=FACE_CONF):
+        """批量检测多张同尺寸图像, 返回与 images 对齐的 [[(bbox, conf), ...], ...]。
+
+        左右目恒为同尺寸, letterbox 结果与单张逐像素一致; ultralytics 按
+        图拆分 NMS, 结果等价于逐张推理(仅存在批内核的浮点位级差异)。
+        """
+        if not images:
+            return []
+        if any(img is None or img.size == 0 for img in images):
+            raise ValueError("批量输入包含空图像")
+        started = time.perf_counter()
+        # stream=True: 生成器模式, 减少结果对象包装开销
+        results = self._model(list(images), imgsz=self.yolo_size, conf=conf,
+                              device=self.device, verbose=False, stream=True)
+        out = []
+        for img, r in zip(images, results):
+            h, w = img.shape[:2]
+            img_area = w * h
+            pairs = []
+            if r.boxes is not None:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0]) if box.cls is not None else 0
+                    if cls_id != 0:  # class 0 = face (yolov8n-face 单类别模型)
+                        continue
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    x1, y1 = max(0, int(x1)), max(0, int(y1))
+                    x2, y2 = min(w, int(x2)), min(h, int(y2))
+                    bw, bh = x2 - x1, y2 - y1
+                    if bw <= 0 or bh <= 0:
+                        continue
+                    if bw < FACE_MIN_SIZE or bh < FACE_MIN_SIZE:
+                        continue
+                    if bw * bh > img_area * FACE_MAX_AREA_RATIO:
+                        continue
+                    ratio = bw / bh
+                    if ratio < FACE_ASPECT_MIN or ratio > FACE_ASPECT_MAX:
+                        continue
+                    c = float(box.conf[0]) if box.conf is not None else 0.0
+                    pairs.append(((x1, y1, x2, y2), c))
+            out.append(pairs)
+        self._record_timing(time.perf_counter() - started)
+        return out
+
 
 class YOLO11FaceDetector(YOLOFaceDetector):
     """YOLOv11-nano 人脸检测器 — ultralytics 最新一代模型。
@@ -757,11 +803,18 @@ class DualFaceDetector:
         self.last_score_rejected_count = 0
         self._stereo_split_enabled = False
         self._stereo_low_conf = STEREO_LOW_CONF
+        self._stereo_batch = False
 
-    def enable_stereo_split(self, enabled=True, low_conf=STEREO_LOW_CONF):
-        """启用左右双鱼眼独立检测及同帧软互证。"""
+    def enable_stereo_split(self, enabled=True, low_conf=STEREO_LOW_CONF,
+                            batch=False):
+        """启用左右双鱼眼独立检测及同帧软互证。
+
+        batch=True 时左右目合并成一次批量推理(det_a/det_b 各一次),
+        模型调用从 4 次降到 2 次; 检测器不支持批量时自动回退逐张。
+        """
         self._stereo_split_enabled = bool(enabled)
         self._stereo_low_conf = max(0.0, float(low_conf))
+        self._stereo_batch = bool(batch)
 
     @staticmethod
     def _iou(a, b):
@@ -796,6 +849,42 @@ class DualFaceDetector:
             enriched.append({"box": box, "score": score,
                              "landmark_risk": risk})
         return enriched
+
+    def _detect_batch_with_details(self, detector, images, conf):
+        """批量检测多张同尺寸图像, 返回与 images 对齐的 details 列表。
+
+        检测器无批量接口或批量失败(如 ONNX 固定 batch=1)时自动回退
+        逐张推理, 单张/批量共用同一套共识与过滤逻辑, 语义完全一致。
+        """
+        if len(images) <= 1:
+            return [self._detect_with_details(detector, images[0], conf)]
+        batch_fn = getattr(detector, "detect_batch_with_conf", None)
+        pairs_per_image = None
+        if batch_fn is not None:
+            try:
+                pairs_per_image = batch_fn(images, conf=conf)
+            except Exception:
+                pairs_per_image = None  # 回退逐张
+        if pairs_per_image is None or len(pairs_per_image) != len(images):
+            return [self._detect_with_details(detector, img, conf)
+                    for img in images]
+        details_per_image = getattr(detector, "last_detection_details_batch",
+                                     None)
+        if not details_per_image or len(details_per_image) != len(images):
+            details_per_image = [()] * len(images)
+        out = []
+        for pairs, details in zip(pairs_per_image, details_per_image):
+            enriched = []
+            for box, score in pairs:
+                risk = 0.0
+                for detail in details:
+                    if self._iou(box, detail["box"]) >= 0.999:
+                        risk = float(detail.get("landmark_risk", 0.0))
+                        break
+                enriched.append({"box": box, "score": score,
+                                 "landmark_risk": risk})
+            out.append(enriched)
+        return out
 
     def _is_tracked(self, box, existing_boxes, iou_thresh):
         return any(self._iou(box, old_box) >= iou_thresh
@@ -1020,9 +1109,21 @@ class DualFaceDetector:
         query_raw = (self._stereo_low_conf if raw_conf is None
                      else min(float(raw_conf), self._stereo_low_conf))
 
+        # 左右目批量推理: det_a/det_b 各一次调用跑两目(4次→2次)。
+        # 仅在两目同尺寸时启用; 检测器不支持批量时自动回退逐张。
+        pre_left = pre_right = None
+        if (self._stereo_batch
+                and left_img.shape[:2] == right_img.shape[:2]):
+            a_results = self._detect_batch_with_details(
+                self._det_a, [left_img, right_img], query_raw)
+            b_results = self._detect_batch_with_details(
+                self._det_b, [left_img, right_img], query_raw)
+            pre_left = (a_results[0], b_results[0])
+            pre_right = (a_results[1], b_results[1])
+
         left_result = self._detect_single_view_with_scores(
             left_img, conf, iou_thresh, include_single, query_raw,
-            left_existing, frame_idx, view_key="L")
+            left_existing, frame_idx, view_key="L", precomputed=pre_left)
         left_candidates = list(self.last_candidates)
         left_raw = list(self.last_raw_candidates)
         left_verified = self.last_verified_count
@@ -1030,7 +1131,7 @@ class DualFaceDetector:
 
         right_result = self._detect_single_view_with_scores(
             right_img, conf, iou_thresh, include_single, query_raw,
-            right_existing, frame_idx, view_key="R")
+            right_existing, frame_idx, view_key="R", precomputed=pre_right)
         right_candidates = list(self.last_candidates)
         right_raw = list(self.last_raw_candidates)
         right_verified = self.last_verified_count
@@ -1063,11 +1164,18 @@ class DualFaceDetector:
                                         iou_thresh=0.2,
                                         include_single=False, raw_conf=None,
                                         existing_boxes=None, frame_idx=None,
-                                        view_key=None):
-        """返回已确认框；单模型结果只是候选，不能直接创建轨迹。"""
+                                        view_key=None, precomputed=None):
+        """返回已确认框；单模型结果只是候选，不能直接创建轨迹。
+
+        precomputed: (dets_a_all, dets_b_all) 预计算的原始检测结果
+                     (批量推理路径注入), 为 None 时现场逐模型检测。
+        """
         query_conf = conf if raw_conf is None else min(float(conf), float(raw_conf))
-        dets_a_all = self._detect_with_details(self._det_a, img, query_conf)
-        dets_b_all = self._detect_with_details(self._det_b, img, query_conf)
+        if precomputed is not None:
+            dets_a_all, dets_b_all = precomputed
+        else:
+            dets_a_all = self._detect_with_details(self._det_a, img, query_conf)
+            dets_b_all = self._detect_with_details(self._det_b, img, query_conf)
         dets_a = [item for item in dets_a_all
                   if item["score"] is None or item["score"] >= conf]
         dets_b = [item for item in dets_b_all
@@ -1545,7 +1653,79 @@ class SCRFDFaceDetector:
         preprocess_finished = time.perf_counter()
         outputs = self._sess.run(self._output_names, {self._input_name: blob})
         inference_finished = time.perf_counter()
+        result, details = self._decode_outputs(outputs, scale, w, h, threshold)
+        self.last_detection_details = details
+        postprocess_finished = time.perf_counter()
+        self._record_timing(
+            preprocess_finished - preprocess_started,
+            inference_finished - preprocess_finished,
+            postprocess_finished - inference_finished)
+        return result
 
+    def detect_batch_with_conf(self, images, conf=None):
+        """批量检测多张同尺寸图像, 返回与 images 对齐的 [[(bbox, conf), ...], ...]。
+
+        需要模型导出支持动态 batch: 每个输出首维必须等于 batch 数,
+        否则抛 ValueError 并由上层回退逐张推理(结果语义完全一致)。
+        landmark 风险按图写入 last_detection_details_batch。
+        """
+        if getattr(self, "_batch_ok", True) is False:
+            raise ValueError("SCRFD 模型不支持批量推理(已缓存)")
+        if not images:
+            return []
+        if any(img is None or img.size == 0 for img in images):
+            raise ValueError("批量输入包含空图像")
+        batch = len(images)
+        preprocess_started = time.perf_counter()
+        threshold = self.conf if conf is None else float(conf)
+        blobs = np.empty((batch, 3, self.input_size, self.input_size),
+                         np.float32)
+        scales, shapes = [], []
+        for i, img in enumerate(images):
+            blob, scale = self._prepare_input(img)  # 复用单张预处理缓冲
+            blobs[i] = blob[0]
+            scales.append(scale)
+            shapes.append(img.shape[:2])
+        preprocess_finished = time.perf_counter()
+        try:
+            outputs = self._sess.run(self._output_names,
+                                     {self._input_name: blobs})
+        except Exception as exc:
+            self._batch_ok = False
+            raise ValueError(f"SCRFD 批量推理失败: {exc}") from exc
+        inference_finished = time.perf_counter()
+        # 校验输出按 batch 维组织(官方导出为 (B, N, ...)); 首维不符则
+        # 说明模型为固定 batch=1, 标记后永久回退逐张, 避免逐帧重试。
+        for out in outputs:
+            if not out.shape or out.shape[0] != batch:
+                self._batch_ok = False
+                raise ValueError(
+                    f"SCRFD 模型不支持批量推理(输出shape={out.shape}, "
+                    f"batch={batch})")
+        results, details_batch = [], []
+        for i in range(batch):
+            h, w = shapes[i]
+            result, details = self._decode_outputs(
+                [out[i] for out in outputs], scales[i], w, h, threshold)
+            results.append(result)
+            details_batch.append(details)
+        self.last_detection_details_batch = details_batch
+        # 兼容单张接口的消费方: 暴露最后一张图的 details
+        self.last_detection_details = details_batch[-1] if details_batch else []
+        postprocess_finished = time.perf_counter()
+        self._record_timing(
+            preprocess_finished - preprocess_started,
+            inference_finished - preprocess_finished,
+            postprocess_finished - inference_finished)
+        return results
+
+    def _decode_outputs(self, outputs, scale, w, h, threshold):
+        """解码单张图的 SCRFD 输出; 返回 ([(box, score), ...], details)。
+
+        outputs: 该图的 9 个输出(scores/boxes/kps 各 3 尺度), 单张推理
+        直接传 session 输出((1,N,...)), 批量推理传按 batch 切片后的
+        (N,...); 两种形状经 reshape(-1) 后走同一解码路径。
+        """
         scores_list, boxes_list, kps_list = [], [], []
         for idx, stride in enumerate(self.STRIDES):
             scores = outputs[idx].reshape(-1)
@@ -1564,12 +1744,7 @@ class SCRFDFaceDetector:
             kps = self._distance2kps(positive_anchors, kps_distances)
             kps_list.append(kps)
         if not scores_list:
-            postprocess_finished = time.perf_counter()
-            self._record_timing(
-                preprocess_finished - preprocess_started,
-                inference_finished - preprocess_finished,
-                postprocess_finished - inference_finished)
-            return []
+            return [], []
 
         scores = np.concatenate(scores_list)
         boxes = np.concatenate(boxes_list) / scale
@@ -1597,19 +1772,13 @@ class SCRFDFaceDetector:
             valid = np.asarray(valid, dtype=bool)
             dets = dets[valid]
             kpss = kpss[valid]
-        self.last_detection_details = [
+        details = [
             {"box": tuple(row[:4]), "score": float(row[4]),
              "landmark_risk": self._landmark_soft_risk(row[:4], kps)}
             for row, kps in zip(dets, kpss)
         ]
-        result = [(item["box"], item["score"])
-                  for item in self.last_detection_details]
-        postprocess_finished = time.perf_counter()
-        self._record_timing(
-            preprocess_finished - preprocess_started,
-            inference_finished - preprocess_finished,
-            postprocess_finished - inference_finished)
-        return result
+        result = [(item["box"], item["score"]) for item in details]
+        return result, details
 
 
 class SCRFDVerifier(SCRFDFaceDetector):
@@ -1749,10 +1918,21 @@ def _log_scrfd_timing(detectors, log):
 
 
 class HardFaceRecall:
+    """困难脸二段召回。
+
+    主检测(双模型共识)漏掉的小脸/边缘脸, 先从低分原始候选中取种子,
+    再对种子框 3x 放大的 ROI 区域用 SCRFD-2.5g 轻量模型二检:
+    与主检测 YOLOv8 异构, 提供真正独立的第二意见。
+    二检结果按置信度分级: 高置信直接确认, 低置信建 pending 轨迹
+    等二次命中(时间共识), 杜绝单模型一次低分命中即永久打码。
+    """
     def __init__(self, conf=HARD_FACE_CONF, min_size=HARD_FACE_MIN_SIZE,
                  edge_ratio=HARD_FACE_EDGE_RATIO, roi_scale=HARD_FACE_ROI_SCALE,
-                 max_rois=HARD_FACE_MAX_ROIS, roi_size=HARD_FACE_ROI_SIZE):
+                 max_rois=HARD_FACE_MAX_ROIS, roi_size=HARD_FACE_ROI_SIZE,
+                 immediate_conf=HARD_FACE_IMMEDIATE_CONF):
         self.conf = max(0.0, float(conf))
+        # 立即确认阈值不低于ROI二检阈值, 防止配置倒挂导致全部直接确认
+        self.immediate_conf = max(self.conf, float(immediate_conf))
         self.min_size = max(1, int(min_size))
         self.edge_ratio = min(0.49, max(0.0, float(edge_ratio)))
         self.roi_scale = max(1.0, float(roi_scale))
@@ -1800,13 +1980,16 @@ class HardFaceRecall:
 
     def recall(self, detector, img, raw_candidates, existing_dets,
                dual_iou, roi_detector=None):
-        """低分原始候选困难脸二检。
+        """低分原始候选困难脸二检, 返回 [(box, roi_conf), ...]。
 
         raw_candidates: 主检测器产出的原始候选列表, 仅使用 formal=False
                         (低置信度, 未进入共识) 的候选作为种子。
         existing_dets:  已有的共识检测结果, 用于去重。
-        roi_detector:   专用轻量检测器(如小尺寸 YOLOv8)。
+        roi_detector:   专用轻量检测器(SCRFD-2.5g@320)。
                         为 None 时回退到主检测器。
+        roi_conf:       ROI二检置信度。达到 immediate_conf 视为强证据;
+                        低于则由上层建立 pending 轨迹等二次命中。
+                        主检测器无分数接口时为 None, 按低置信处理。
         """
         height, width = img.shape[:2]
         recalled = []
@@ -1830,18 +2013,19 @@ class HardFaceRecall:
             if x2 <= x1 or y2 <= y1:
                 continue
             roi = img[y1:y2, x1:x2]
-            if roi_detector is not None:
-                boxes = roi_detector.detect(roi, conf=self.conf)
+            target = roi_detector if roi_detector is not None else detector
+            if hasattr(target, "detect_with_conf"):
+                pairs = target.detect_with_conf(roi, conf=self.conf)
             else:
-                boxes = detector.detect(roi, conf=self.conf)
-            for roi_box in boxes:
+                pairs = [(b, None) for b in target.detect(roi, conf=self.conf)]
+            for roi_box, roi_conf in pairs:
                 mapped = (roi_box[0] + x1, roi_box[1] + y1,
                           roi_box[2] + x1, roi_box[3] + y1)
                 if any(self._iou(mapped, ed) >= 0.35 for ed in existing_dets):
                     continue
-                if all(self._iou(mapped, existing) < 0.35
+                if all(self._iou(mapped, existing[0]) < 0.35
                        for existing in recalled):
-                    recalled.append(mapped)
+                    recalled.append((mapped, roi_conf))
         return recalled
 
 
@@ -2164,14 +2348,23 @@ class FaceProcessor:
         self.tracks = active_tracks
 
     def _update_tracks(self, dets, gray, debug_scores=None,
-                       allow_new=None, debug_sources=None, frame_idx=None):
-        """按 IoU/中心距离匹配；未匹配轨迹分别保活，不再整帧清空。"""
+                       allow_new=None, debug_sources=None, frame_idx=None,
+                       new_confirmed=None):
+        """按 IoU/中心距离匹配；未匹配轨迹分别保活，不再整帧清空。
+
+        new_confirmed: 与 dets 对齐的布尔列表。False 表示该检测只建立
+                       pending 轨迹(困难召唤低置信ROI命中), 不打码;
+                       须共识级检测命中或累计第二次命中后才确认,
+                       确认时从首见帧回补打码(时间共识替代模型共识)。
+        """
         if debug_scores is None:
             debug_scores = [None] * len(dets)
         if allow_new is None:
             allow_new = [True] * len(dets)
         if debug_sources is None:
             debug_sources = ["D"] * len(dets)
+        if new_confirmed is None:
+            new_confirmed = [True] * len(dets)
         pairs = []
         for ti, track in enumerate(self.tracks):
             current = track["box"]
@@ -2232,6 +2425,24 @@ class FaceProcessor:
             if debug_scores[di] is not None:
                 track["debug_scores"] = debug_scores[di]
                 track["debug_source"] = debug_sources[di]
+            if not track.get("confirmed", True) and (
+                    new_confirmed[di] or track["hits"] >= 2):
+                # pending轨迹升级: 共识级检测命中(双模型/S/高分ROI)或
+                # 累计第二次命中(时间共识)。升级后从首见帧插值回补,
+                # pending期间不打码的帧在确认时统一补上。
+                track["confirmed"] = True
+                track["debug_source"] = "U"
+                first_frame = track.get("first_frame")
+                if (self.backfill_frames > 0 and frame_idx is not None
+                        and first_frame is not None
+                        and frame_idx > first_frame):
+                    self.last_backfill_events.append({
+                        "start_frame": first_frame,
+                        "start_box": track.get("first_box", track["box"]),
+                        "end_frame": frame_idx,
+                        "end_box": track["box"],
+                        "kind": "pending_confirm",
+                    })
 
         for ti, track in enumerate(self.tracks):
             if ti not in matched_tracks:
@@ -2256,7 +2467,10 @@ class FaceProcessor:
             self.tracks.append({
                 "id": self._next_track_id,
                 "box": box,
-                "confirmed": True,
+                # 困难召唤低置信ROI命中建pending轨迹: 不打码, 等二次确认
+                "confirmed": bool(new_confirmed[di]),
+                "first_frame": frame_idx,
+                "first_box": box,
                 "misses": 0,
                 "hits": 1,
                 "visible": True,
@@ -2383,6 +2597,7 @@ class FaceProcessor:
             if self._burst_remaining > 0:
                 self._burst_remaining -= 1
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
+            new_confirmed = None
             if isinstance(self.detector, DualFaceDetector):
                 dual_dets = self.detector.detect_with_scores(
                     img, conf=self.conf, iou_thresh=self.dual_iou,
@@ -2397,23 +2612,34 @@ class FaceProcessor:
                 dets = [item["box"] for item in dual_dets]
                 debug_scores = [item["scores"] for item in dual_dets]
                 allow_new = [True] * len(dets)
+                new_confirmed = [True] * len(dets)
                 debug_sources = [item.get("source", "D") for item in dual_dets]
+                hard_pending = 0
                 if self.hard_face_recall is not None:
                     raw_cands = list(self.detector.last_raw_candidates)
-                    hard_boxes = self.hard_face_recall.recall(
+                    hard_hits = self.hard_face_recall.recall(
                         self.detector, img, raw_cands, dets, self.dual_iou,
                         roi_detector=self.roi_detector)
                     self.detector.last_candidates = single_candidates
-                    for box in hard_boxes:
+                    for box, roi_conf in hard_hits:
                         if any(self._iou(box, existing) >= 0.35 for existing in dets):
                             continue
                         dets.append(box)
-                        debug_scores.append((("HardROI", self.hard_face_recall.conf),))
+                        debug_scores.append((("HardROI", roi_conf),))
                         allow_new.append(True)
+                        # ROI二检分级: 3x放大后仍达立即确认阈值 → 证据等效
+                        # formal候选直接打码; 低置信 → pending轨迹等二次命中,
+                        # 杜绝单模型一次低分命中即永久打码的误检路径。
+                        immediate = (roi_conf is not None and
+                                     roi_conf >= self.hard_face_recall.immediate_conf)
+                        new_confirmed.append(immediate)
+                        if not immediate:
+                            hard_pending += 1
                         debug_sources.append("R")
                 self._update_backfill_candidates(
                     frame_idx, dual_dets, single_candidates)
-                detection_count = len(dets)
+                # pending命中不计入人数变化, 避免误检触发burst逐帧自持
+                detection_count = len(dets) - hard_pending
                 # 新人脸必须双模型共识；已确认人脸遇到运动模糊时，
                 # 允许 YOLO/SCRFD 任一模型续轨。这些框 allow_new=False，
                 # 因此不会把单模型误检建成新马赛克。
@@ -2427,6 +2653,7 @@ class FaceProcessor:
                     dets.append(box)
                     debug_scores.append(item["scores"])
                     allow_new.append(False)
+                    new_confirmed.append(True)
                     debug_sources.append("S")
             # SCRFD 二次验证: 高conf框直接保留, 低conf框用SCRFD确认(过滤手/玩具误检)
             elif self.scrfd_verifier is not None and hasattr(self.detector, 'detect_with_conf'):
@@ -2445,7 +2672,7 @@ class FaceProcessor:
             self._update_tracks(
                 dets, gray, debug_scores,
                 allow_new=allow_new, debug_sources=debug_sources,
-                frame_idx=frame_idx)
+                frame_idx=frame_idx, new_confirmed=new_confirmed)
             if (self._last_detection_count is not None
                     and detection_count != self._last_detection_count
                     and self._burst_remaining == 0):
@@ -2457,16 +2684,25 @@ class FaceProcessor:
                 self._active_hold_remaining -= 1
         elif not self.tracks and self._active_hold_remaining > 0:
             self._active_hold_remaining -= 1
+        # pending轨迹存在时强制下帧检测: 把二次确认窗口压缩到1帧,
+        # 真脸几乎无感; 误检pending则会在grace内快速死亡并停止消耗ROI推理
+        if any(not track.get("confirmed", True) for track in self.tracks):
+            self._force_detect = True
         self.last_faces = [
             track["box"] for track in self.tracks
             if track.get("confirmed", True) and track.get("visible", True)]
-        self.last_debug_faces = [
-            {"box": track["box"], "scores": track.get("debug_scores"),
-             "source": track.get("debug_source", "T")}
-            for track in self.tracks
-            if (track.get("confirmed", True) and track.get("visible", True)
-                and track.get("debug_scores") is not None)
-        ]
+        self.last_debug_faces = []
+        for track in self.tracks:
+            if not track.get("visible", True):
+                continue
+            scores = track.get("debug_scores")
+            if scores is None:
+                continue
+            # pending轨迹以P标注, 升级确认帧以U标注, 便于调参观测
+            source = ("P" if not track.get("confirmed", True)
+                      else track.get("debug_source", "T"))
+            self.last_debug_faces.append(
+                {"box": track["box"], "scores": scores, "source": source})
         self.prev_gray = gray
         return self.last_faces
 
@@ -2791,10 +3027,12 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                   scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
+                  stereo_batch=False,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
                   hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                  hard_face_immediate_conf=HARD_FACE_IMMEDIATE_CONF,
                   hard_face_min_size=HARD_FACE_MIN_SIZE,
                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
@@ -2845,24 +3083,29 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     stereo_split = (_is_dual_fisheye(w, h, fisheye_dual)
                     and isinstance(fd, DualFaceDetector))
     if stereo_split:
-        fd.enable_stereo_split(True)
+        fd.enable_stereo_split(True, batch=stereo_batch)
+        batch_label = ", 左右目批量推理" if fd._stereo_batch else ""
         log(f"  [双鱼眼] 左右独立检测 + 低分互证 "
             f"(每目输入={face_size}, 低分候选>={fd._stereo_low_conf:.2f}, "
-            f"高分增量={STEREO_HIGH_MARGIN:.2f})")
+            f"高分增量={STEREO_HIGH_MARGIN:.2f}{batch_label})")
     scrfd_verifier = _create_scrfd_verifier(
         scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
-    # 困难召唤: 创建专用轻量 ROI 检测器(小尺寸 YOLOv8, 跳过双模型共识)
+    # 困难召唤: 创建专用轻量 ROI 检测器(SCRFD-2.5g@320, 与主检测YOLOv8异构,
+    # YOLO的系统性盲区SCRFD未必盲, 提供真正独立的第二意见)
     roi_detector = None
     if hard_face_recall and face_on:
         try:
-            roi_detector = YOLOFaceDetector(
-                model_dir=model_dir, yolo_size=hard_face_roi_size,
-                use_gpu=use_gpu)
-            log(f"  [困难召唤] ROI二检: YOLOv8@{roi_detector.yolo_size}px "
-                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf})")
+            roi_detector = SCRFDFaceDetector(
+                model_dir=model_dir, model="2.5g",
+                input_size=hard_face_roi_size, conf=hard_face_conf,
+                device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
+            log(f"  [困难召唤] ROI二检: SCRFD-2.5g@{roi_detector.input_size}px "
+                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf}, "
+                f"立即确认>={hard_face_immediate_conf}, "
+                f"低于建pending轨迹等二次命中)")
         except Exception as exc:
             log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
             roi_detector = None
@@ -2874,6 +3117,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                               burst_frames=face_burst,
                               hard_face_recall=(HardFaceRecall(
                                   conf=hard_face_conf,
+                                  immediate_conf=hard_face_immediate_conf,
                                   min_size=hard_face_min_size,
                                   roi_scale=hard_face_roi_scale,
                                   max_rois=hard_face_max_rois,
@@ -3228,10 +3472,12 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                    dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                    scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
+                   stereo_batch=False,
                    face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                    scrfd_landmark_filter=True, debug=False, raw_debug=False,
                    face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
                    hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                   hard_face_immediate_conf=HARD_FACE_IMMEDIATE_CONF,
                    hard_face_min_size=HARD_FACE_MIN_SIZE,
                    hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                    hard_face_max_rois=HARD_FACE_MAX_ROIS,
@@ -3289,23 +3535,29 @@ def _process_files(src, dst, face_on, model_dir, face_size,
     stereo_split = (_is_dual_fisheye(w, h, fisheye_dual)
                     and isinstance(fd, DualFaceDetector))
     if stereo_split:
-        fd.enable_stereo_split(True)
+        fd.enable_stereo_split(True, batch=stereo_batch)
+        batch_label = ", 左右目批量推理" if fd._stereo_batch else ""
         log(f"  [双鱼眼] 左右独立检测 + 低分互证 "
             f"(每目输入={face_size}, 低分候选>={fd._stereo_low_conf:.2f}, "
-            f"高分增量={STEREO_HIGH_MARGIN:.2f})")
+            f"高分增量={STEREO_HIGH_MARGIN:.2f}{batch_label})")
     scrfd_verifier = _create_scrfd_verifier(
         scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
+    # 困难召唤: 创建专用轻量 ROI 检测器(SCRFD-2.5g@320, 与主检测YOLOv8异构,
+    # YOLO的系统性盲区SCRFD未必盲, 提供真正独立的第二意见)
     roi_detector = None
     if hard_face_recall and face_on:
         try:
-            roi_detector = YOLOFaceDetector(
-                model_dir=model_dir, yolo_size=hard_face_roi_size,
-                use_gpu=use_gpu)
-            log(f"  [困难召唤] ROI二检: YOLOv8@{roi_detector.yolo_size}px "
-                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf})")
+            roi_detector = SCRFDFaceDetector(
+                model_dir=model_dir, model="2.5g",
+                input_size=hard_face_roi_size, conf=hard_face_conf,
+                device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
+            log(f"  [困难召唤] ROI二检: SCRFD-2.5g@{roi_detector.input_size}px "
+                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf}, "
+                f"立即确认>={hard_face_immediate_conf}, "
+                f"低于建pending轨迹等二次命中)")
         except Exception as exc:
             log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
             roi_detector = None
@@ -3317,6 +3569,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                               burst_frames=face_burst,
                               hard_face_recall=(HardFaceRecall(
                                   conf=hard_face_conf,
+                                  immediate_conf=hard_face_immediate_conf,
                                   min_size=hard_face_min_size,
                                   roi_scale=hard_face_roi_scale,
                                   max_rois=hard_face_max_rois,
@@ -3447,11 +3700,13 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
                   scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
+                  stereo_batch=False,
                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
                   face_empty_int=FACE_EMPTY_DETECT_INT,
                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
                   hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                  hard_face_immediate_conf=HARD_FACE_IMMEDIATE_CONF,
                   hard_face_min_size=HARD_FACE_MIN_SIZE,
                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
@@ -3472,10 +3727,12 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                    scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
                                    dual_iou, scrfd_model, scrfd_device,
                                    scrfd_nms, scrfd_gpu_id, dual_mirror,
+                                   stereo_batch,
                                    face_grace, face_smooth,
                                    scrfd_landmark_filter, debug, raw_debug,
                                    face_backfill, face_burst,
                                    hard_face_recall, hard_face_conf,
+                                   hard_face_immediate_conf,
                                    hard_face_min_size, hard_face_roi_scale,
                                    hard_face_max_rois, hard_face_roi_size,
                                    hard_face_full_scan, hard_face_full_scan_conf)
@@ -3491,10 +3748,12 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                 scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
                                 dual_iou, scrfd_model, scrfd_device,
                                 scrfd_nms, scrfd_gpu_id, dual_mirror,
+                                stereo_batch,
                                 face_grace, face_smooth,
                                 scrfd_landmark_filter, debug, raw_debug,
                                 face_backfill, face_burst,
                                 hard_face_recall, hard_face_conf,
+                                hard_face_immediate_conf,
                                 hard_face_min_size, hard_face_roi_scale,
                                 hard_face_max_rois, hard_face_roi_size,
                                 hard_face_full_scan, hard_face_full_scan_conf)
@@ -3573,6 +3832,9 @@ def main():
     ap.add_argument("--dual-mirror", action="store_true",
                     help="双鱼眼镜像打码: 一侧检出人脸后另一侧同步打码"
                          "(仅双鱼眼视频生效, 避免单侧漏检导致另一侧未打码)")
+    ap.add_argument("--stereo-batch", action="store_true",
+                    help="左右目合并批量推理: 每检测帧模型调用4次→2次, 结果与逐张"
+                         "推理一致(检测器不支持批量时自动回退逐张)")
     ap.add_argument("--scrfd-verify", action="store_true",
                     help="SCRFD二次验证: YOLO检出后用SCRFD关键点模型确认, 过滤手/玩具误检 "
                          "(高conf框不验证, 低conf框才验证; 要求全部框均由SCRFD确认请使用"
@@ -3600,6 +3862,10 @@ def main():
                     help="启用困难脸ROI二检：对小脸/边缘候选放大区域后低阈值复检")
     ap.add_argument("--hard-face-conf", type=float, default=HARD_FACE_CONF,
                     help=f"困难脸ROI二检阈值(默认{HARD_FACE_CONF})")
+    ap.add_argument("--hard-face-immediate-conf", type=float,
+                    default=HARD_FACE_IMMEDIATE_CONF,
+                    help=f"困难召唤立即确认阈值(默认{HARD_FACE_IMMEDIATE_CONF}; "
+                         f"ROI二检达到该分数直接打码, 低于则建pending轨迹等二次命中)")
     ap.add_argument("--hard-face-min-size", type=int, default=HARD_FACE_MIN_SIZE,
                     help=f"候选最小边小于该值时进入困难ROI二检(默认{HARD_FACE_MIN_SIZE}px)")
     ap.add_argument("--hard-face-roi-scale", type=float, default=HARD_FACE_ROI_SCALE,
@@ -3640,6 +3906,8 @@ def main():
         ap.error("--face-burst 必须 >= 0")
     if not 0 <= args.hard_face_conf <= 1:
         ap.error("--hard-face-conf 必须在 0~1 之间")
+    if not 0 <= args.hard_face_immediate_conf <= 1:
+        ap.error("--hard-face-immediate-conf 必须在 0~1 之间")
     if args.hard_face_min_size < 1:
         ap.error("--hard-face-min-size 必须 >= 1")
     if args.hard_face_roi_scale < 1:
@@ -3673,6 +3941,7 @@ def main():
                                face_burst=args.face_burst,
                                hard_face_recall=args.hard_face_recall,
                                hard_face_conf=args.hard_face_conf,
+                               hard_face_immediate_conf=args.hard_face_immediate_conf,
                                hard_face_min_size=args.hard_face_min_size,
                                hard_face_roi_scale=args.hard_face_roi_scale,
                                hard_face_max_rois=args.hard_face_max_rois,
@@ -3694,6 +3963,7 @@ def main():
                                scrfd_keep_conf=args.scrfd_keep_conf,
                                dual_iou=args.dual_iou,
                                dual_mirror=args.dual_mirror,
+                               stereo_batch=args.stereo_batch,
                                scrfd_model=args.scrfd_model,
                                scrfd_device=args.scrfd_device,
                                scrfd_nms=args.scrfd_nms,
