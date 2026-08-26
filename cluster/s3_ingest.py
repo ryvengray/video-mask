@@ -9,7 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-from cluster.local_ingest import DEFAULT_ALGORITHM, DEFAULT_ARGS, VIDEO_SUFFIXES
+from cluster.local_ingest import VIDEO_SUFFIXES
 from cluster.store import ClusterStore
 
 
@@ -60,7 +60,7 @@ class S3Ingestor:
 
         For example, with ``source_prefix=source/inbox`` and
         ``output_prefix=outputs``, ``source/inbox/s/s/m.mp4`` becomes
-        ``outputs/s/s/masked_m.mp4``.  Keeping the relative path prevents
+        ``outputs/s/s/m.mp4``.  Keeping the relative path prevents
         identically named videos in different source folders from overwriting
         one another in the output bucket.
         """
@@ -69,7 +69,11 @@ class S3Ingestor:
         if prefix and source_key.startswith(prefix):
             relative = source_key[len(prefix):]
         path = PurePosixPath(relative)
-        filename = f"masked_{path.stem}.mp4"
+        # S3 output keeps the source basename exactly as-is.  The Worker only
+        # uploads to the pre-signed URL supplied here, so this key controls the
+        # final target-bucket filename independently of its local masked_*.mp4
+        # working file.
+        filename = path.name
         parts = [part for part in (self.output_prefix, str(path.parent), filename) if part and part != "."]
         return "/".join(parts)
 
@@ -108,22 +112,40 @@ class S3Ingestor:
         with self._lock:
             if time.monotonic() - self._last_scan < self.poll_seconds:
                 return 0
-            created = self._scan()
+            created = self._scan(self.source_prefix)
             self._last_scan = time.monotonic()
             return created
 
     def scan(self) -> int:
-        """Scan immediately, serializing with scheduled and request-triggered scans."""
+        """Scan the configured source prefix immediately."""
         with self._lock:
-            created = self._scan()
+            created = self._scan(self.source_prefix)
             self._last_scan = time.monotonic()
             return created
 
-    def _scan(self) -> int:
+    @staticmethod
+    def normalise_scan_prefix(value: str) -> str:
+        """Turn a human-friendly S3 folder into a safe S3 listing prefix."""
+        prefix = value.strip().strip("/")
+        if len(prefix) > 1024 or "\x00" in prefix:
+            raise ValueError("source prefix is invalid")
+        return prefix
+
+    def scan_prefix(self, source_prefix: str = "") -> int:
+        """Run a one-off scan under ``source_prefix`` without changing scheduled scans.
+
+        An empty value deliberately means the entire source bucket, even when
+        the Controller's scheduled scanner has a configured base prefix.
+        """
+        prefix = self.normalise_scan_prefix(source_prefix)
+        with self._lock:
+            return self._scan(prefix)
+
+    def _scan(self, source_prefix: str) -> int:
         """Scan while ``_lock`` is held by the caller."""
         created = 0
         paginator = self.source_client.get_paginator("list_objects_v2")
-        prefix = f"{self.source_prefix}/" if self.source_prefix else ""
+        prefix = f"{source_prefix}/" if source_prefix else ""
         for page in paginator.paginate(Bucket=self.source_bucket, Prefix=prefix):
             for object_info in page.get("Contents", []):
                 key = str(object_info["Key"])
@@ -144,8 +166,6 @@ class S3Ingestor:
                         "source_url": f"s3://{self.source_bucket}/{key}",
                         "source_object_key": key,
                         "source_size_bytes": int(object_info.get("Size") or 0),
-                        "algorithm": DEFAULT_ALGORITHM,
-                        "arguments": DEFAULT_ARGS,
                         "output_object_key": output_key,
                     })
                     created += 1

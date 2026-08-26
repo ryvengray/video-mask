@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 import time
+import uuid
+import re
+from collections import Counter
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -79,6 +83,8 @@ class ClusterStore:
             finished_at REAL,
             face_annotation INTEGER,
             face_annotated_at REAL,
+            content_tags_json TEXT,
+            content_tagged_at REAL,
             face_review_owner TEXT,
             face_review_lease_until REAL,
             updated_at REAL NOT NULL
@@ -101,13 +107,54 @@ class ClusterStore:
             setting_value TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS algorithm_defaults (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            algorithm TEXT NOT NULL DEFAULT 'video_mask_batch_fish_v1.py',
+            arguments_json TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS content_categories (
+            category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS video_shares (
+            share_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            revoked_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_shares_valid
+          ON video_shares(token_hash, expires_at, revoked_at);
+        CREATE TABLE IF NOT EXISTS video_share_items (
+            share_id TEXT NOT NULL REFERENCES video_shares(share_id) ON DELETE CASCADE,
+            item_id TEXT NOT NULL,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+            file TEXT NOT NULL CHECK(file IN ('input', 'output')),
+            PRIMARY KEY (share_id, item_id),
+            UNIQUE (share_id, task_id, file)
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_share_items_task
+          ON video_share_items(task_id);
         """)
+        self.conn.execute("""
+            INSERT INTO algorithm_defaults (id, algorithm, arguments_json, updated_at)
+            SELECT 1, 'video_mask_batch_fish_v1.py',
+                   '["--fisheye","--fisheye-device","pico4","--face-size","960",
+                     "--face-int","5","--face-conf","0.4","--frame-skip","1",
+                     "--face-model","yolov8+yolo11","--dual-iou","0.4"]', ?
+            WHERE NOT EXISTS (SELECT 1 FROM algorithm_defaults WHERE id = 1)
+        """, (now(),))
         task_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(tasks)")}
         if "restarted_at" not in task_columns:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN restarted_at REAL")
         for column, definition in (
             ("face_annotation", "INTEGER"),
             ("face_annotated_at", "REAL"),
+            ("content_tags_json", "TEXT"),
+            ("content_tagged_at", "REAL"),
+            ("content_category_id", "INTEGER"),
             ("face_review_owner", "TEXT"),
             ("face_review_lease_until", "REAL"),
         ):
@@ -118,6 +165,14 @@ class ClusterStore:
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_face_review
               ON tasks(status, face_annotation, face_review_owner, finished_at)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_content_review
+              ON tasks(status, content_tags_json, face_review_owner, finished_at)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_content_category
+              ON tasks(content_category_id, status, finished_at)
         """)
         self.conn.commit()
 
@@ -155,6 +210,8 @@ class ClusterStore:
         for name in ("arguments_json", "progress_json", "capabilities_json"):
             if name in value:
                 value[name.removesuffix("_json")] = json.loads(value.pop(name) or "{}")
+        if "content_tags_json" in value:
+            value["content_tags"] = json.loads(value.pop("content_tags_json") or "[]")
         return value
 
     @synchronized
@@ -257,10 +314,41 @@ class ClusterStore:
         return self.worker(worker_id) or {}
 
     @synchronized
+    def get_algorithm_defaults(self) -> dict[str, Any]:
+        """Return the current global default algorithm and arguments."""
+        row = self.conn.execute(
+            "SELECT algorithm, arguments_json FROM algorithm_defaults WHERE id=1"
+        ).fetchone()
+        if row is None:
+            return {"algorithm": "video_mask_batch_fish_v1.py", "arguments": []}
+        return {"algorithm": str(row[0]), "arguments": json.loads(row[1] or "[]")}
+
+    @synchronized
+    def set_algorithm_defaults(self, algorithm: str, arguments: list[str]) -> dict[str, Any]:
+        """Update the global default algorithm and arguments."""
+        stamp = now()
+        self.conn.execute("""
+            INSERT INTO algorithm_defaults (id, algorithm, arguments_json, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              algorithm=excluded.algorithm,
+              arguments_json=excluded.arguments_json,
+              updated_at=excluded.updated_at
+        """, (algorithm, json.dumps(arguments), stamp))
+        self.conn.commit()
+        return self.get_algorithm_defaults()
+
+    @synchronized
     def create_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         import uuid
         task_id = payload.get("task_id") or str(uuid.uuid4())
-        args = payload.get("arguments") or []
+        defaults = self.get_algorithm_defaults()
+        algorithm = payload.get("algorithm")
+        if not algorithm:
+            algorithm = defaults["algorithm"]
+        args = payload.get("arguments")
+        if args is None:
+            args = defaults["arguments"]
         if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
             raise ValueError("arguments must be a list of strings")
         required = ("source_url",)
@@ -276,7 +364,7 @@ class ClusterStore:
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """, (task_id, payload["source_url"], payload.get("source_object_key"),
                   payload.get("source_size_bytes"), payload.get("source_sha256"),
-                  payload.get("source_duration_seconds"), payload.get("algorithm", "video_mask_batch_skip.py"),
+                  payload.get("source_duration_seconds"), algorithm,
                   json.dumps(args), payload.get("output_upload_url") or "", payload.get("output_object_key"),
                   int(payload.get("max_attempts", 3)), stamp, stamp))
             self.conn.commit()
@@ -308,22 +396,27 @@ class ClusterStore:
         return self.task(task_id) or {}
 
     @synchronized
-    def restart_task(self, task_id: str) -> dict[str, Any]:
-        """Queue a terminal task again, including a completed task on request."""
+    def restart_task(self, task_id: str, algorithm: str | None = None,
+                     arguments: list[str] | None = None) -> dict[str, Any]:
+        """Queue a terminal task again, optionally with updated algorithm settings."""
         current = self.task(task_id)
         if current is None:
             raise ValueError("task does not exist")
         if current["status"] not in TERMINAL:
             raise ValueError("only completed, failed, or cancelled tasks can be restarted")
+        if (algorithm is None) != (arguments is None):
+            raise ValueError("algorithm and arguments must be updated together")
         stamp = now()
         self.conn.execute("DELETE FROM task_logs WHERE task_id=?", (task_id,))
         self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
               error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
-              face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
+              face_review_owner=NULL, face_review_lease_until=NULL,
+              algorithm=COALESCE(?, algorithm), arguments_json=COALESCE(?, arguments_json),
+              updated_at=?
             WHERE task_id=?
-        """, (stamp, stamp, task_id))
+        """, (stamp, algorithm, json.dumps(arguments) if arguments is not None else None, stamp, task_id))
         self.conn.commit()
         return self.task(task_id) or {}
 
@@ -350,7 +443,11 @@ class ClusterStore:
 
     @synchronized
     def claim_next_face_review(self, reviewer_id: str, lease_seconds: int) -> dict[str, Any] | None:
-        """Atomically reserve one unlabelled completed source video for review."""
+        """Atomically reserve a random non-test source video missing content tags.
+
+        Face presence is a separate optional annotation and must never affect
+        which task is selected by the content-label workflow.
+        """
         stamp = now()
         lease_until = stamp + lease_seconds
         self.conn.execute("BEGIN IMMEDIATE")
@@ -358,9 +455,11 @@ class ClusterStore:
             self._expire_face_review_leases(stamp)
             row = self.conn.execute("""
                 SELECT task_id FROM tasks
-                WHERE status='completed' AND face_annotation IS NULL AND source_object_key IS NOT NULL
+                WHERE content_tags_json IS NULL AND source_object_key IS NOT NULL
+                  AND source_object_key NOT LIKE 'test/%'
+                  AND source_object_key NOT LIKE '/test/%'
                   AND face_review_owner IS NULL
-                ORDER BY finished_at, created_at
+                ORDER BY RANDOM()
                 LIMIT 1
             """).fetchone()
             if row is None:
@@ -379,7 +478,7 @@ class ClusterStore:
 
     @synchronized
     def claim_face_review(self, task_id: str, reviewer_id: str, lease_seconds: int) -> dict[str, Any]:
-        """Reserve one completed S3 task for editing its current face label."""
+        """Reserve one S3 source video for editing its current manual labels."""
         stamp = now()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -387,8 +486,8 @@ class ClusterStore:
             task = self.task(task_id)
             if task is None:
                 raise ValueError("task does not exist")
-            if task["status"] != "completed" or not task.get("source_object_key"):
-                raise ValueError("only completed S3 tasks can be manually labelled")
+            if not task.get("source_object_key"):
+                raise ValueError("only S3 source videos can be manually labelled")
             owner = task.get("face_review_owner")
             if owner not in {None, reviewer_id}:
                 raise ValueError("this video is currently being labelled by another browser")
@@ -432,13 +531,107 @@ class ClusterStore:
         cursor = self.conn.execute("""
             UPDATE tasks SET face_annotation=?, face_annotated_at=?, face_review_owner=NULL,
               face_review_lease_until=NULL, updated_at=?
-            WHERE task_id=? AND status='completed' AND face_review_owner=?
+            WHERE task_id=? AND face_review_owner=?
         """, (1 if has_face else 0, stamp, stamp, task_id, reviewer_id))
         if cursor.rowcount != 1:
             self.conn.commit()
             raise ValueError("face-review lease expired or this task is no longer available")
         self.conn.commit()
         return self.task(task_id) or {}
+
+    @staticmethod
+    def _normalise_content_tags(tags: list[str]) -> list[str]:
+        """Validate and de-duplicate human-entered video-content labels."""
+        if not isinstance(tags, list) or not tags:
+            raise ValueError("provide at least one content tag")
+        if len(tags) > 20:
+            raise ValueError("at most 20 content tags may be saved")
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in tags:
+            if not isinstance(value, str):
+                raise ValueError("content tags must be text")
+            tag = " ".join(value.split())
+            if not tag or len(tag) > 64:
+                raise ValueError("each content tag must contain 1 to 64 characters")
+            key = tag.casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(tag)
+        if not result:
+            raise ValueError("provide at least one content tag")
+        return result
+
+    @synchronized
+    def annotate_content_tags(self, task_id: str, reviewer_id: str, tags: list[str]) -> dict[str, Any]:
+        """Save content labels while retaining the current review lease."""
+        normalised_tags = self._normalise_content_tags(tags)
+        stamp = now()
+        self._expire_face_review_leases(stamp)
+        cursor = self.conn.execute("""
+            UPDATE tasks SET content_tags_json=?, content_tagged_at=?, updated_at=?
+            WHERE task_id=? AND face_review_owner=?
+        """, (json.dumps(normalised_tags, ensure_ascii=False), stamp, stamp, task_id, reviewer_id))
+        if cursor.rowcount != 1:
+            self.conn.commit()
+            raise ValueError("face-review lease expired or this task is no longer available")
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def content_tags(self, limit: int = 500) -> list[str]:
+        """Return distinct labels already used, newest first, for the picker."""
+        rows = self.conn.execute("""
+            SELECT content_tags_json FROM tasks
+            WHERE content_tags_json IS NOT NULL
+            ORDER BY content_tagged_at DESC, updated_at DESC
+            LIMIT ?
+        """, (max(1, min(limit, 10_000)),)).fetchall()
+        tags: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                values = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                tag = " ".join(value.split())
+                if tag and tag.casefold() not in seen:
+                    seen.add(tag.casefold())
+                    tags.append(tag)
+        return tags
+
+    @synchronized
+    def content_tag_statistics(self, statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Count videos for every saved content tag, optionally by task status."""
+        values: list[Any] = []
+        where = "WHERE content_tags_json IS NOT NULL"
+        if statuses:
+            where += " AND status IN (" + ", ".join("?" for _ in statuses) + ")"
+            values.extend(statuses)
+        rows = self.conn.execute(
+            "SELECT content_tags_json FROM tasks " + where, values
+        ).fetchall()
+        counts: Counter[str] = Counter()
+        for row in rows:
+            try:
+                tags = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(tags, list):
+                continue
+            # Current writes already deduplicate tags.  Retain that guarantee
+            # when reporting against historical data too.
+            unique_tags = {tag for tag in tags if isinstance(tag, str) and tag}
+            counts.update(unique_tags)
+        return [
+            {"tag": tag, "video_count": count}
+            for tag, count in sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+        ]
 
     @synchronized
     def face_review_status(self, task_ids: tuple[str, ...] | None = None) -> dict[str, Any]:
@@ -448,13 +641,13 @@ class ClusterStore:
             placeholders = ", ".join("?" for _ in task_ids)
             rows = self.conn.execute(f"""
                 SELECT task_id, status, source_object_key, face_annotation, face_review_owner,
-                  face_review_lease_until FROM tasks
+                  face_review_lease_until, content_tags_json FROM tasks
                 WHERE task_id IN ({placeholders})
             """, task_ids).fetchall()
         else:
             rows = self.conn.execute("""
                 SELECT task_id, status, source_object_key, face_annotation, face_review_owner,
-                  face_review_lease_until FROM tasks
+                  face_review_lease_until, content_tags_json FROM tasks
                 WHERE face_annotation IS NULL AND face_review_owner IS NOT NULL
                 ORDER BY face_review_lease_until
             """).fetchall()
@@ -462,10 +655,11 @@ class ClusterStore:
         return {"reviews": [
             {
                 "task_id": str(row[0]),
-                "reviewable": row[1] == "completed" and bool(row[2]),
+                "reviewable": bool(row[2]),
                 "has_face": None if row[3] is None else bool(row[3]),
                 "reviewing": bool(row[4] and float(row[5] or 0) > stamp),
                 "lease_until": float(row[5] or 0),
+                "content_tags": json.loads(row[6] or "[]"),
             }
             for row in rows
         ]}
@@ -535,6 +729,319 @@ class ClusterStore:
     def task(self, task_id: str) -> dict[str, Any] | None:
         return self._row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
+    @staticmethod
+    def _normalise_content_category(name: str) -> str:
+        category = " ".join(str(name).split())
+        if not category or len(category) > 64:
+            raise ValueError("content category must contain 1 to 64 characters")
+        return category
+
+    @synchronized
+    def content_categories(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("""
+            SELECT categories.category_id, categories.name, COUNT(tasks.task_id) AS task_count
+            FROM content_categories AS categories
+            LEFT JOIN tasks ON tasks.content_category_id=categories.category_id
+            GROUP BY categories.category_id, categories.name
+            ORDER BY categories.name COLLATE NOCASE, categories.category_id
+        """).fetchall()
+        return [{"category_id": int(row[0]), "name": str(row[1]), "task_count": int(row[2])} for row in rows]
+
+    @synchronized
+    def create_content_category(self, name: str) -> dict[str, Any]:
+        category = self._normalise_content_category(name)
+        try:
+            cursor = self.conn.execute(
+                "INSERT INTO content_categories(name, created_at) VALUES(?, ?)", (category, now()),
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            self.conn.rollback()
+            raise ValueError("a content category with this name already exists") from exc
+        return {"category_id": int(cursor.lastrowid), "name": category, "task_count": 0}
+
+    @synchronized
+    def delete_content_category(self, category_id: int) -> None:
+        assigned = self.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE content_category_id=?", (category_id,)
+        ).fetchone()[0]
+        if assigned:
+            raise ValueError("remove this category from its tasks before deleting it")
+        cursor = self.conn.execute("DELETE FROM content_categories WHERE category_id=?", (category_id,))
+        self.conn.commit()
+        if cursor.rowcount != 1:
+            raise ValueError("content category does not exist")
+
+    @synchronized
+    def set_task_content_category(self, task_id: str, category_id: int | None) -> dict[str, Any]:
+        if self.task(task_id) is None:
+            raise ValueError("task does not exist")
+        if category_id is not None:
+            exists = self.conn.execute(
+                "SELECT 1 FROM content_categories WHERE category_id=?", (category_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError("content category does not exist")
+        self.conn.execute(
+            "UPDATE tasks SET content_category_id=?, updated_at=? WHERE task_id=?",
+            (category_id, now(), task_id),
+        )
+        self.conn.commit()
+        return self.task(task_id) or {}
+
+    @synchronized
+    def task_content_categories(self, task_ids: tuple[str, ...]) -> dict[str, int | None]:
+        if not task_ids:
+            return {}
+        rows = self.conn.execute(
+            "SELECT task_id, content_category_id FROM tasks WHERE task_id IN ("
+            + ", ".join("?" for _ in task_ids) + ")", task_ids,
+        ).fetchall()
+        return {str(row[0]): (None if row[1] is None else int(row[1])) for row in rows}
+
+    @synchronized
+    def category_share_id(self) -> str:
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings WHERE setting_key='content_category_share_id'"
+        ).fetchone()
+        return str(row[0]) if row else ""
+
+    @synchronized
+    def category_share_file(self) -> str:
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings WHERE setting_key='content_category_share_file'"
+        ).fetchone()
+        # Existing installations default to sharing source videos until an
+        # administrator explicitly chooses processed output.
+        return str(row[0]) if row and row[0] in {"input", "output"} else "input"
+
+    @synchronized
+    def category_share_limit(self) -> int:
+        """Return the public page's per-category video limit (default 10)."""
+        row = self.conn.execute(
+            "SELECT setting_value FROM controller_settings "
+            "WHERE setting_key='content_category_share_limit'"
+        ).fetchone()
+        try:
+            value = int(str(row[0])) if row else 10
+        except (TypeError, ValueError):
+            value = 10
+        return value if 1 <= value <= 100 else 10
+
+    @synchronized
+    def set_category_share_id(self, share_id: str) -> str:
+        value = share_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", value):
+            raise ValueError("share ID must be 16 to 64 letters, numbers, hyphens, or underscores")
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES('content_category_share_id', ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (value, now()))
+        self.conn.commit()
+        return value
+
+    @synchronized
+    def set_category_share_file(self, file: str) -> str:
+        if file not in {"input", "output"}:
+            raise ValueError("shared category video must be 'input' or 'output'")
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES('content_category_share_file', ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (file, now()))
+        self.conn.commit()
+        return file
+
+    @synchronized
+    def set_category_share_limit(self, limit: int) -> int:
+        value = int(limit)
+        if not 1 <= value <= 100:
+            raise ValueError("shared category video limit must be between 1 and 100")
+        self.conn.execute("""
+            INSERT INTO controller_settings(setting_key, setting_value, updated_at)
+            VALUES('content_category_share_limit', ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value=excluded.setting_value, updated_at=excluded.updated_at
+        """, (str(value), now()))
+        self.conn.commit()
+        return value
+
+    @synchronized
+    def public_category_catalog(self, share_id: str) -> list[dict[str, Any]] | None:
+        configured = self.category_share_id()
+        if not configured or configured != share_id:
+            return None
+        file = self.category_share_file()
+        limit = self.category_share_limit()
+        key_column = "tasks.source_object_key" if file == "input" else "tasks.output_object_key"
+        status_filter = "tasks.status='completed'" if file == "output" else "1=1"
+        order_by = "tasks.finished_at DESC" if file == "output" else "tasks.created_at DESC"
+        rows = self.conn.execute(f"""
+            SELECT categories.category_id, categories.name, tasks.task_id,
+              tasks.source_object_key, tasks.output_object_key
+            FROM content_categories AS categories
+            JOIN tasks ON tasks.content_category_id=categories.category_id
+            WHERE {status_filter}
+              AND {key_column} IS NOT NULL
+            ORDER BY categories.name COLLATE NOCASE, {order_by}, tasks.task_id DESC
+        """).fetchall()
+        grouped: dict[int, dict[str, Any]] = {}
+        category_video_counts: dict[int, int] = {}
+        for row in rows:
+            category_id = int(row[0])
+            category = grouped.setdefault(category_id, {
+                "category_id": category_id, "name": str(row[1]), "videos": [],
+            })
+            key = row[3] if file == "input" else row[4]
+            if not key:
+                continue
+            category_video_counts[category_id] = category_video_counts.get(category_id, 0) + 1
+            if len(category["videos"]) >= limit:
+                continue
+            category["videos"].append({
+                "task_id": str(row[2]), "file": file,
+                "filename": Path(str(key)).name or "video.mp4",
+            })
+        return sorted(
+            grouped.values(),
+            key=lambda category: (-category_video_counts[category["category_id"]],
+                                  str(category["name"]).casefold(), category["category_id"]),
+        )
+
+    @synchronized
+    def public_category_catalog_item(self, share_id: str, task_id: str) -> dict[str, Any] | None:
+        # Limit direct video/cover URLs to the same items that are visible in
+        # the public catalog.  Otherwise a hidden 11th item could still be
+        # accessed by guessing its task ID.
+        catalog = self.public_category_catalog(share_id)
+        if catalog is None:
+            return None
+        for category in catalog:
+            for item in category["videos"]:
+                if item["task_id"] == task_id:
+                    return dict(item)
+        return None
+
+    @synchronized
+    def create_video_share(self, task_ids: list[str], files: list[str],
+                           expires_in_days: int = 7) -> dict[str, Any]:
+        """Create an expiring, opaque customer-share token for selected media.
+
+        Only the SHA-256 digest is persisted.  The raw token is returned once
+        to the dashboard and is never recoverable from the Controller DB.
+        """
+        if not task_ids:
+            raise ValueError("select at least one task to share")
+        if len(task_ids) > 100:
+            raise ValueError("at most 100 tasks may be shared at once")
+        if not files or any(file not in {"input", "output"} for file in files):
+            raise ValueError("select source and/or processed output")
+        try:
+            expires_in_days = int(expires_in_days)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("share expiry must be a whole number of days") from exc
+        if not 1 <= expires_in_days <= 30:
+            raise ValueError("share expiry must be between 1 and 30 days")
+
+        unique_task_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if str(task_id)))
+        unique_files = list(dict.fromkeys(files))
+        selected: list[tuple[str, str]] = []
+        for task_id in unique_task_ids:
+            task = self.task(task_id)
+            if task is None:
+                raise ValueError(f"task does not exist: {task_id}")
+            for file in unique_files:
+                key = task.get("source_object_key") if file == "input" else task.get("output_object_key")
+                # Output is not a customer-ready artifact until a Worker has
+                # reported successful completion.  Source may be shared while
+                # a task is still being processed.
+                if key and (file == "input" or task.get("status") == "completed"):
+                    selected.append((task_id, file))
+        if not selected:
+            raise ValueError("the selected tasks do not have shareable files")
+
+        stamp = now()
+        share_id = str(uuid.uuid4())
+        raw_token = secrets.token_urlsafe(32)
+        self.conn.execute(
+            "INSERT INTO video_shares(share_id, token_hash, created_at, expires_at) VALUES(?, ?, ?, ?)",
+            (share_id, token_hash(raw_token), stamp, stamp + expires_in_days * 86400),
+        )
+        self.conn.executemany(
+            "INSERT INTO video_share_items(share_id, item_id, task_id, file) VALUES(?, ?, ?, ?)",
+            [(share_id, uuid.uuid4().hex, task_id, file) for task_id, file in selected],
+        )
+        self.conn.commit()
+        return {
+            "share_id": share_id,
+            "token": raw_token,
+            "created_at": stamp,
+            "expires_at": stamp + expires_in_days * 86400,
+            "item_count": len(selected),
+        }
+
+    @synchronized
+    def video_share(self, raw_token: str) -> dict[str, Any] | None:
+        """Resolve a public share only while its token is valid and active."""
+        if not raw_token:
+            return None
+        stamp = now()
+        share = self.conn.execute("""
+            SELECT share_id, created_at, expires_at FROM video_shares
+            WHERE token_hash=? AND revoked_at IS NULL AND expires_at>?
+        """, (token_hash(raw_token), stamp)).fetchone()
+        if share is None:
+            return None
+        rows = self.conn.execute("""
+            SELECT items.item_id, items.task_id, items.file,
+              tasks.source_object_key, tasks.output_object_key, tasks.status
+            FROM video_share_items AS items
+            JOIN tasks ON tasks.task_id=items.task_id
+            WHERE items.share_id=?
+            ORDER BY tasks.created_at DESC, items.file
+        """, (share["share_id"],)).fetchall()
+        items = []
+        for row in rows:
+            key = row["source_object_key"] if row["file"] == "input" else row["output_object_key"]
+            if key:
+                items.append({
+                    "item_id": str(row["item_id"]), "task_id": str(row["task_id"]),
+                    "file": str(row["file"]), "filename": Path(str(key)).name or "video.mp4",
+                })
+        if not items:
+            return None
+        return {
+            "share_id": str(share["share_id"]), "created_at": float(share["created_at"]),
+            "expires_at": float(share["expires_at"]), "items": items,
+        }
+
+    @synchronized
+    def video_share_item(self, raw_token: str, item_id: str) -> dict[str, Any] | None:
+        """Return the selected task/file pair if it belongs to an active share."""
+        share = self.video_share(raw_token)
+        if share is None:
+            return None
+        for item in share["items"]:
+            # The share token is the secret.  Item IDs only select a member of
+            # that already-authorized share, so a normal equality comparison
+            # also handles malformed non-ASCII path values safely.
+            if str(item["item_id"]) == str(item_id):
+                return item
+        return None
+
+    @synchronized
+    def revoke_video_share(self, share_id: str) -> bool:
+        """Disable an existing customer link without deleting audit history."""
+        cursor = self.conn.execute(
+            "UPDATE video_shares SET revoked_at=? WHERE share_id=? AND revoked_at IS NULL",
+            (now(), share_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
     @synchronized
     def active_task_for_worker(self, worker_id: str, token: str, task_id: str) -> dict[str, Any]:
         """Return a task only while its lease belongs to this Worker."""
@@ -547,7 +1054,9 @@ class ClusterStore:
     @staticmethod
     def _task_filter_conditions(statuses: tuple[str, ...] | None,
                                 search: str | None,
-                                face_annotations: tuple[str, ...] | None = None) -> tuple[str, list[Any]]:
+                                face_annotations: tuple[str, ...] | None = None,
+                                content_tags: tuple[str, ...] | None = None,
+                                content_category_ids: tuple[int, ...] | None = None) -> tuple[str, list[Any]]:
         """Build a WHERE clause from optional task, label, and text filters."""
         conditions: list[str] = []
         values: list[Any] = []
@@ -571,13 +1080,28 @@ class ClusterStore:
                 annotation_conditions.append("face_annotation IS NULL")
             if annotation_conditions:
                 conditions.append("(" + " OR ".join(annotation_conditions) + ")")
+        if content_tags:
+            tag_conditions: list[str] = []
+            for tag in content_tags:
+                encoded_tag = json.dumps(tag, ensure_ascii=False)
+                escaped_tag = encoded_tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                tag_conditions.append("IFNULL(content_tags_json, '') LIKE ? ESCAPE '\\'")
+                values.append(f"%{escaped_tag}%")
+            conditions.append("(" + " OR ".join(tag_conditions) + ")")
+        if content_category_ids:
+            conditions.append("content_category_id IN (" + ", ".join("?" for _ in content_category_ids) + ")")
+            values.extend(content_category_ids)
         return (" WHERE " + " AND ".join(conditions)) if conditions else "", values
 
     @synchronized
     def count_tasks(self, statuses: tuple[str, ...] | None = None,
                     search: str | None = None,
-                    face_annotations: tuple[str, ...] | None = None) -> int:
-        where, values = self._task_filter_conditions(statuses, search, face_annotations)
+                    face_annotations: tuple[str, ...] | None = None,
+                    content_tags: tuple[str, ...] | None = None,
+                    content_category_ids: tuple[int, ...] | None = None) -> int:
+        where, values = self._task_filter_conditions(
+            statuses, search, face_annotations, content_tags, content_category_ids,
+        )
         return int(self.conn.execute("SELECT COUNT(*) FROM tasks" + where, values).fetchone()[0])
 
     @synchronized
@@ -595,8 +1119,12 @@ class ClusterStore:
     def list_tasks(self, limit: int = 100, offset: int = 0,
                    statuses: tuple[str, ...] | None = None,
                    search: str | None = None,
-                   face_annotations: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
-        where, values = self._task_filter_conditions(statuses, search, face_annotations)
+                   face_annotations: tuple[str, ...] | None = None,
+                   content_tags: tuple[str, ...] | None = None,
+                   content_category_ids: tuple[int, ...] | None = None) -> list[dict[str, Any]]:
+        where, values = self._task_filter_conditions(
+            statuses, search, face_annotations, content_tags, content_category_ids,
+        )
         values.extend((limit, max(0, offset)))
         rows = self.conn.execute(
             "SELECT * FROM tasks" + where + " ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?",
@@ -794,6 +1322,10 @@ class ClusterStore:
     @synchronized
     def claim(self, worker_id: str, token: str) -> dict[str, Any] | None:
         self.authenticate_worker(worker_id, token)
+        # Keep this check inside the store lock shared with the administrator
+        # switch, so a paused dispatch cannot race with a new Worker claim.
+        if not self.boolean_setting("task_dispatch_enabled", True):
+            return None
         stamp = now()
         # BEGIN IMMEDIATE serializes claims across concurrent API requests.
         self.conn.execute("BEGIN IMMEDIATE")

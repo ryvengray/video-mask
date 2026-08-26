@@ -171,11 +171,19 @@ class Autoscaler:
             diagnostic = "\n".join(value for value in (result.stdout, result.stderr) if value).strip()
             raise RuntimeError(f"EC2 pool refresh failed: {diagnostic[-2000:]}")
 
-    def queue_and_workers(self) -> tuple[int, float | None, list[dict[str, Any]]]:
+    def queue_and_workers(self) -> tuple[int, float | None, list[dict[str, Any]], bool]:
         pending = self.api("/api/tasks?status=pending&limit=1")
         workers = self.api("/api/workers?limit=1000")
         oldest = pending.get("oldest_created_at")
-        return int(pending.get("total") or 0), float(oldest) if oldest is not None else None, list(workers.get("workers") or [])
+        task_dispatch_enabled = pending.get("task_dispatch_enabled")
+        if not isinstance(task_dispatch_enabled, bool):
+            raise RuntimeError("Controller response does not include task_dispatch_enabled")
+        return (
+            int(pending.get("total") or 0),
+            float(oldest) if oldest is not None else None,
+            list(workers.get("workers") or []),
+            task_dispatch_enabled,
+        )
 
     def load_state(self) -> dict[str, dict[str, Any]]:
         try:
@@ -261,7 +269,8 @@ class Autoscaler:
 
     def plan(self, hosts: list[PoolHost], workers: list[dict[str, Any]], pending: int,
              oldest_pending_created_at: float | None,
-             state: dict[str, dict[str, Any]], stamp: float) -> list[Action]:
+             state: dict[str, dict[str, Any]], stamp: float,
+             task_dispatch_enabled: bool = True) -> list[Action]:
         # Accept state files created by earlier autoscaler versions.
         state.setdefault("idle_since", {})
         state.setdefault("start_requested_at", {})
@@ -278,14 +287,20 @@ class Autoscaler:
         for host in stopped:
             state["stop_requested_at"].pop(host.private_ip, None)
 
-        needed_slots = max(0, pending - ready_slots)
+        # A paused dispatch leaves queued tasks intentionally unclaimed.  They
+        # must not cause new EC2 instances to start, and they must not block
+        # normal idle shutdown of already-running Workers.
+        scaling_pending = pending if task_dispatch_enabled else 0
+        scaling_oldest_pending_created_at = oldest_pending_created_at if task_dispatch_enabled else None
+        needed_slots = max(0, scaling_pending - ready_slots)
         requested_capacity = sum(
             self.estimated_slots(host, workers)
             for host in stopped
             if stamp - state["start_requested_at"].get(host.private_ip, 0) < self.start_grace_seconds
         )
         actions: list[Action] = []
-        pending_age = max(0, stamp - oldest_pending_created_at) if oldest_pending_created_at else 0
+        pending_age = (max(0, stamp - scaling_oldest_pending_created_at)
+                       if scaling_oldest_pending_created_at else 0)
         if needed_slots > requested_capacity and pending_age >= self.pending_grace_seconds:
             remaining_slots = needed_slots - requested_capacity
             for host in self.start_candidates(stopped, workers, remaining_slots, state, stamp):
@@ -293,14 +308,14 @@ class Autoscaler:
                     break
                 capacity = self.estimated_slots(host, workers)
                 actions.append(Action("start", host,
-                                      f"{pending} pending task(s) waited {round(pending_age)}s, "
+                                      f"{scaling_pending} pending task(s) waited {round(pending_age)}s, "
                                       f"{ready_slots} ready slot(s), starting {capacity}-slot host"))
                 remaining_slots -= capacity
                 if remaining_slots <= 0:
                     break
             return actions  # Never scale down while the queue needs capacity.
 
-        if pending:
+        if scaling_pending:
             if needed_slots > requested_capacity:
                 logging.info("Autoscaler is waiting for pending tasks to age: %.0fs / %ss",
                              pending_age, self.pending_grace_seconds)
@@ -362,12 +377,13 @@ class Autoscaler:
             raise RuntimeError("VIDEO_MASK_ADMIN_TOKEN is required for autoscaling")
         self.refresh_pool()
         hosts = load_pool(self.pool_file, self.managed_ips)
-        pending, oldest_pending_created_at, workers = self.queue_and_workers()
+        pending, oldest_pending_created_at, workers, task_dispatch_enabled = self.queue_and_workers()
         state = self.load_state()
         previous_state = copy.deepcopy(state)
         stamp = time.time()
         self.sync_pool_status(hosts, state)
-        actions = self.plan(hosts, workers, pending, oldest_pending_created_at, state, stamp)
+        actions = self.plan(hosts, workers, pending, oldest_pending_created_at, state, stamp,
+                            task_dispatch_enabled=task_dispatch_enabled)
         try:
             for action in actions:
                 self.execute(action, state, stamp)
@@ -376,7 +392,8 @@ class Autoscaler:
             # script times out or returns an error after AWS accepted it.
             self.record_state_events(previous_state, state)
             self.save_state(state)
-        logging.info("Autoscaler check: pending=%s, workers=%s, actions=%s", pending, len(workers),
+        logging.info("Autoscaler check: pending=%s, task_dispatch=%s, workers=%s, actions=%s",
+                     pending, "enabled" if task_dispatch_enabled else "paused", len(workers),
                      ", ".join(f"{item.kind}:{item.host.private_ip}" for item in actions) or "none")
         return actions
 

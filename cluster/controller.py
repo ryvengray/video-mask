@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -37,7 +38,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("Install cluster requirements: pip install -r requirements-cluster.txt") from exc
 
 from cluster.store import ClusterStore
-from cluster.local_ingest import DEFAULT_ALGORITHM, DEFAULT_ARGS, VIDEO_SUFFIXES, LocalIngestor
+from cluster.local_ingest import VIDEO_SUFFIXES, LocalIngestor
 from cluster.s3_ingest import S3Ingestor
 
 
@@ -61,6 +62,23 @@ MANUAL_UPLOAD_MAX_BYTES = 20 * 1024 * 1024 * 1024
 FRAME_PREVIEW_HEIGHT = 240
 FRAME_PREVIEW_PER_MINUTE = 2
 FRAME_PREVIEW_MAX_IMAGES = 24
+PLAYBACK_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+def parse_algorithm_arguments(value: str | list[str]) -> list[str]:
+    """Accept JSON string arrays or a shell-style parameter line safely."""
+    if isinstance(value, str):
+        raw = value.strip()
+        try:
+            arguments = json.loads(raw) if raw.startswith("[") else shlex.split(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("algorithm parameters must be a JSON array or command-line string") from exc
+    else:
+        arguments = value
+    if (not isinstance(arguments, list) or len(arguments) > 128
+            or not all(isinstance(argument, str) and len(argument) <= 4096 for argument in arguments)):
+        raise ValueError("algorithm parameters must contain at most 128 strings")
+    return arguments
 
 
 def frame_preview_timestamps(task_id: str, duration_seconds: float) -> list[float]:
@@ -230,8 +248,8 @@ class TaskRequest(BaseModel):
     source_size_bytes: int | None = None
     source_sha256: str | None = None
     source_duration_seconds: float | None = None
-    algorithm: str = DEFAULT_ALGORITHM
-    arguments: list[str] = Field(default_factory=lambda: list(DEFAULT_ARGS))
+    algorithm: str | None = None
+    arguments: list[str] | None = None
     output_object_key: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=20)
 
@@ -245,12 +263,50 @@ class S3IngestSwitchRequest(BaseModel):
     enabled: bool
 
 
+class TaskDispatchSwitchRequest(BaseModel):
+    enabled: bool
+
+
+class AlgorithmDefaultsRequest(BaseModel):
+    algorithm: str = Field(min_length=1, max_length=255)
+    arguments: list[str] | str = Field(default_factory=list)
+
+
+class TaskRestartRequest(BaseModel):
+    algorithm: str = Field(min_length=1, max_length=255)
+    arguments: list[str] | str = Field(default_factory=list)
+
+
 class FaceReviewRequest(BaseModel):
     reviewer_id: str = Field(min_length=16, max_length=128)
 
 
 class FaceAnnotationRequest(FaceReviewRequest):
     has_face: bool
+
+
+class ContentTagsRequest(FaceReviewRequest):
+    tags: list[str] = Field(min_length=1, max_length=20)
+
+
+class VideoShareRequest(BaseModel):
+    task_ids: list[str] = Field(min_length=1, max_length=100)
+    files: list[str] = Field(min_length=1, max_length=2)
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
+class ContentCategoryRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+
+class TaskContentCategoryRequest(BaseModel):
+    category_id: int | None = Field(default=None, ge=1)
+
+
+class ContentCategoryShareRequest(BaseModel):
+    share_id: str = Field(min_length=16, max_length=64)
+    file: str = Field(default="input", pattern="^(input|output)$")
+    max_videos_per_category: int = Field(default=10, ge=1, le=100)
 
 
 def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
@@ -271,6 +327,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     def s3_ingest_is_enabled() -> bool:
         return bool(s3_ingestor) and s3_ingest_enabled
+
+    def task_dispatch_is_enabled() -> bool:
+        return store.boolean_setting("task_dispatch_enabled", True)
 
     def model_data(model: BaseModel) -> dict[str, Any]:
         # FastAPI 0.110 uses Pydantic v2, while some supported deployments
@@ -344,7 +403,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         s3_ingested = s3_ingestor.scan_if_due() if s3_ingest_is_enabled() else 0
         return {"status": "ok", "requeued": str(requeued), "ingested": str(ingested),
                 "s3_ingested": str(s3_ingested),
-                "s3_ingest_enabled": str(s3_ingest_is_enabled()).lower()}
+                "s3_ingest_enabled": str(s3_ingest_is_enabled()).lower(),
+                "task_dispatch_enabled": str(task_dispatch_is_enabled()).lower()}
 
     @app.post("/api/workers/register")
     def register_worker(request: WorkerRequest, http_request: Request):
@@ -479,9 +539,58 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         filename = Path(str(key or "")).name
         return filename or ("output.mp4" if file == "output" else "input.mp4")
 
+    def stream_task_playback(request: Request, task_id: str, task: dict[str, Any], file: str,
+                             download: bool = False, public: bool = False) -> StreamingResponse:
+        """Proxy S3 media without ever revealing its temporary URL to a client."""
+        url = task_playback_url(task_id, file)
+        upstream_headers = {"User-Agent": "video-mask-controller-playback/1.0"}
+        for header in ("range", "if-range"):
+            value = request.headers.get(header)
+            if value:
+                upstream_headers[header.title()] = value
+        try:
+            upstream = urllib.request.urlopen(urllib.request.Request(url, headers=upstream_headers), timeout=30)
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(status_code=exc.code, detail="S3 playback request failed") from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(status_code=502, detail="unable to reach S3 for playback") from exc
+
+        response_headers: dict[str, str] = {}
+        for header in ("Accept-Ranges", "Content-Length", "Content-Range", "Content-Type", "ETag", "Last-Modified"):
+            value = upstream.headers.get(header)
+            if value:
+                response_headers[header] = value
+        filename = task_playback_filename(task, file)
+        ascii_filename = filename.encode("ascii", "ignore").decode("ascii") or "video.mp4"
+        ascii_filename = ascii_filename.replace('"', "_").replace("\\", "_")
+        disposition = "attachment" if download else "inline"
+        response_headers["Content-Disposition"] = (
+            f'{disposition}; filename="{ascii_filename}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
+        )
+        # Range reads must arrive immediately for HTML5 startup and seeking.
+        response_headers["X-Accel-Buffering"] = "no"
+        if public:
+            response_headers["Cache-Control"] = "private, no-store"
+
+        def stream_video():
+            try:
+                while chunk := upstream.read(PLAYBACK_STREAM_CHUNK_BYTES):
+                    yield chunk
+            finally:
+                upstream.close()
+
+        media_type = response_headers.pop("Content-Type", None)
+        return StreamingResponse(
+            stream_video(), status_code=upstream.getcode(), headers=response_headers, media_type=media_type,
+        )
+
     frame_preview_root = database.parent / "frame-previews"
     frame_preview_jobs: set[tuple[str, str, str]] = set()
     frame_preview_lock = threading.Lock()
+    category_cover_root = database.parent / "category-share-covers"
+    category_cover_jobs: set[tuple[str, str, str]] = set()
+    category_cover_lock = threading.Lock()
 
     def frame_preview_dir(task_id: str, file: str) -> Path:
         # Task IDs originate from an API, so keep cache paths independent of
@@ -564,6 +673,95 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             with frame_preview_lock:
                 frame_preview_jobs.discard(job_key)
 
+    def category_cover_dir(task_id: str, file: str) -> Path:
+        return category_cover_root / hashlib.sha256(task_id.encode("utf-8")).hexdigest() / file
+
+    def category_cover_fingerprint(task: dict[str, Any], file: str) -> str:
+        return "|".join(str(value or "") for value in (
+            file, task.get("output_object_key") if file == "output" else task.get("source_object_key"),
+            task.get("output_sha256") if file == "output" else task.get("source_sha256"),
+            task.get("finished_at") if file == "output" else task.get("created_at"),
+        ))
+
+    def category_cover_manifest(directory: Path) -> dict[str, Any]:
+        try:
+            return json.loads((directory / "manifest.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def write_category_cover_manifest(directory: Path, payload: dict[str, Any]) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / "manifest.json.partial"
+        temporary.write_text(json.dumps(payload, separators=(",", ":")))
+        temporary.replace(directory / "manifest.json")
+
+    def generate_category_cover(task_id: str, file: str, source_url: str, fingerprint: str,
+                                duration_hint: float | None) -> None:
+        """Generate one share-page poster frame, never exposing the S3 URL."""
+        directory = category_cover_dir(task_id, file)
+        job_key = (task_id, file, fingerprint)
+        manifest: dict[str, Any] = {"state": "running", "fingerprint": fingerprint}
+        try:
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True, exist_ok=True)
+            duration_seconds = duration_hint
+            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", source_url],
+                    text=True, capture_output=True, check=False, timeout=60,
+                )
+                try:
+                    duration_seconds = float(probe.stdout.strip())
+                except ValueError as exc:
+                    raise RuntimeError("unable to determine video duration for share cover") from exc
+            if not isinstance(duration_seconds, (int, float)) or duration_seconds <= 0:
+                raise RuntimeError("video duration is empty")
+            # Sampling slightly into the video avoids the frequent black first frame.
+            timestamp = min(max(0.0, float(duration_seconds) - 0.1), max(0.0, float(duration_seconds) * 0.1))
+            image = directory / "cover.jpg"
+            completed = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.3f}",
+                 "-i", source_url, "-map", "0:v:0", "-frames:v", "1",
+                 "-vf", "scale=-2:360", "-q:v", "6", "-y", str(image)],
+                text=True, capture_output=True, check=False, timeout=90,
+            )
+            if completed.returncode or not image.is_file():
+                raise RuntimeError("ffmpeg could not extract a share cover frame")
+            manifest.update({"state": "ready", "timestamp_seconds": round(timestamp, 1)})
+            write_category_cover_manifest(directory, manifest)
+        except Exception as exc:
+            logger.warning("Share cover generation failed for %s: %s", task_id, exc)
+            manifest.update({"state": "error", "error": str(exc)[:500]})
+            write_category_cover_manifest(directory, manifest)
+        finally:
+            with category_cover_lock:
+                category_cover_jobs.discard(job_key)
+
+    def category_cover_state(task: dict[str, Any], file: str, start: bool = True) -> dict[str, Any]:
+        fingerprint = category_cover_fingerprint(task, file)
+        directory = category_cover_dir(str(task["task_id"]), file)
+        manifest = category_cover_manifest(directory)
+        image = directory / "cover.jpg"
+        if manifest.get("fingerprint") == fingerprint and manifest.get("state") == "ready" and image.is_file():
+            return {"state": "ready", "image": image}
+        if manifest.get("fingerprint") == fingerprint and manifest.get("state") in {"running", "error"}:
+            return {"state": str(manifest["state"]), "error": str(manifest.get("error") or "")}
+        if not start:
+            return {"state": "missing"}
+        job_key = (str(task["task_id"]), file, fingerprint)
+        source_url = task_playback_url(str(task["task_id"]), file)
+        with category_cover_lock:
+            if job_key not in category_cover_jobs:
+                category_cover_jobs.add(job_key)
+                duration_hint = task.get("output_duration_seconds") if file == "output" else task.get("source_duration_seconds")
+                threading.Thread(
+                    target=generate_category_cover,
+                    args=(str(task["task_id"]), file, source_url, fingerprint, duration_hint),
+                    name=f"category-cover-{str(task['task_id'])[:8]}", daemon=True,
+                ).start()
+        return {"state": "running"}
+
     @app.get("/api/tasks/{task_id}/frame-previews")
     def get_frame_previews(task_id: str) -> dict[str, Any]:
         task = store.task(task_id)
@@ -606,7 +804,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         return FileResponse(image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
     @app.get("/api/tasks/{task_id}/play-url")
-    def get_task_play_url(task_id: str, file: str = "input") -> dict[str, str]:
+    def get_task_play_url(task_id: str, file: str = "input", download: bool = False) -> dict[str, str]:
         # Keep the signed S3 URL on the Controller. The browser requests this
         # relative URL through Nginx, so S3 sees the Controller as the client.
         if file not in {"input", "output"}:
@@ -616,54 +814,163 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=404, detail="task does not exist")
         if not s3_ingestor:
             raise HTTPException(status_code=409, detail="playback URLs are only available for S3 tasks")
-        return {"url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/play?file={file}"}
+        suffix = "&download=true" if download else ""
+        return {"url": f"/api/tasks/{urllib.parse.quote(task_id, safe='')}/play?file={file}{suffix}"}
 
     @app.get("/api/tasks/{task_id}/play", name="proxy_task_playback")
-    def proxy_task_playback(request: Request, task_id: str, file: str = "input"):
+    def proxy_task_playback(request: Request, task_id: str, file: str = "input", download: bool = False):
         """Stream an S3 video through the Controller while preserving seek support."""
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
-        url = task_playback_url(task_id, file)
-        upstream_headers = {"User-Agent": "video-mask-controller-playback/1.0"}
-        for header in ("range", "if-range"):
-            value = request.headers.get(header)
-            if value:
-                upstream_headers[header.title()] = value
+        return stream_task_playback(request, task_id, task, file, download)
+
+    @app.post("/api/dashboard/shares")
+    def create_dashboard_video_share(request: VideoShareRequest) -> dict[str, Any]:
+        """Create a public, expiring link for explicitly selected task media."""
         try:
-            upstream = urllib.request.urlopen(urllib.request.Request(url, headers=upstream_headers), timeout=30)
-        except urllib.error.HTTPError as exc:
-            raise HTTPException(status_code=exc.code, detail="S3 playback request failed") from exc
-        except urllib.error.URLError as exc:
-            raise HTTPException(status_code=502, detail="unable to reach S3 for playback") from exc
+            share = store.create_video_share(request.task_ids, request.files, request.expires_in_days)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        token = str(share.pop("token"))
+        return {**share, "url": f"/share/{urllib.parse.quote(token, safe='')}"}
 
-        response_headers: dict[str, str] = {}
-        for header in ("Accept-Ranges", "Content-Length", "Content-Range", "Content-Type", "ETag", "Last-Modified"):
-            value = upstream.headers.get(header)
-            if value:
-                response_headers[header] = value
-        filename = task_playback_filename(task, file)
-        ascii_filename = filename.encode("ascii", "ignore").decode("ascii") or "video.mp4"
-        ascii_filename = ascii_filename.replace('"', "_").replace("\\", "_")
-        response_headers["Content-Disposition"] = (
-            f'inline; filename="{ascii_filename}"; '
-            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}"
+    def public_share_or_404(token: str) -> dict[str, Any]:
+        share = store.video_share(token)
+        if share is None:
+            # Do not disclose whether this was expired, revoked, or never a
+            # real token.  All invalid public links deliberately look alike.
+            raise HTTPException(status_code=404, detail="shared video link is unavailable")
+        return share
+
+    @app.get("/share/{token}", response_class=HTMLResponse)
+    def public_video_share(request: Request, token: str):
+        share = public_share_or_404(token)
+        share["expires_at_display"] = datetime_local(float(share["expires_at"])).replace("T", " ")
+        response = templates.TemplateResponse(
+            request=request, name="share.html", context={"share": share, "token": token},
         )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
-        def stream_video():
-            try:
-                while chunk := upstream.read(1024 * 1024):
-                    yield chunk
-            finally:
-                upstream.close()
+    @app.get("/share/{token}/files/{item_id}")
+    def public_video_share_file(request: Request, token: str, item_id: str, download: bool = False):
+        item = store.video_share_item(token, item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared video link is unavailable")
+        task = store.task(str(item["task_id"]))
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared video link is unavailable")
+        return stream_task_playback(request, str(item["task_id"]), task, str(item["file"]), download, public=True)
 
-        media_type = response_headers.pop("Content-Type", None)
-        return StreamingResponse(
-            stream_video(),
-            status_code=upstream.getcode(),
-            headers=response_headers,
-            media_type=media_type,
+    def public_category_catalog_or_404(share_id: str) -> list[dict[str, Any]]:
+        categories = store.public_category_catalog(share_id)
+        if categories is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        return categories
+
+    @app.get("/share/categories/{share_id}", response_class=HTMLResponse)
+    def public_content_category_catalog(request: Request, share_id: str):
+        categories = public_category_catalog_or_404(share_id)
+        response = templates.TemplateResponse(
+            request=request, name="category-share.html",
+            context={
+                "share_id": share_id, "categories": categories,
+                "share_file": store.category_share_file(),
+            },
         )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.get("/share/categories/{share_id}/videos/{task_id}")
+    def public_content_category_video(request: Request, share_id: str, task_id: str, download: bool = False):
+        item = store.public_category_catalog_item(share_id, task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        return stream_task_playback(request, task_id, task, str(item["file"]), download, public=True)
+
+    @app.get("/share/categories/{share_id}/videos/{task_id}/cover")
+    def public_content_category_cover(share_id: str, task_id: str) -> JSONResponse:
+        item = store.public_category_catalog_item(share_id, task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        state = category_cover_state(task, str(item["file"]))
+        response: dict[str, Any] = {"state": state["state"]}
+        if state["state"] == "ready":
+            response["url"] = (
+                f"/share/categories/{urllib.parse.quote(share_id, safe='')}/videos/"
+                f"{urllib.parse.quote(task_id, safe='')}/cover.jpg"
+            )
+        elif state.get("error"):
+            response["error"] = state["error"]
+        return JSONResponse(response, headers={"Cache-Control": "private, no-store"})
+
+    @app.get("/share/categories/{share_id}/videos/{task_id}/cover.jpg")
+    def public_content_category_cover_file(share_id: str, task_id: str):
+        item = store.public_category_catalog_item(share_id, task_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="shared category page is unavailable")
+        state = category_cover_state(task, str(item["file"]), start=False)
+        image = state.get("image")
+        if state.get("state") != "ready" or not isinstance(image, Path) or not image.is_file():
+            raise HTTPException(status_code=404, detail="shared video cover is not available")
+        return FileResponse(image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+    @app.get("/api/dashboard/content-categories")
+    def list_content_categories(task_ids: str = "") -> dict[str, Any]:
+        selected = tuple(dict.fromkeys(value for value in task_ids.split(",") if value))[:100]
+        return {
+            "categories": store.content_categories(),
+            "assignments": store.task_content_categories(selected),
+            "share_id": store.category_share_id(),
+            "share_file": store.category_share_file(),
+            "share_max_videos_per_category": store.category_share_limit(),
+        }
+
+    @app.post("/api/dashboard/content-categories")
+    def create_content_category(request: ContentCategoryRequest) -> dict[str, Any]:
+        try:
+            return store.create_content_category(request.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/dashboard/content-categories/{category_id}")
+    def delete_content_category(category_id: int) -> dict[str, bool]:
+        try:
+            store.delete_content_category(category_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"deleted": True}
+
+    @app.put("/api/dashboard/tasks/{task_id}/content-category")
+    def set_dashboard_task_content_category(task_id: str, request: TaskContentCategoryRequest) -> dict[str, Any]:
+        try:
+            return store.set_task_content_category(task_id, request.category_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/dashboard/content-category-share")
+    def set_content_category_share(request: ContentCategoryShareRequest) -> dict[str, Any]:
+        try:
+            share_id = store.set_category_share_id(request.share_id)
+            share_file = store.set_category_share_file(request.file)
+            share_limit = store.set_category_share_limit(request.max_videos_per_category)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "share_id": share_id, "share_file": share_file,
+            "max_videos_per_category": share_limit,
+            "url": f"/share/categories/{urllib.parse.quote(share_id, safe='')}",
+        }
 
     @app.post("/api/tasks")
     def create_task(request: TaskRequest, authorization: str | None = Header(default=None)):
@@ -703,14 +1010,31 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/dashboard/tasks/{task_id}/restart")
-    def dashboard_restart_task(task_id: str) -> dict[str, Any]:
+    def dashboard_restart_task(task_id: str, request: TaskRestartRequest) -> dict[str, Any]:
         """Restart one completed or failed task from the Nginx-protected dashboard."""
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
         if task.get("status") not in {"completed", "failed"}:
             raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
-        return store.restart_task(task_id)
+        algorithm = request.algorithm.strip()
+        if not algorithm or Path(algorithm).name != algorithm:
+            raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
+        try:
+            arguments = parse_algorithm_arguments(request.arguments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return store.restart_task(task_id, algorithm=algorithm, arguments=arguments)
+
+    @app.get("/api/dashboard/tasks/{task_id}/restart-config")
+    def dashboard_task_restart_config(task_id: str) -> dict[str, Any]:
+        """Return the current Settings defaults for a dashboard restart."""
+        task = store.task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task does not exist")
+        if task.get("status") not in {"completed", "failed"}:
+            raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
+        return store.get_algorithm_defaults()
 
     @app.post("/api/dashboard/tasks/{task_id}/cancel")
     def dashboard_cancel_task(task_id: str) -> dict[str, Any]:
@@ -745,9 +1069,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 or Path(selected_algorithm).name != selected_algorithm):
             raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
         try:
-            selected_arguments = json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of strings") from exc
+            selected_arguments = parse_algorithm_arguments(arguments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if (not isinstance(selected_arguments, list) or len(selected_arguments) > 128
                 or not all(isinstance(value, str) and len(value) <= 4096 for value in selected_arguments)):
             raise HTTPException(status_code=400, detail="algorithm parameters must be a JSON array of at most 128 strings")
@@ -838,7 +1162,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     @app.post("/api/face-reviews/{task_id}/open")
     def open_face_review(task_id: str, request: FaceReviewRequest) -> dict[str, Any]:
-        """Reserve a particular completed video so its label can be viewed or edited."""
+        """Reserve a particular source video so its manual labels can be viewed or edited."""
         try:
             task = store.claim_face_review(task_id, request.reviewer_id, FACE_REVIEW_LEASE_SECONDS)
         except ValueError as exc:
@@ -863,6 +1187,31 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             return store.annotate_face(task_id, request.reviewer_id, request.has_face)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/face-reviews/{task_id}/content-tags")
+    def annotate_content_tags(task_id: str, request: ContentTagsRequest) -> dict[str, Any]:
+        try:
+            return store.annotate_content_tags(task_id, request.reviewer_id, request.tags)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/content-tags")
+    def list_content_tags() -> dict[str, list[str]]:
+        return {"tags": store.content_tags()}
+
+    @app.get("/api/dashboard/content-tag-statistics")
+    def content_tag_statistics(status: str = "") -> dict[str, Any]:
+        """Return the tagged-video count for each content label."""
+        statuses = tuple(dict.fromkeys(value.strip() for value in status.split(",") if value.strip()))
+        if set(statuses) - set(TASK_FILTER_STATUSES):
+            raise HTTPException(status_code=400, detail="unknown task status filter")
+        tags = store.content_tag_statistics(statuses or None)
+        return {
+            "tags": tags,
+            "total_tags": len(tags),
+            "tagged_video_occurrences": sum(item["video_count"] for item in tags),
+            "statuses": statuses,
+        }
 
     @app.get("/api/face-reviews/status")
     def get_face_review_status(task_ids: str = "") -> dict[str, Any]:
@@ -896,6 +1245,20 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         # as the UI control, so this browser-facing switch has no token prompt.
         return {"configured": bool(s3_ingestor), "enabled": s3_ingest_is_enabled()}
 
+    @app.get("/api/admin/algorithm-defaults")
+    def get_algorithm_defaults() -> dict[str, Any]:
+        return store.get_algorithm_defaults()
+
+    @app.put("/api/admin/algorithm-defaults")
+    def set_algorithm_defaults(request: AlgorithmDefaultsRequest) -> dict[str, Any]:
+        # Dashboard access is protected by the same outer proxy authentication
+        # as the UI control, so this browser-facing endpoint has no token prompt.
+        try:
+            arguments = parse_algorithm_arguments(request.arguments)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return store.set_algorithm_defaults(request.algorithm, arguments)
+
     @app.put("/api/admin/s3-ingest")
     def set_s3_ingest_switch(request: S3IngestSwitchRequest) -> dict[str, bool]:
         nonlocal s3_ingest_enabled
@@ -909,14 +1272,24 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         logger.warning("S3 ingestion %s by administrator", "enabled" if s3_ingest_enabled else "disabled")
         return {"configured": True, "enabled": s3_ingest_enabled}
 
+    @app.put("/api/admin/task-dispatch")
+    def set_task_dispatch_switch(request: TaskDispatchSwitchRequest) -> dict[str, bool]:
+        enabled = store.set_boolean_setting("task_dispatch_enabled", request.enabled)
+        logger.warning("Task dispatch %s by administrator", "enabled" if enabled else "paused")
+        return {"enabled": enabled}
+
     @app.post("/api/admin/s3-ingest/scan")
-    def scan_s3_ingest_once() -> dict[str, bool | int]:
-        """Run one S3 discovery pass even while scheduled ingestion is paused."""
+    def scan_s3_ingest_once(source_prefix: str = "") -> dict[str, bool | int | str]:
+        """Run one S3 discovery pass, optionally restricted to a source-bucket folder."""
         if not s3_ingestor:
             raise HTTPException(status_code=409, detail="S3 ingestion is not configured on this Controller")
-        created = s3_ingestor.scan()
-        logger.warning("S3 ingestion manual scan created %d task(s)", created)
-        return {"configured": True, "enabled": s3_ingest_is_enabled(), "created": created}
+        try:
+            prefix = s3_ingestor.normalise_scan_prefix(source_prefix)
+            created = s3_ingestor.scan_prefix(prefix)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.warning("S3 ingestion manual scan prefix=%r created %d task(s)", prefix or "/", created)
+        return {"configured": True, "enabled": s3_ingest_is_enabled(), "source_prefix": prefix, "created": created}
 
     @app.get("/api/tasks")
     def list_tasks(limit: int = 100, offset: int = 0, status: str | None = None,
@@ -929,6 +1302,7 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "tasks": store.list_tasks(page_size, page_offset, statuses),
             "total": store.count_tasks(statuses),
             "oldest_created_at": store.oldest_task_created_at(statuses) if statuses else None,
+            "task_dispatch_enabled": task_dispatch_is_enabled(),
             "limit": page_size,
             "offset": page_offset,
         }
@@ -945,10 +1319,28 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         ))
         if set(selected_face_annotations) - set(FACE_ANNOTATION_FILTERS):
             raise HTTPException(status_code=400, detail="unknown face annotation filter")
+        selected_content_tags = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_tag") if value.strip()
+        ))
+        if len(selected_content_tags) > 20 or any(len(value) > 64 for value in selected_content_tags):
+            raise HTTPException(status_code=400, detail="invalid content tag filter")
+        raw_content_categories = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_category") if value.strip()
+        ))
+        if len(raw_content_categories) > 100:
+            raise HTTPException(status_code=400, detail="too many content category filters")
+        try:
+            selected_content_categories = tuple(int(value) for value in raw_content_categories)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content category filter") from exc
+        if any(value < 1 for value in selected_content_categories):
+            raise HTTPException(status_code=400, detail="invalid content category filter")
         selected_search = q.strip()[:200] or None
-        total = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None)
+        total = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None,
+                                  selected_content_tags or None, selected_content_categories or None)
         tasks = store.list_tasks(max(1, total), 0, selected_statuses, selected_search,
-                                 selected_face_annotations or None)
+                                 selected_face_annotations or None, selected_content_tags or None,
+                                 selected_content_categories or None)
 
         def timestamp(value: Any) -> str:
             try:
@@ -965,8 +1357,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
             "Output upload URL", "Output file/key", "Attempt count", "Max attempts", "Assigned worker ID",
             "Worker name", "Worker slot", "Progress (JSON)", "Processing seconds", "Task lifetime (seconds)",
             "Output SHA256", "Output size (bytes)", "Output duration (seconds)", "Error message", "Created at",
-            "Started at", "Restarted at", "Finished at", "Face annotation",
-            "Face annotated at", "Face review owner", "Face review lease until", "Updated at",
+            "Started at", "Restarted at", "Finished at", "Face annotation", "Content tags",
+            "Face annotated at", "Content tagged at", "Face review owner", "Face review lease until", "Updated at",
         ]
         rows: list[list[Any]] = []
         for task in tasks:
@@ -990,7 +1382,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 task.get("error_message"), timestamp(task.get("created_at")),
                 timestamp(task.get("started_at")), timestamp(task.get("restarted_at")), timestamp(task.get("finished_at")),
                 "Has face" if annotation == 1 else "No face" if annotation == 0 else "Unlabelled",
-                timestamp(task.get("face_annotated_at")), task.get("face_review_owner"),
+                ", ".join(task.get("content_tags") or []), timestamp(task.get("face_annotated_at")),
+                timestamp(task.get("content_tagged_at")), task.get("face_review_owner"),
                 timestamp(task.get("face_review_lease_until")), timestamp(task.get("updated_at")),
             ])
         workbook = tasks_xlsx(headers, rows)
@@ -1026,18 +1419,38 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         unknown_face_annotations = set(selected_face_annotations) - set(FACE_ANNOTATION_FILTERS)
         if unknown_face_annotations:
             raise HTTPException(status_code=400, detail="unknown face annotation filter")
+        selected_content_tags = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_tag") if value.strip()
+        ))
+        if len(selected_content_tags) > 20 or any(len(value) > 64 for value in selected_content_tags):
+            raise HTTPException(status_code=400, detail="invalid content tag filter")
+        raw_content_categories = tuple(dict.fromkeys(
+            value.strip() for value in request.query_params.getlist("content_category") if value.strip()
+        ))
+        if len(raw_content_categories) > 100:
+            raise HTTPException(status_code=400, detail="too many content category filters")
+        try:
+            selected_content_categories = tuple(int(value) for value in raw_content_categories)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content category filter") from exc
+        if any(value < 1 for value in selected_content_categories):
+            raise HTTPException(status_code=400, detail="invalid content category filter")
         selected_search = q.strip()[:200] or None
         task_filter_query = urllib.parse.urlencode([
             *([("task_status", selected_task_status)] if selected_task_status else []),
             *(("face_annotation", value) for value in selected_face_annotations),
+            *(("content_tag", value) for value in selected_content_tags),
+            *(("content_category", value) for value in selected_content_categories),
             *([("q", selected_search)] if selected_search else []),
         ])
         page_size = 50
-        total_tasks = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None)
+        total_tasks = store.count_tasks(selected_statuses, selected_search, selected_face_annotations or None,
+                                        selected_content_tags or None, selected_content_categories or None)
         total_pages = max(1, (total_tasks + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
         rows = store.list_tasks(page_size, (page - 1) * page_size, selected_statuses, selected_search,
-                                selected_face_annotations or None)
+                                selected_face_annotations or None, selected_content_tags or None,
+                                selected_content_categories or None)
 
         def byte_size(value: Any) -> str:
             try:
@@ -1191,8 +1604,9 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                 "status_tones": STATUS_TONES,
                 "s3_ingest_configured": bool(s3_ingestor),
                 "s3_ingest_enabled": s3_ingest_is_enabled(),
-                "manual_task_default_algorithm": DEFAULT_ALGORITHM,
-                "manual_task_default_arguments": DEFAULT_ARGS,
+                "task_dispatch_enabled": task_dispatch_is_enabled(),
+                "manual_task_default_algorithm": store.get_algorithm_defaults()["algorithm"],
+                "manual_task_default_arguments": store.get_algorithm_defaults()["arguments"],
                 "processing_statistics": processing_statistics,
                 "statistics_range_hours": round((stats_end - stats_start) / 3600),
                 "statistics_start_input": datetime_local(stats_start),
@@ -1207,6 +1621,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
                     ("unlabelled", "Unlabelled"),
                 ),
                 "selected_face_annotations": selected_face_annotations,
+                "content_tag_filter_options": store.content_tags(),
+                "selected_content_tags": selected_content_tags,
                 "selected_search": selected_search or "",
                 "task_filter_query": task_filter_query,
                 "task_total_all": sum(task_status_counts.values()),

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Audit - 人脸检测审核</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <h1>Video Audit</h1>
+            <p class="subtitle">人脸检测结果审核工具</p>
+        </header>
+
+        <nav class="nav">
+            <button class="nav-btn active" data-view="projects">项目管理</button>
+            <button class="nav-btn" data-view="stats">统计</button>
+        </nav>
+
+        <main class="main">
+            <!-- Projects View -->
+            <div id="view-projects" class="view active">
+                <div class="projects-section">
+                    <div class="section-header">
+                        <h2>项目列表</h2>
+                        <button id="create-project-btn" class="btn-primary">创建项目</button>
+                    </div>
+                    <div id="projects-list" class="projects-list"></div>
+                </div>
+
+                <div id="tasks-section" class="tasks-section hidden">
+                    <div class="section-header">
+                        <h2>任务列表</h2>
+                        <button id="back-to-projects" class="btn-secondary">返回项目</button>
+                    </div>
+                    <div class="add-tasks">
+                        <textarea id="task-ids-input" placeholder="输入任务ID，每行一个" rows="3"></textarea>
+                        <button id="add-tasks-btn" class="btn-primary">添加任务</button>
+                    </div>
+                    <div id="tasks-list" class="tasks-list"></div>
+                </div>
+            </div>
+
+            <!-- Stats View -->
+            <div id="view-stats" class="view">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">总审核数</div>
+                        <div id="stat-total" class="stat-value">0</div>
+                    </div>
+                    <div class="stat-card missed">
+                        <div class="stat-label">漏检</div>
+                        <div id="stat-missed" class="stat-value">0</div>
+                    </div>
+                    <div class="stat-card false-positive">
+                        <div class="stat-label">误检</div>
+                        <div id="stat-false" class="stat-value">0</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Audit View -->
+            <div id="view-audit" class="view">
+                <div class="audit-header">
+                    <button id="back-to-tasks" class="btn-secondary">返回任务</button>
+                    <h2 id="audit-task-title">视频审核</h2>
+                </div>
+                <div class="audit-container">
+                    <div class="video-section">
+                        <video id="audit-video" controls></video>
+                        <div class="video-controls">
+                            <button id="mark-missed" class="btn-danger">标记漏检 (Missed)</button>
+                            <button id="mark-false" class="btn-warning">标记误检 (False Positive)</button>
+                        </div>
+                    </div>
+                    <div class="reviews-section">
+                        <h3>审核记录</h3>
+                        <div id="reviews-list" class="reviews-list"></div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Create Project Modal -->
+    <div id="create-project-modal" class="modal hidden">
+        <div class="modal-content">
+            <h3>创建新项目</h3>
+            <input type="text" id="project-name-input" placeholder="项目名称">
+            <div class="modal-actions">
+                <button id="cancel-create-project" class="btn-secondary">取消</button>
+                <button id="confirm-create-project" class="btn-primary">创建</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -10,6 +10,7 @@ import os
 import signal
 import shutil
 import socket
+import site
 import subprocess
 import sys
 import threading
@@ -27,6 +28,20 @@ DEFAULT_ARGS = ["--fisheye", "--fisheye-device", "pico4", "--face-size", "960",
                 ]
 DEFAULT_ALGORITHM = "video_mask_batch_fish_v1.py"
 SINGLE_PUT_MAX_BYTES = 5 * 1024 * 1024 * 1024
+STRUCTURED_REPORT_ALGORITHMS = {"video_mask_batch_fish_v1_plus.py"}
+MAX_ALGORITHM_REPORT_BYTES = 1024 * 1024
+
+
+def cuda_library_paths() -> list[str]:
+    """Find CUDA shared libraries installed by PyTorch's pip dependencies."""
+    paths: list[str] = []
+    for site_packages in site.getsitepackages():
+        root = Path(site_packages)
+        candidates = [root / "torch" / "lib", *sorted(root.glob("nvidia/*/lib"))]
+        for candidate in candidates:
+            if candidate.is_dir() and str(candidate) not in paths:
+                paths.append(str(candidate))
+    return paths
 
 
 def request_json(url: str, payload: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -67,6 +82,13 @@ class Worker:
         self.poll_seconds = args.poll_seconds
         self.extra_args = args.extra_arg or DEFAULT_ARGS
         self.allow_local_files = args.allow_local_files
+        self.algorithm_environment = dict(os.environ)
+        cuda_paths = cuda_library_paths()
+        if cuda_paths:
+            inherited_paths = self.algorithm_environment.get("LD_LIBRARY_PATH", "")
+            self.algorithm_environment["LD_LIBRARY_PATH"] = ":".join(
+                [*cuda_paths, *filter(None, inherited_paths.split(":"))]
+            )
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.completed_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -244,7 +266,7 @@ class Worker:
         return candidate
 
     def algorithm_command(self, algorithm: Path, source: Path, output_dir: Path,
-                          arguments: list[str]) -> list[str]:
+                          arguments: list[str], report_path: Path | None = None) -> list[str]:
         """Build an invocation for either a development script or a release binary.
 
         The normal source deployment supplies a ``.py`` algorithm and therefore
@@ -253,6 +275,8 @@ class Worker:
         as a Python script makes an otherwise valid Worker fail at task claim time.
         """
         shared = [str(source), "--out-dir", str(output_dir), *arguments]
+        if report_path is not None:
+            shared.extend(("--report", str(report_path)))
         if algorithm.suffix.lower() == ".py":
             if not algorithm.is_file():
                 raise RuntimeError(f"algorithm script does not exist: {algorithm.name}")
@@ -262,6 +286,52 @@ class Worker:
         if not os.access(algorithm, os.X_OK):
             raise RuntimeError(f"algorithm executable is not executable: {algorithm.name}")
         return [str(algorithm), *shared]
+
+    @staticmethod
+    def structured_report_path(algorithm: Path, output_dir: Path) -> Path | None:
+        """Return the report location for algorithms with the JSON report contract."""
+        if algorithm.name in STRUCTURED_REPORT_ALGORITHMS:
+            return output_dir / "algorithm-report.json"
+        return None
+
+    @staticmethod
+    def read_algorithm_report(path: Path) -> dict[str, Any]:
+        """Validate and retain the safe single-video metrics from an algorithm report."""
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_ALGORITHM_REPORT_BYTES:
+                raise ValueError("report file is missing or too large")
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("algorithm JSON report cannot be read") from exc
+        videos = report.get("videos") if isinstance(report, dict) else None
+        if not isinstance(videos, list) or len(videos) != 1 or not isinstance(videos[0], dict):
+            raise ValueError("algorithm JSON report must contain exactly one video result")
+        video = videos[0]
+
+        def non_negative_int(name: str) -> int:
+            value = video.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2_000_000_000:
+                raise ValueError(f"algorithm JSON report has invalid {name}")
+            return value
+
+        def non_negative_number(name: str) -> float:
+            value = video.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= float(value) <= 1_000_000_000:
+                raise ValueError(f"algorithm JSON report has invalid {name}")
+            return round(float(value), 3)
+
+        if video.get("success") is not True:
+            raise ValueError("algorithm JSON report marks the video as failed")
+        return {
+            "schema_version": 1,
+            "total_frames": non_negative_int("total_frames"),
+            "frames_with_face": non_negative_int("frames_with_face"),
+            "total_face_detections": non_negative_int("total_face_detections"),
+            "duration_seconds": non_negative_number("duration_seconds"),
+            "fps": non_negative_number("fps"),
+            "width": non_negative_int("width"),
+            "height": non_negative_int("height"),
+        }
 
     def persist_output(self, output: Path, task_id: str) -> Path:
         """Keep a completed result after the task work directory is cleaned."""
@@ -288,6 +358,8 @@ class Worker:
         output: Path | None = None
         elapsed: float | None = None
         processing_started_at: float | None = None
+        algorithm_exit_code: int | None = None
+        algorithm_stats: dict[str, Any] | None = None
         try:
             phase = "downloading"
             self.report(task_id, "downloading", phase="downloading")
@@ -300,11 +372,14 @@ class Worker:
                         processing_started_at=processing_started_at)
             algorithm = self.algorithm_path_for_task(task)
             print(f"[{task_id}] Controller selected algorithm: {algorithm.name}", flush=True)
-            command = self.algorithm_command(algorithm, source, output_dir, task.get("arguments") or self.extra_args)
+            report_path = self.structured_report_path(algorithm, output_dir)
+            command = self.algorithm_command(
+                algorithm, source, output_dir, task.get("arguments") or self.extra_args, report_path,
+            )
             started = time.monotonic()
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1, start_new_session=True,
-                                       env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                                       env={**self.algorithm_environment, "PYTHONUNBUFFERED": "1"})
 
             cancel_monitor_stop = threading.Event()
 
@@ -334,18 +409,20 @@ class Worker:
                         self.report_logs(task_id, log_batch)
                         log_batch = []
                         last_log_upload = time.monotonic()
-            exit_code = process.wait()
+            algorithm_exit_code = process.wait()
             self.report_logs(task_id, log_batch)
             cancel_monitor_stop.set()
             cancel_monitor.join(timeout=1)
             if cancel_requested.is_set():
                 raise RuntimeError("cancelled by administrator")
-            if exit_code != 0:
+            if algorithm_exit_code != 0:
                 raise RuntimeError("algorithm failed: " + " | ".join(tail)[-1500:])
             candidates = sorted(output_dir.glob("masked_*.mp4"))
             if not candidates:
                 raise RuntimeError("algorithm completed without an output mp4")
             output = candidates[0]
+            if report_path is not None:
+                algorithm_stats = self.read_algorithm_report(report_path)
             elapsed = round(time.monotonic() - started, 1)
             output_url = task.get("output_upload_url")
             if output_url:
@@ -401,6 +478,13 @@ class Worker:
                     "output_bytes": completed_output.stat().st_size,
                     "processing_started_at": processing_started_at,
                     "processing_seconds": elapsed,
+                    "algorithm_exit_code": algorithm_exit_code,
+                    "algorithm_stats": algorithm_stats,
+                    # Convenient scalar aliases for SQL/JSON exports and
+                    # future aggregation without traversing the nested report.
+                    "face_frame_count": algorithm_stats.get("frames_with_face") if algorithm_stats else None,
+                    "face_detection_count": algorithm_stats.get("total_face_detections") if algorithm_stats else None,
+                    "processed_frame_count": algorithm_stats.get("total_frames") if algorithm_stats else None,
                     # Retain the existing field for older Controller databases/API consumers.
                     "elapsed_seconds": elapsed,
                     "output_location": output_location,
@@ -417,6 +501,10 @@ class Worker:
                 failure_progress.update({"processing_seconds": elapsed, "elapsed_seconds": elapsed})
             if processing_started_at is not None:
                 failure_progress["processing_started_at"] = processing_started_at
+            if algorithm_exit_code is not None:
+                failure_progress["algorithm_exit_code"] = algorithm_exit_code
+            if algorithm_stats is not None:
+                failure_progress["algorithm_stats"] = algorithm_stats
             if output is not None and output.exists():
                 failure_progress.update({
                     "output_filename": output.name,

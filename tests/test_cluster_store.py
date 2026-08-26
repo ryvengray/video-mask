@@ -81,14 +81,14 @@ def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypat
     second_payload["source_url"] = "https://storage.example/second.mov"
     second_payload["source_object_key"] = "source/inbox/second.mov"
     second = store.create_task(second_payload)
-    store.conn.execute("UPDATE tasks SET status='completed', finished_at=?", (clock[0],))
-    store.conn.commit()
-
     claimed_first = store.claim_next_face_review("browser-a-unique-id", 300)
     claimed_second = store.claim_next_face_review("browser-b-unique-id", 300)
     assert {claimed_first["task_id"], claimed_second["task_id"]} == {first["task_id"], second["task_id"]}
+    assert {claimed_first["status"], claimed_second["status"]} == {"pending"}
     assert store.claim_next_face_review("browser-c-unique-id", 300) is None
 
+    labelled = store.annotate_content_tags(claimed_first["task_id"], "browser-a-unique-id", ["Laundry"])
+    assert labelled["content_tags"] == ["Laundry"]
     labelled = store.annotate_face(claimed_first["task_id"], "browser-a-unique-id", True)
     assert labelled["face_annotation"] == 1
     status = store.face_review_status((claimed_first["task_id"], claimed_second["task_id"]))["reviews"]
@@ -108,6 +108,75 @@ def test_face_review_claim_lease_annotation_and_expiry(tmp_path: Path, monkeypat
     store.close()
 
 
+def test_content_tags_are_saved_normalised_and_listed_for_reuse(tmp_path: Path):
+    store = new_store(tmp_path)
+    first = store.create_task(task_payload())
+    second_payload = task_payload()
+    second_payload["source_url"] = "https://storage.example/second.mov"
+    second = store.create_task(second_payload)
+    store.conn.execute("UPDATE tasks SET status='completed'")
+    store.conn.commit()
+
+    claimed = store.claim_next_face_review("browser-a-unique-id", 300)
+    assert claimed is not None
+    tagged = store.annotate_content_tags(
+        claimed["task_id"], "browser-a-unique-id", ["  Washing   clothes ", "washing clothes", "Tidy room"]
+    )
+    assert tagged["content_tags"] == ["Washing clothes", "Tidy room"]
+    assert store.content_tags() == ["Washing clothes", "Tidy room"]
+    store.annotate_face(claimed["task_id"], "browser-a-unique-id", True)
+
+    # A completed video whose face state is already known remains eligible
+    # until it receives its content labels.
+    other_id = second["task_id"] if claimed["task_id"] == first["task_id"] else first["task_id"]
+    store.conn.execute("UPDATE tasks SET face_annotation=1 WHERE task_id=?", (other_id,))
+    store.conn.commit()
+    next_claim = store.claim_next_face_review("browser-b-unique-id", 300)
+    assert next_claim is not None
+    assert next_claim["task_id"] == other_id
+    store.close()
+
+
+def test_random_content_label_claim_ignores_face_state(tmp_path: Path):
+    store = new_store(tmp_path)
+    tagged = store.create_task(task_payload())
+    needs_tags_payload = task_payload()
+    needs_tags_payload["source_url"] = "https://storage.example/needs-tags.mov"
+    needs_tags = store.create_task(needs_tags_payload)
+    store.conn.execute("UPDATE tasks SET status='completed', content_tags_json=? WHERE task_id=?", (
+        json.dumps(["Laundry"]), tagged["task_id"],
+    ))
+    # A missing face choice must not make this already content-tagged task
+    # eligible; a known face state must not exclude the task needing tags.
+    store.conn.execute(
+        "UPDATE tasks SET status='completed', face_annotation=1 WHERE task_id=?", (needs_tags["task_id"],)
+    )
+    store.conn.commit()
+
+    claimed = store.claim_next_face_review("browser-a-unique-id", 300)
+    assert claimed and claimed["task_id"] == needs_tags["task_id"]
+    store.close()
+
+
+def test_random_content_label_claim_excludes_test_source_prefix(tmp_path: Path):
+    store = new_store(tmp_path)
+    test_task = store.create_task({
+        **task_payload(),
+        "source_url": "https://storage.example/test.mov",
+        "source_object_key": "test/sample/test.mov",
+    })
+    production_task = store.create_task({
+        **task_payload(),
+        "source_url": "https://storage.example/production.mov",
+        "source_object_key": "cn-shanghai/video-capture/production.mov",
+    })
+
+    claimed = store.claim_next_face_review("browser-a-unique-id", 300)
+    assert claimed and claimed["task_id"] == production_task["task_id"]
+    assert store.task(test_task["task_id"])["face_review_owner"] is None
+    store.close()
+
+
 def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path):
     database = tmp_path / "controller.sqlite3"
     store = ClusterStore(database)
@@ -118,6 +187,160 @@ def test_boolean_controller_setting_persists_across_store_reopens(tmp_path: Path
     reopened = ClusterStore(database)
     assert reopened.boolean_setting("s3_ingest_enabled", True) is False
     reopened.close()
+
+
+def test_paused_task_dispatch_keeps_pending_tasks_unclaimed(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    task = store.create_task(task_payload())
+
+    assert store.set_boolean_setting("task_dispatch_enabled", False) is False
+    assert store.claim("worker-01", TOKEN) is None
+    assert store.task(task["task_id"])["status"] == "pending"
+
+    assert store.set_boolean_setting("task_dispatch_enabled", True) is True
+    claimed = store.claim("worker-01", TOKEN)
+    assert claimed and claimed["task_id"] == task["task_id"]
+    store.close()
+
+
+def test_video_share_is_opaque_expiring_and_can_be_revoked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store = new_store(tmp_path)
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr("cluster.store.now", lambda: clock[0])
+    task = store.create_task(task_payload())
+    store.conn.execute(
+        "UPDATE tasks SET status='completed', output_object_key='output/masked/input.mp4' WHERE task_id=?",
+        (task["task_id"],),
+    )
+    store.conn.commit()
+
+    created = store.create_video_share([task["task_id"]], ["input", "output"], expires_in_days=3)
+    assert "token" in created
+    digest = store.conn.execute("SELECT token_hash FROM video_shares").fetchone()[0]
+    assert digest != created["token"]
+    share = store.video_share(created["token"])
+    assert share is not None
+    assert {item["file"] for item in share["items"]} == {"input", "output"}
+    item = share["items"][0]
+    assert store.video_share_item(created["token"], item["item_id"]) == item
+
+    assert store.revoke_video_share(created["share_id"]) is True
+    assert store.video_share(created["token"]) is None
+
+    another = store.create_video_share([task["task_id"]], ["input"], expires_in_days=1)
+    clock[0] += 86_401
+    assert store.video_share(another["token"]) is None
+    store.close()
+
+
+def test_content_categories_assign_one_per_task_and_build_public_catalog(tmp_path: Path):
+    store = new_store(tmp_path)
+    task = store.create_task(task_payload())
+    store.conn.execute(
+        "UPDATE tasks SET status='completed', output_object_key='output/masked/input.mp4' WHERE task_id=?",
+        (task["task_id"],),
+    )
+    store.conn.commit()
+    laundry = store.create_content_category("  Laundry ")
+    rooms = store.create_content_category("Tidy room")
+    updated = store.set_task_content_category(task["task_id"], laundry["category_id"])
+    assert updated["content_category_id"] == laundry["category_id"]
+    assert store.task_content_categories((task["task_id"],))[task["task_id"]] == laundry["category_id"]
+    assert [(item["name"], item["task_count"]) for item in store.content_categories()] == [
+        ("Laundry", 1), ("Tidy room", 0),
+    ]
+    with pytest.raises(ValueError, match="remove this category"):
+        store.delete_content_category(laundry["category_id"])
+
+    share_id = "customer_video_library_2026"
+    assert store.set_category_share_id(share_id) == share_id
+    catalog = store.public_category_catalog(share_id)
+    assert catalog is not None
+    assert catalog[0]["name"] == "Laundry"
+    assert catalog[0]["videos"][0]["file"] == "input"
+    assert store.public_category_catalog("wrong_share_id") is None
+    item = store.public_category_catalog_item(share_id, task["task_id"])
+    assert item and item["file"] == "input" and item["filename"] == "input.mov"
+    assert store.category_share_file() == "input"
+    assert store.set_category_share_file("output") == "output"
+    output_catalog = store.public_category_catalog(share_id)
+    assert output_catalog and output_catalog[0]["videos"][0]["file"] == "output"
+    output_item = store.public_category_catalog_item(share_id, task["task_id"])
+    assert output_item and output_item["file"] == "output"
+    with pytest.raises(ValueError, match="shared category video"):
+        store.set_category_share_file("original")
+    store.close()
+
+
+def test_public_category_catalog_defaults_to_ten_and_hides_over_limit_items(tmp_path: Path):
+    store = new_store(tmp_path)
+    category = store.create_content_category("Library")
+    task_ids = []
+    for index in range(11):
+        payload = task_payload()
+        payload["source_url"] = f"https://storage.example/{index}.mov"
+        payload["source_object_key"] = f"source/inbox/{index}.mov"
+        task = store.create_task(payload)
+        task_ids.append(task["task_id"])
+        store.conn.execute(
+            "UPDATE tasks SET status='completed', content_category_id=? WHERE task_id=?",
+            (category["category_id"], task["task_id"]),
+        )
+    store.conn.commit()
+    share_id = "public_category_limit_test"
+    store.set_category_share_id(share_id)
+
+    assert store.category_share_limit() == 10
+    catalog = store.public_category_catalog(share_id)
+    assert catalog and len(catalog[0]["videos"]) == 10
+    visible_ids = {item["task_id"] for item in catalog[0]["videos"]}
+    hidden_id = next(task_id for task_id in task_ids if task_id not in visible_ids)
+    assert store.public_category_catalog_item(share_id, hidden_id) is None
+
+    assert store.set_category_share_limit(2) == 2
+    limited = store.public_category_catalog(share_id)
+    assert limited and len(limited[0]["videos"]) == 2
+    store.close()
+
+
+def test_public_category_catalog_orders_categories_by_total_video_count(tmp_path: Path):
+    store = new_store(tmp_path)
+    fewer = store.create_content_category("Fewer videos")
+    more = store.create_content_category("More videos")
+    for index in range(3):
+        payload = task_payload()
+        payload["source_object_key"] = f"source/inbox/more-{index}.mov"
+        task = store.create_task(payload)
+        store.set_task_content_category(task["task_id"], more["category_id"])
+    task = store.create_task(task_payload())
+    store.set_task_content_category(task["task_id"], fewer["category_id"])
+    share_id = "public_category_order_test"
+    store.set_category_share_id(share_id)
+
+    catalog = store.public_category_catalog(share_id)
+
+    assert catalog is not None
+    assert [category["name"] for category in catalog] == ["More videos", "Fewer videos"]
+    store.close()
+
+
+def test_task_list_can_filter_by_content_category(tmp_path: Path):
+    store = new_store(tmp_path)
+    laundry_task = store.create_task(task_payload())
+    room_payload = task_payload()
+    room_payload["source_url"] = "https://storage.example/room.mov"
+    room_task = store.create_task(room_payload)
+    laundry = store.create_content_category("Laundry")
+    room = store.create_content_category("Tidy room")
+    store.set_task_content_category(laundry_task["task_id"], laundry["category_id"])
+    store.set_task_content_category(room_task["task_id"], room["category_id"])
+
+    selected = store.list_tasks(content_category_ids=(laundry["category_id"],))
+    assert [task["task_id"] for task in selected] == [laundry_task["task_id"]]
+    assert store.count_tasks(content_category_ids=(room["category_id"],)) == 1
+    store.close()
 
 
 def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tmp_path: Path):
@@ -134,7 +357,10 @@ def test_opening_pre_annotation_database_runs_columns_before_annotation_index(tm
     store = ClusterStore(database)
     columns = {row[1] for row in store.conn.execute("PRAGMA table_info(tasks)")}
     indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(tasks)")}
-    assert {"face_annotation", "face_annotated_at", "face_review_owner", "face_review_lease_until"} <= columns
+    assert {
+        "face_annotation", "face_annotated_at", "content_tags_json", "content_tagged_at",
+        "face_review_owner", "face_review_lease_until",
+    } <= columns
     assert "idx_tasks_face_review" in indexes
     store.close()
 
@@ -192,6 +418,45 @@ def test_task_list_can_filter_by_multiple_face_annotations(tmp_path: Path):
     selected = store.list_tasks(face_annotations=("has_face", "unlabelled"))
     assert {task["task_id"] for task in selected} == {has_face["task_id"], unlabelled["task_id"]}
     assert store.count_tasks(face_annotations=("no_face",)) == 1
+    store.close()
+
+
+def test_task_list_can_filter_by_any_selected_content_tag(tmp_path: Path):
+    store = new_store(tmp_path)
+    laundry = store.create_task(task_payload())
+    room_payload = task_payload()
+    room_payload["source_url"] = "https://storage.example/room.mov"
+    room = store.create_task(room_payload)
+    unlabelled_payload = task_payload()
+    unlabelled_payload["source_url"] = "https://storage.example/unlabelled.mov"
+    unlabelled = store.create_task(unlabelled_payload)
+    store.conn.execute("UPDATE tasks SET content_tags_json=? WHERE task_id=?", (json.dumps(["Laundry", "Home"]), laundry["task_id"]))
+    store.conn.execute("UPDATE tasks SET content_tags_json=? WHERE task_id=?", (json.dumps(["Tidy room"]), room["task_id"]))
+    store.conn.commit()
+
+    selected = store.list_tasks(content_tags=("Laundry", "Tidy room"))
+    assert {task["task_id"] for task in selected} == {laundry["task_id"], room["task_id"]}
+    assert store.count_tasks(content_tags=("Laundry",)) == 1
+    assert unlabelled["task_id"] not in {task["task_id"] for task in selected}
+    store.close()
+
+
+def test_content_tag_statistics_counts_each_video_once_per_tag(tmp_path: Path):
+    store = new_store(tmp_path)
+    first = store.create_task(task_payload())
+    second_payload = task_payload()
+    second_payload["source_url"] = "https://storage.example/second.mov"
+    second = store.create_task(second_payload)
+    store.conn.execute("UPDATE tasks SET status='completed', content_tags_json=? WHERE task_id=?", (json.dumps(["Laundry", "Home", "Laundry"]), first["task_id"]))
+    store.conn.execute("UPDATE tasks SET status='failed', content_tags_json=? WHERE task_id=?", (json.dumps(["Laundry"]), second["task_id"]))
+    store.conn.commit()
+
+    assert store.content_tag_statistics() == [
+        {"tag": "Laundry", "video_count": 2}, {"tag": "Home", "video_count": 1},
+    ]
+    assert store.content_tag_statistics(("completed",)) == [
+        {"tag": "Home", "video_count": 1}, {"tag": "Laundry", "video_count": 1},
+    ]
     store.close()
 
 
@@ -364,6 +629,22 @@ def test_failed_task_can_also_be_restarted(tmp_path: Path):
     assert restarted["status"] == "pending"
     assert restarted["attempt_count"] == 0
     assert restarted["restarted_at"] is not None
+    store.close()
+
+
+def test_restart_task_can_update_algorithm_and_arguments(tmp_path: Path):
+    store = new_store(tmp_path)
+    created = store.create_task(task_payload())
+    store.cancel_task(created["task_id"])
+
+    restarted = store.restart_task(
+        created["task_id"], algorithm="video_mask_batch_experiment.py",
+        arguments=["--face-model", "yolo11", "--frame-skip", "2"],
+    )
+
+    assert restarted["status"] == "pending"
+    assert restarted["algorithm"] == "video_mask_batch_experiment.py"
+    assert restarted["arguments"] == ["--face-model", "yolo11", "--frame-skip", "2"]
     store.close()
 
 

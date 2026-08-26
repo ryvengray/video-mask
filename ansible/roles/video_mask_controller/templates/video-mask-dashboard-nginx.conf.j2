@@ -31,6 +31,42 @@ server {
         proxy_set_header X-Forwarded-Prefix /transfer;
     }
 
+    location /cost/ {
+        auth_basic "AWS Cost Monitor";
+
+        proxy_pass http://127.0.0.1:18080/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Prefix /cost;
+    }
+
+    # Customer links are deliberately the only unauthenticated Controller
+    # surface.  They carry an unguessable, expiring token and the Controller
+    # permits only the task files explicitly selected for that token.
+    location = /share {
+        auth_basic off;
+        return 308 /share/;
+    }
+
+    location ^~ /share/ {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 30s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        tcp_nodelay on;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location = /api/dashboard/manual-tasks {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
@@ -41,9 +77,36 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
+    # HTML5 video uses short Range requests while loading and seeking.  Keep
+    # the byte range intact and stream it to the browser immediately instead
+    # of filling Nginx proxy buffers (or proxy-temp files) first.
+    location ~ ^/api/tasks/[^/]+/play$ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 30s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        tcp_nodelay on;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
+        # auth_basic consumes the client Authorization header for Basic
+        # credentials.  A trusted automation client can carry the Controller
+        # Bearer token in this dedicated header; promote it only upstream.
+        set $controller_authorization $http_authorization;
+        if ($http_x_video_mask_authorization != "") {
+            set $controller_authorization $http_x_video_mask_authorization;
+        }
+        proxy_set_header Authorization $controller_authorization;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

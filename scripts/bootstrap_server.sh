@@ -139,6 +139,26 @@ if [[ "$MODE" == "cuda" ]]; then
   }
 fi
 
+if [[ "$MODE" == "cuda" ]]; then
+  CUDA_LIBRARY_PATH="$("$PYTHON" - <<'PY'
+import site
+from pathlib import Path
+
+paths = []
+for site_packages in site.getsitepackages():
+    root = Path(site_packages)
+    for candidate in [root / "torch" / "lib", *sorted(root.glob("nvidia/*/lib"))]:
+        if candidate.is_dir() and str(candidate) not in paths:
+            paths.append(str(candidate))
+print(":".join(paths))
+PY
+)"
+  if [[ -n "$CUDA_LIBRARY_PATH" ]]; then
+    export LD_LIBRARY_PATH="$CUDA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "==> 已配置 pip CUDA 动态库路径"
+  fi
+fi
+
 echo "==> 创建默认任务目录"
 mkdir -p /home/ubuntu/sources /home/ubuntu/outputs
 
