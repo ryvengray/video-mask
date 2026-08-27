@@ -671,8 +671,13 @@ def test_pending_task_can_be_cancelled_and_restarted(tmp_path: Path):
 
 def test_all_completed_tasks_can_be_restarted_with_a_shared_timestamp(tmp_path: Path, monkeypatch):
     store = new_store(tmp_path)
-    completed = store.create_task(task_payload())
-    second_completed = store.create_task({**task_payload(), "source_url": "https://storage.example/second.mov"})
+    completed = store.create_task({
+        **task_payload(), "algorithm": "legacy_algorithm.py", "arguments": ["--legacy-option"],
+    })
+    second_completed = store.create_task({
+        **task_payload(), "source_url": "https://storage.example/second.mov",
+        "algorithm": "another_legacy_algorithm.py", "arguments": ["--old-frame-skip", "4"],
+    })
     failed = store.create_task({**task_payload(), "source_url": "https://storage.example/failed.mov"})
     store.conn.execute("""
         UPDATE tasks SET status='completed', attempt_count=2, started_at=10, finished_at=20,
@@ -682,6 +687,7 @@ def test_all_completed_tasks_can_be_restarted_with_a_shared_timestamp(tmp_path: 
     """, (completed["task_id"], completed["task_id"], second_completed["task_id"]))
     store.conn.execute("UPDATE tasks SET status='failed', finished_at=20 WHERE task_id=?", (failed["task_id"],))
     store.conn.commit()
+    store.set_algorithm_defaults("video_mask_batch_fish_v1_plus.py", ["--face-model", "yolo11"])
     monkeypatch.setattr("cluster.store.now", lambda: 1234.5)
 
     result = store.restart_completed_tasks()
@@ -695,6 +701,8 @@ def test_all_completed_tasks_can_be_restarted_with_a_shared_timestamp(tmp_path: 
         assert restarted["restarted_at"] == 1234.5
         assert restarted["finished_at"] is None
         assert restarted["output_sha256"] is None
+        assert restarted["algorithm"] == "video_mask_batch_fish_v1_plus.py"
+        assert restarted["arguments"] == ["--face-model", "yolo11"]
         assert restarted["face_annotation"] == (1 if task_id == completed["task_id"] else 0)
         assert restarted["face_annotated_at"] == 18
     assert store.task(failed["task_id"])["status"] == "failed"

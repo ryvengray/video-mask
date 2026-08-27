@@ -426,16 +426,18 @@ class ClusterStore:
 
     @synchronized
     def restart_completed_tasks(self) -> dict[str, Any]:
-        """Queue every completed task again and retain the bulk restart time."""
+        """Queue completed tasks again using the current global algorithm defaults."""
         stamp = now()
+        defaults = self.get_algorithm_defaults()
         self.conn.execute("DELETE FROM task_logs WHERE task_id IN (SELECT task_id FROM tasks WHERE status='completed')")
         cursor = self.conn.execute("""
             UPDATE tasks SET status='pending', attempt_count=0, assigned_worker_id=NULL,
               progress_json='{}', output_sha256=NULL, output_duration_seconds=NULL,
               error_message=NULL, started_at=NULL, restarted_at=?, finished_at=NULL,
-              face_review_owner=NULL, face_review_lease_until=NULL, updated_at=?
+              face_review_owner=NULL, face_review_lease_until=NULL,
+              algorithm=?, arguments_json=?, updated_at=?
             WHERE status='completed'
-        """, (stamp, stamp))
+        """, (stamp, defaults["algorithm"], json.dumps(defaults["arguments"]), stamp))
         self.conn.commit()
         return {"restarted_tasks": cursor.rowcount, "restarted_at": stamp}
 
