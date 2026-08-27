@@ -1667,8 +1667,8 @@ function ensureTaskActionsColumn() {
     const status = row.querySelector('.badge')?.textContent?.trim();
     const cell = document.createElement('td');
     cell.className = 'task-actions-cell';
-    if (['completed', 'failed'].includes(status) || ['assigned', 'downloading', 'processing', 'uploading'].includes(status)) {
-      const action = ['completed', 'failed'].includes(status) ? 'restart' : 'cancel';
+    if (['completed', 'failed', 'cancelled'].includes(status) || ['assigned', 'downloading', 'processing', 'uploading'].includes(status)) {
+      const action = ['completed', 'failed', 'cancelled'].includes(status) ? 'restart' : 'cancel';
       const button = document.createElement('button');
       button.type = 'button';
       button.className = `task-action-button task-action-${action}`;

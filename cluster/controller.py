@@ -1011,12 +1011,12 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
 
     @app.post("/api/dashboard/tasks/{task_id}/restart")
     def dashboard_restart_task(task_id: str, request: TaskRestartRequest) -> dict[str, Any]:
-        """Restart one completed or failed task from the Nginx-protected dashboard."""
+        """Restart one terminal task from the Nginx-protected dashboard."""
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
-        if task.get("status") not in {"completed", "failed"}:
-            raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
+        if task.get("status") not in {"completed", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="only completed, failed, or cancelled tasks can be restarted here")
         algorithm = request.algorithm.strip()
         if not algorithm or Path(algorithm).name != algorithm:
             raise HTTPException(status_code=400, detail="algorithm must be a filename in the Worker source directory")
@@ -1032,8 +1032,8 @@ def create_app(database: Path, admin_token: str, stale_after_seconds: int = 90,
         task = store.task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task does not exist")
-        if task.get("status") not in {"completed", "failed"}:
-            raise HTTPException(status_code=409, detail="only completed or failed tasks can be restarted here")
+        if task.get("status") not in {"completed", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="only completed, failed, or cancelled tasks can be restarted here")
         return store.get_algorithm_defaults()
 
     @app.post("/api/dashboard/tasks/{task_id}/cancel")
