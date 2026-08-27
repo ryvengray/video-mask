@@ -20,6 +20,7 @@ from typing import Any
 UNFINISHED = ("pending", "assigned", "downloading", "processing", "uploading", "cancelling")
 RESTARTABLE = ("completed", "failed", "cancelled")
 RESTART_ALL_COMPLETED_PHRASE = "RESTART ALL COMPLETED TASKS"
+RESTART_ALL_FAILED_PHRASE = "RESTART ALL FAILED TASKS"
 
 
 class ControllerClient:
@@ -66,6 +67,18 @@ class ControllerClient:
 
     def restart_all_completed(self) -> dict[str, Any]:
         return self.request("POST", "/api/tasks/restart-completed")
+
+    def failed_task_ids(self) -> list[str]:
+        """Fetch a stable list before changing any failed task's status."""
+        task_ids: list[str] = []
+        offset = 0
+        while True:
+            page = self.task_page(("failed",), offset, limit=1000)
+            tasks = page["tasks"]
+            task_ids.extend(str(task["task_id"]) for task in tasks)
+            offset += len(tasks)
+            if not tasks or offset >= int(page["total"]):
+                return task_ids
 
     def purge_tasks(self) -> dict[str, Any]:
         return self.request("DELETE", "/api/tasks?confirm=DELETE_ALL_TASKS")
@@ -176,6 +189,35 @@ def restart_all_completed_tasks(client: ControllerClient) -> None:
     print(f"Queued {result['restarted_tasks']} completed task(s) at {stamp(result['restarted_at'])}.")
 
 
+def restart_all_failed_tasks(client: ControllerClient) -> None:
+    failed_task_ids = client.failed_task_ids()
+    failed = len(failed_task_ids)
+    if not failed:
+        print("There are no failed tasks to restart.")
+        return
+    print(f"This will queue all {failed} failed task(s) to run again from the beginning.")
+    if not confirm("Restart every failed task?"):
+        return
+    phrase = input(f"Type {RESTART_ALL_FAILED_PHRASE} to continue: ").strip()
+    if phrase != RESTART_ALL_FAILED_PHRASE:
+        print("Confirmation phrase did not match; no tasks were restarted.")
+        return
+    if not confirm(f"Final confirmation: queue all {failed} failed task(s) now?"):
+        return
+
+    restarted = 0
+    errors: list[tuple[str, str]] = []
+    for task_id in failed_task_ids:
+        try:
+            client.restart(task_id)
+            restarted += 1
+        except RuntimeError as exc:
+            errors.append((task_id, str(exc)))
+    print(f"Queued {restarted}/{failed} failed task(s).")
+    for task_id, error in errors:
+        print(f"  {task_id}: {error}", file=sys.stderr)
+
+
 def parse_slots(specification: str) -> tuple[int, ...]:
     slots: set[int] = set()
     for part in specification.split(","):
@@ -233,8 +275,9 @@ Video Mask Cluster Manager
   6) Restart a Worker slot through Ansible
   7) Enable, disable, or check S3 task ingestion
   8) Restart all completed tasks (three confirmations)
-  9) Permanently delete all task records
-  10) Exit""")
+  9) Restart all failed tasks (three confirmations)
+  10) Permanently delete all task records
+  11) Exit""")
         choice = input("Choose: ").strip()
         try:
             if choice == "1":
@@ -281,14 +324,16 @@ Video Mask Cluster Manager
             elif choice == "8":
                 restart_all_completed_tasks(client)
             elif choice == "9":
+                restart_all_failed_tasks(client)
+            elif choice == "10":
                 page = client.task_page(None, 0, limit=1)
                 print(f"This will permanently delete {page['total']} task record(s).")
                 if confirm_delete_all_tasks():
                     print("Deleted:", client.purge_tasks()["deleted_tasks"], "task record(s)")
-            elif choice == "10":
+            elif choice == "11":
                 return
             else:
-                print("Choose 1-10.")
+                print("Choose 1-11.")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
 
@@ -297,6 +342,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Manage Video Mask Controller tasks")
     parser.add_argument("action", nargs="?", default="menu",
                         choices=("menu", "list", "all", "detail", "cancel", "restart", "restart-all-completed",
+                                 "restart-all-failed",
                                  "restart-slot", "s3-ingest", "purge"))
     parser.add_argument("task_id", nargs="?")
     parser.add_argument("--controller", default="http://127.0.0.1:8080")
@@ -324,6 +370,10 @@ def main() -> None:
             if args.task_id:
                 raise SystemExit("restart-all-completed does not accept a task ID")
             restart_all_completed_tasks(client)
+        elif args.action == "restart-all-failed":
+            if args.task_id:
+                raise SystemExit("restart-all-failed does not accept a task ID")
+            restart_all_failed_tasks(client)
         elif args.action == "s3-ingest":
             operation = (args.task_id or "status").lower()
             if operation == "status":
