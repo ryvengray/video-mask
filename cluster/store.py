@@ -19,8 +19,14 @@ from pathlib import Path
 from typing import Any
 
 
-TERMINAL = {"completed", "failed", "cancelled"}
+TERMINAL = {"completed", "failed", "cancelled", "ignored"}
 ACTIVE = {"assigned", "downloading", "processing", "uploading", "cancelling"}
+
+# Objects below this size are upload artefacts rather than processable videos in
+# production.  Do the check while claiming, so they never consume a Worker or
+# GPU slot.  A known size is required: legacy tasks with a NULL size remain
+# claimable.
+MIN_CLAIMABLE_SOURCE_BYTES = 4 * 1024
 
 
 def now() -> float:
@@ -1368,6 +1374,21 @@ class ClusterStore:
                 if current and current["status"] in ACTIVE:
                     self.conn.execute("COMMIT")
                     return current
+            # Classify tiny upload artefacts before selecting a task.  Include
+            # already failed tasks so historical cases are corrected as soon
+            # as a Worker polls, without consuming another retry or GPU slot.
+            self.conn.execute("""
+                UPDATE tasks
+                SET status='ignored',
+                    error_message='ignored: source file is only ' || source_size_bytes
+                      || ' bytes (minimum claimable size is ' || ? || ' bytes)',
+                    finished_at=COALESCE(finished_at, ?),
+                    updated_at=?
+                WHERE status IN ('pending', 'failed')
+                  AND source_size_bytes IS NOT NULL
+                  AND source_size_bytes < ?
+            """, (MIN_CLAIMABLE_SOURCE_BYTES, stamp, stamp,
+                   MIN_CLAIMABLE_SOURCE_BYTES))
             row = self.conn.execute("""
                 SELECT task_id FROM tasks WHERE status='pending' AND attempt_count < max_attempts
                 ORDER BY created_at LIMIT 1

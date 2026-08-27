@@ -48,12 +48,12 @@ STATUS_TONES = {
     "ready": "success", "completed": "success",
     "busy": "active", "assigned": "active", "downloading": "active",
     "processing": "active", "uploading": "active",
-    "pending": "pending", "cancelling": "warning", "cancelled": "warning",
+    "pending": "pending", "cancelling": "warning", "cancelled": "warning", "ignored": "muted",
     "offline": "muted", "failed": "danger",
 }
 TASK_FILTER_STATUSES = (
     "pending", "assigned", "downloading", "processing", "uploading",
-    "cancelling", "completed", "failed", "cancelled",
+    "cancelling", "completed", "failed", "cancelled", "ignored",
 )
 FACE_REVIEW_LEASE_SECONDS = 300
 FACE_ANNOTATION_FILTERS = ("has_face", "no_face", "unlabelled")

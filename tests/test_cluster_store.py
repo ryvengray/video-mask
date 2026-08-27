@@ -45,6 +45,50 @@ def test_worker_claims_task_once_and_finishes(tmp_path: Path):
     store.close()
 
 
+def test_claim_ignores_known_tiny_source_and_continues_to_next_task(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {"gpu": "Tesla T4"})
+    tiny_payload = task_payload()
+    tiny_payload["source_url"] = "https://storage.example/input-too-small.mp4"
+    tiny_payload["source_object_key"] = "source/inbox/input-too-small.mp4"
+    tiny_payload["source_size_bytes"] = 3_300
+    tiny = store.create_task(tiny_payload)
+    valid = store.create_task(task_payload())
+
+    claimed = store.claim("worker-01", TOKEN)
+
+    assert claimed is not None
+    assert claimed["task_id"] == valid["task_id"]
+    ignored = store.task(tiny["task_id"])
+    assert ignored is not None
+    assert ignored["status"] == "ignored"
+    assert ignored["attempt_count"] == 0
+    assert "3300 bytes" in ignored["error_message"]
+    store.close()
+
+
+def test_claim_reclassifies_previously_failed_tiny_source_as_ignored(tmp_path: Path):
+    store = new_store(tmp_path)
+    store.provision_worker("worker-01", TOKEN)
+    store.register_worker("worker-01", TOKEN, {})
+    tiny_payload = task_payload()
+    tiny_payload["source_size_bytes"] = 3_348
+    tiny = store.create_task(tiny_payload)
+    store.conn.execute("UPDATE tasks SET status='failed', attempt_count=max_attempts WHERE task_id=?",
+                       (tiny["task_id"],))
+    store.conn.commit()
+
+    assert store.claim("worker-01", TOKEN) is None
+
+    ignored = store.task(tiny["task_id"])
+    assert ignored is not None
+    assert ignored["status"] == "ignored"
+    assert ignored["attempt_count"] == ignored["max_attempts"] == 3
+    assert "3348 bytes" in ignored["error_message"]
+    store.close()
+
+
 def test_worker_task_logs_are_persisted_and_cleared_on_restart(tmp_path: Path):
     store = new_store(tmp_path)
     store.provision_worker("worker-01", TOKEN)
@@ -862,7 +906,7 @@ def test_duplicate_local_scan_does_not_block_worker_claim(tmp_path: Path):
     store.register_worker("worker-01", TOKEN, {})
     source_dir = tmp_path / "sources"
     source_dir.mkdir()
-    (source_dir / "clip.mp4").write_bytes(b"test video")
+    (source_dir / "clip.mp4").write_bytes(b"test video" * 500)
     ingestor = LocalIngestor(store, source_dir, tmp_path / "outputs")
 
     assert ingestor.scan() == 1
