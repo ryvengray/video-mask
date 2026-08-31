@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-video_mask_batch_fish_v1_plus.py — 视频批量打码（仅人脸），SCRFD 增强版
+video_mask_batch_fish_v2_plus.py — 视频批量打码（仅人脸），SCRFD 增强版
+                                  + v2: Evidence 驱动打码决策架构
+
+v2 相对 v1_plus 的改造边界(最小改造):
+  只把轨迹 confirmed 的"写入路径"替换为 Evidence→Decision(FaceEvidence
+  证据累积 + FaceDecisionEngine 四态滞回决策 REJECT/PENDING/CONFIRMED/GRACE),
+  其余全部保留(双模型检测、SCRFD-10g复核、Hard ROI困难召回、LK/模板跟踪、
+  pending轨迹状态机、回补backfill、burst/加餐检测调度、打码渲染)。
+  关键校准不变量: D/V建轨立即CONFIRMED; X第2次共识命中score>=confirm;
+  R/S来源封顶永不单独确认; 确认后无证据~5轮EWMA衰减到release(≈grace)。
 
 人脸:
   YuNet(默认, 仅 OpenCV 依赖) / YOLOv8-nano(极速, 需 ultralytics)
@@ -15,19 +24,21 @@ video_mask_batch_fish_v1_plus.py — 视频批量打码（仅人脸），SCRFD �
   抽帧跳帧(--frame-skip, 提速2-3倍)
 
 用法:
-  python video_mask_batch_fish_v1_plus.py video.mp4
-  python video_mask_batch_fish_v1_plus.py ./videos/              # 整个目录
-  python video_mask_batch_fish_v1_plus.py a.mp4 b.mov            # 多文件
-  python video_mask_batch_fish_v1_plus.py video.mp4 --face-model yolov8
-  python video_mask_batch_fish_v1_plus.py video.mp4 --face-model yolo11
-  python video_mask_batch_fish_v1_plus.py video.mp4 --face-model scrfd --scrfd-model 10g
-  python video_mask_batch_fish_v1_plus.py video.mp4 --face-model yolov8+scrfd
-  python video_mask_batch_fish_v1_plus.py video.mp4 --out-dir ./out
-  python video_mask_batch_fish_v1_plus.py video.mp4 --no-face            # 关闭人脸打码
-  python video_mask_batch_fish_v1_plus.py video.mp4 --face-conf 0.25
-  python video_mask_batch_fish_v1_plus.py video.mp4 --fisheye
-  python video_mask_batch_fish_v1_plus.py video.mp4 --fisheye --fisheye-device pico4
-  python video_mask_batch_fish_v1_plus.py video.mp4 --frame-skip 2
+  python video_mask_batch_fish_v2_plus.py video.mp4
+  python video_mask_batch_fish_v2_plus.py ./videos/              # 整个目录
+  python video_mask_batch_fish_v2_plus.py a.mp4 b.mov            # 多文件
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-model yolov8
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-model yolo11
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-model scrfd --scrfd-model 10g
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-model yolov8+scrfd
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-model mogface
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-model yolov8+mogface
+  python video_mask_batch_fish_v2_plus.py video.mp4 --out-dir ./out
+  python video_mask_batch_fish_v2_plus.py video.mp4 --no-face            # 关闭人脸打码
+  python video_mask_batch_fish_v2_plus.py video.mp4 --face-conf 0.25
+  python video_mask_batch_fish_v2_plus.py video.mp4 --fisheye
+  python video_mask_batch_fish_v2_plus.py video.mp4 --fisheye --fisheye-device pico4
+  python video_mask_batch_fish_v2_plus.py video.mp4 --frame-skip 2
 
 依赖:
   pip install opencv-python numpy
@@ -36,7 +47,7 @@ video_mask_batch_fish_v1_plus.py — 视频批量打码（仅人脸），SCRFD �
   # 系统需 ffmpeg(保留音轨)
 
 代码调用:
-  from video_mask_batch_fish_v1_plus import process_video
+  from video_mask_batch_fish_v2_plus import process_video
   process_video("in.mp4", "out.mp4", face_model="yunet")
 """
 import argparse
@@ -54,6 +65,9 @@ import time
 
 import cv2
 import numpy as np
+
+# 手部保护: 排斥遮罩 + 误检拒绝(保证人手不被马赛克)
+from hand_protect import hand_exclude_mask, max_hand_iou, HandDetector, filter_center_boxes  # noqa: E402
 
 # ================= 打码/检测参数 =================
 FACE_CELLS, FACE_SIGMA = 4, 45.0
@@ -73,7 +87,6 @@ HARD_FACE_EDGE_RATIO = 0.16
 HARD_FACE_ROI_SCALE = 3.0
 HARD_FACE_MAX_ROIS = 3             # 每帧最多二检的困难框数量(防止推理爆炸)
 HARD_FACE_ROI_SIZE = 320           # ROI 二检推理尺寸(比主检测 640 小一倍, 提速~75%)
-HARD_FACE_FULL_SCAN_CONF = 0.15    # 全帧低阈值扫描置信度(低于主检测, 独立捕获遗漏人脸)
 SCRFD_ADAPTIVE_VERIFY_MARGIN = 0.15  # 新候选进入10g复核区间的分数增量
 SCRFD_ADAPTIVE_VERIFY_IOU = 0.25     # 10g复核框与候选框的最低IoU
 SCRFD_VERIFIER_MAX_SCORE_DROP = 0.02  # 复核时10g相对候选模型允许的最大分差
@@ -92,6 +105,10 @@ FACE_MIN_SIZE = 15           # 人脸框最小边长(像素), 低于视为噪点
 FACE_MAX_AREA_RATIO = 0.12   # 单脸最大面积占比(超过画面12%视为大物体误检, 如玩具堆)
 FACE_ASPECT_MIN = 0.5        # 人脸长宽比(宽/高)下限, 低于视为细长物(手/手臂)误检
 FACE_ASPECT_MAX = 2.0        # 人脸长宽比上限, 超过视为细长物误检
+S_AUTO_CONFIRM_MAX = 80       # S(单模型)直接确认的最大边长(像素)。
+                               # 超过此值的 S 候选走 PENDING 等二次确认,
+                               # 防止衣物/手部等大物体被 YOLO 误检后立即打码。
+                               # 边缘小脸通常 <=20px, 不受影响。
 
 VIDEO_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v",
                  ".mpg", ".mpeg", ".ts", ".m2ts", ".wmv", ".3gp", ".rmvb",
@@ -100,8 +117,12 @@ VIDEO_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v",
 
 # ================= 打码 =================
 
-def heavy_mosaic(img, x1, y1, x2, y2, cells=6, sigma=35.0):
-    """高斯模糊 + 像素化马赛克"""
+def heavy_mosaic(img, x1, y1, x2, y2, cells=6, sigma=35.0, exclude=None):
+    """高斯模糊 + 像素化马赛克。
+
+    exclude: (bh,bw) 布尔遮罩, True 表示"该像素属于手部, 必须保留原图"。
+    传入时只把马赛克写回非手部像素, 保证人手绝对不被打码。
+    """
     h, w = img.shape[:2]
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(w, int(x2)), min(h, int(y2))
@@ -118,7 +139,11 @@ def heavy_mosaic(img, x1, y1, x2, y2, cells=6, sigma=35.0):
     ch = max(1, bh // cells)
     small = cv2.resize(roi, (cw, ch), interpolation=cv2.INTER_LINEAR)
     big = cv2.resize(small, (bw, bh), interpolation=cv2.INTER_NEAREST)
-    img[y1:y2, x1:x2] = big
+    if exclude is not None:
+        # exclude 已在调用方按 (bh,bw) 对齐ROI局部坐标构建; 手部像素保留原图
+        img[y1:y2, x1:x2][~exclude] = big[~exclude]
+    else:
+        img[y1:y2, x1:x2] = big
 
 
 def _ensure_writable_frame(img):
@@ -344,6 +369,12 @@ YOLO_FACE_M_FILE = "yolov8m-face.pt"  # YOLOv8 medium 人脸检测模型(精度�
 YOLO11_FACE_FILE = "yolo11n-face.pt"  # YOLOv11 nano 人脸检测模型(ultralytics 最新一代, 6MB)
 YOLO11_FACE_FILE_ALT = "yolov11n-face.pt"  # 社区常见命名变体(同一模型, 文件名带v)
 YOLO_INPUT_SIZE = 640          # YOLOv8 检测输入尺寸(32的倍数; 降低可提速)
+# MogFace-large 人脸检测模型 (WiderFace SOTA, ResNet101骨干, ~300MB)
+# ONNX 导出来源: ModelScope 'damo/cv_resnet101_face-detection_cvpr22papermogface'
+MOGFACE_FILE = "mogface_large.onnx"
+# MogFace 预处理常量 (RGB 顺序, 与 ModelScope 官方 pipeline 一致)
+MOGFACE_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+MOGFACE_STD = np.array([58.395, 57.120003, 57.375], dtype=np.float32)
 
 
 class YuNetFaceDetector:
@@ -800,6 +831,8 @@ class DualFaceDetector:
         self.last_raw_candidates = []
         self.last_verified_count = 0
         self.last_score_rejected_count = 0
+        # v2 统计: 10g 复核器实际推理调用次数
+        self.verify_calls = 0
         self._stereo_split_enabled = False
         self._stereo_low_conf = STEREO_LOW_CONF
         self._stereo_batch = False
@@ -1225,11 +1258,11 @@ class DualFaceDetector:
         singles = ([{
             "box": item["box"],
             "scores": ((self._name_a, item["score"]), (self._name_b, None)),
-            "landmark_risk": item["landmark_risk"], "source": "C",
+            "landmark_risk": item["landmark_risk"], "source": "S",
         } for ai, item in enumerate(dets_a) if ai not in used_a] + [{
             "box": item["box"],
             "scores": ((self._name_a, None), (self._name_b, item["score"])),
-            "landmark_risk": item["landmark_risk"], "source": "C",
+            "landmark_risk": item["landmark_risk"], "source": "S",
         } for bi, item in enumerate(dets_b) if bi not in used_b])
         self.last_candidates = list(singles) if include_single else []
 
@@ -1265,11 +1298,12 @@ class DualFaceDetector:
             # 2.5g模式下，新人脸必须先由YOLOv8+2.5g共同检出；10g
             # 只能复核双模型候选，不能替代其中任意一个创建新轨迹。
             # 已有轨迹的单模型框仍由上层续轨，避免正常人脸闪动。
+            # 激进召回改法: 不再因缺少第二主模型分而硬拒单模型脸——
+            # 全部送 10g 复核: 10g 通过→V 确认(对齐 v1 单模型召回),
+            # 10g 拒绝/低重叠→降级为 S 软保留(带 10g 分供证据加权),
+            # 不再直接丢弃, 由 FaceProcessor 续帧确认或回退清理。
             for item in singles:
                 if self._is_tracked(item["box"], existing_boxes, iou_thresh):
-                    continue
-                if not self._has_required_primary_scores(item):
-                    self.last_score_rejected_count += 1
                     continue
                 verify_candidates.append(item)
         if not verify_candidates:
@@ -1294,20 +1328,24 @@ class DualFaceDetector:
             # YOLOv8 单模型候选与 SCRFD-2.5g 单模型候选都要和10g
             # 做分数一致性检查；其他模型组合不改变原有复核逻辑。
             score_ok = self._verifier_score_consistent(item, best[2])
-            if not score_ok:
-                self.last_score_rejected_count += 1
             if best[0] >= self._verify_iou and score_ok:
                 confirmed = dict(item)
                 confirmed["source"] = "V"
                 confirmed["scores"] = tuple(item["scores"]) + (
                     ("SCRFD-10g", best[2]),)
                 kept.append(confirmed)
-            elif frame_idx is not None and self._reject_cooldown > 0:
-                self._rejected_candidates.append({
-                    "box": item["box"],
-                    "until": frame_idx + self._reject_cooldown,
-                    "view": view_key,
-                })
+            else:
+                # 激进召回改法: 10g 拒绝或低重叠不再硬丢, 降级为 S 软
+                # 保留; 但【不附带 10g 分】(避免低 10g 分把加权 base 拉
+                # 到确认线以下导致卡在 PENDING 永不打码——那比 v1 更差)。
+                # 纯 S 的 base 保持高位→当场确认(对齐 v1 单模型召回);
+                # 其未获 10g 佐证→corroborated=False, 真消失时由条件回退
+                # 快速清理, 仍比 v1 少残留误检。
+                soft = dict(item)
+                soft["source"] = "S"
+                kept.append(soft)
+                if not score_ok:
+                    self.last_score_rejected_count += 1
         return kept
 
 
@@ -1851,6 +1889,279 @@ class SCRFDFaceDetector:
         return result, details
 
 
+class MogFaceDetector:
+    """MogFace-large ONNX 人脸检测器 (WiderFace SOTA, ResNet101骨干)。
+
+    模型来源: ModelScope 'damo/cv_resnet101_face-detection_cvpr22papermogface'
+    的 ONNX 导出(固定 640x640 输入, 输出为原始 conf (1,N,1) 和 loc (1,N,4),
+    需在本地生成先验框并解码 + NMS)。找不到 mogface_large.onnx 时抛出明确错误。
+
+    接口与 SCRFDFaceDetector 对齐:
+      detect(img, conf) -> [(x1,y1,x2,y2), ...]
+      detect_with_conf(img, conf) -> [((x1,y1,x2,y2), score), ...]
+      timing_stats() / timing_label / last_detection_details
+
+    预处理: BGR->RGB -> resize(固定尺寸) -> 减均值(123.675,116.28,103.53)
+    -> 除std(58.395,57.12,57.375) -> /255 -> CHW float32 (与 ModelScope
+    官方 pipeline 一致); 解码后坐标按 固定尺寸→原图 线性缩放。
+    """
+
+    def __init__(self, model_dir=None, input_size=640, conf=FACE_CONF,
+                 device="auto", gpu_id=0, use_gpu=True, model_path=None):
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 onnxruntime。请安装：pip install onnxruntime"
+            ) from exc
+
+        model_path = model_path or self._find_model(model_dir)
+        if model_path is None:
+            raise RuntimeError(
+                f"未找到 {MOGFACE_FILE}。请从 ModelScope 下载 "
+                f"'damo/cv_resnet101_face-detection_cvpr22papermogface' 的 "
+                f"ONNX 导出并重命名为 {MOGFACE_FILE}, 放到项目目录或通过 "
+                f"--model-dir 指定模型目录"
+            )
+
+        self.conf = float(conf)
+        self.model_path = model_path
+        self.last_detection_details = []
+
+        requested = device.lower()
+        if requested not in ("auto", "cpu", "cuda", "coreml"):
+            raise ValueError(f"不支持的 MogFace 推理设备: {device}")
+        if not use_gpu:
+            requested = "cpu"
+
+        options = ort.SessionOptions()
+        options.log_severity_level = 3
+        available = ort.get_available_providers()
+        provider_name = "CPUExecutionProvider"
+        providers = ["CPUExecutionProvider"]
+        if requested in ("auto", "cuda") and "CUDAExecutionProvider" in available:
+            provider_name = "CUDAExecutionProvider"
+            providers = [
+                ("CUDAExecutionProvider", {
+                    "device_id": str(gpu_id),
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "1",
+                }),
+                "CPUExecutionProvider",
+            ]
+        elif requested in ("auto", "coreml") and "CoreMLExecutionProvider" in available:
+            provider_name = "CoreMLExecutionProvider"
+            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        elif requested in ("cuda", "coreml"):
+            print(f"[人脸] [警告] MogFace 请求的 {requested} 后端不可用，"
+                  f"可用后端={available}，回退 CPU")
+
+        try:
+            self._sess = ort.InferenceSession(model_path, options, providers=providers)
+        except Exception as exc:
+            if provider_name == "CPUExecutionProvider":
+                raise
+            print(f"[人脸] [警告] MogFace {provider_name} 初始化失败({exc})，回退 CPU")
+            providers = ["CPUExecutionProvider"]
+            self._sess = ort.InferenceSession(
+                model_path, options, providers=["CPUExecutionProvider"])
+
+        self._input_name = self._sess.get_inputs()[0].name
+        self._output_names = [out.name for out in self._sess.get_outputs()]
+        if set(self._output_names) != {"conf", "loc"}:
+            raise RuntimeError(
+                f"MogFace ONNX 输出异常: {self._output_names}, "
+                f"预期 ['conf', 'loc'] (原始锚框偏移, 需本地解码)")
+
+        # 模型为固定输入尺寸, 以会话声明的实际 shape 为准(忽略传入的 input_size)
+        in_shape = self._sess.get_inputs()[0].shape
+        try:
+            self.input_size = int(in_shape[-1])
+            if int(in_shape[-2]) != self.input_size or self.input_size < 32:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"MogFace ONNX 输入非固定尺寸: {in_shape}, "
+                f"需要固定 H=W 的导出(如 640x640)以兼容 CoreML")
+        self._priors = self._build_priors()   # (N,4) cx,cy,w,h
+
+        # 预热: 尽早暴露后端与模型 shape 不兼容
+        dummy = np.zeros((1, 3, self.input_size, self.input_size), np.float32)
+        try:
+            self._sess.run(self._output_names, {self._input_name: dummy})
+        except Exception as exc:
+            if provider_name == "CPUExecutionProvider":
+                raise
+            print(f"[人脸] [警告] MogFace {provider_name} 预热失败({exc})，回退 CPU")
+            self._sess = ort.InferenceSession(
+                model_path, options, providers=["CPUExecutionProvider"])
+            self._sess.run(self._output_names, {self._input_name: dummy})
+        self.backend = self._sess.get_providers()[0]
+        self.timing_label = "MogFace-large"
+        self._timing = {"calls": 0, "total": 0.0}
+
+    @staticmethod
+    def _find_model(model_dir):
+        candidates = []
+        if model_dir:
+            candidates.append(os.path.join(model_dir, MOGFACE_FILE))
+        candidates.extend([
+            os.path.join(os.getcwd(), MOGFACE_FILE),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), MOGFACE_FILE),
+        ])
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _build_priors(self):
+        """生成 MogPriorBox 先验框 (N,4) [cx, cy, w, h]。
+
+        strides=[4,8,16,32,64,128], sizes=[16,32,64,128,256,512],
+        scale=0.68; 特征图尺寸由输入尺寸逐层减半得到(与 ModelScope
+        官方 MogPriorBox 一致), 行优先(i 外层 y, j 内层 x) 与模型
+        permute+view 后的输出顺序对齐。
+        """
+        STRIDES = (4, 8, 16, 32, 64, 128)
+        SIZES = (16, 32, 64, 128, 256, 512)
+        SCALE = 0.68
+        priors = []
+        for stride, size in zip(STRIDES, SIZES):
+            side = size * SCALE
+            gh, gw, s = self.input_size, self.input_size, stride
+            while s != 1:
+                s //= 2
+                gh = (gh + 1) // 2
+                gw = (gw + 1) // 2
+            for i in range(gh):
+                cy = (i + 0.5) * stride
+                for j in range(gw):
+                    priors.append(((j + 0.5) * stride, cy, side, side))
+        return np.asarray(priors, dtype=np.float32)
+
+    def _record_timing(self, elapsed):
+        self._timing["calls"] += 1
+        self._timing["total"] += max(0.0, float(elapsed))
+
+    def timing_stats(self):
+        calls = self._timing["calls"]
+        total = self._timing["total"]
+        return {"calls": calls, "total_seconds": total,
+                "average_ms": total * 1000.0 / calls if calls else 0.0}
+
+    def _prepare_input(self, img):
+        """BGR -> RGB -> resize -> 减均值 -> 除std -> /255 -> CHW float32。
+
+        与 ModelScope 官方 MogFaceDetector.forward 的数值顺序完全一致:
+        (pixel - mean) / std / 255 (注意 /255 在 std 之后)。
+        """
+        resized = cv2.resize(img, (self.input_size, self.input_size))
+        blob = resized[:, :, ::-1].astype(np.float32)      # BGR -> RGB
+        blob -= MOGFACE_MEAN
+        blob /= MOGFACE_STD
+        blob /= 255.0
+        blob = blob.transpose(2, 0, 1)[None]               # (1,3,H,W)
+        return np.ascontiguousarray(blob)
+
+    def _decode_outputs(self, outputs, w, h, threshold):
+        """解码 conf/loc -> 先验框偏移回归 -> NMS -> 坐标映射回原图。
+
+        outputs: [conf (1,N,1), loc (1,N,4)] (模型输出顺序按名字对应);
+        解码公式与 ModelScope 官方 mogdecode 一致:
+          cx = prior_cx + loc_x * prior_w; bw = prior_w * exp(loc_w)
+          x0 = cx - (bw-1)/2; x1 = x0 + bw - 1 (y 同理)
+        NMS 阈值 0.4, NMS 前 top-5000 / 后 top-750 (官方默认)。
+        """
+        by_name = dict(zip(self._output_names, outputs))
+        conf = np.asarray(by_name["conf"], dtype=np.float32).reshape(-1)
+        loc = np.asarray(by_name["loc"], dtype=np.float32).reshape(-1, 4)
+        priors = self._priors
+        if conf.shape[0] != priors.shape[0] or loc.shape[0] != priors.shape[0]:
+            raise RuntimeError(
+                f"MogFace 输出锚框数 {conf.shape[0]}/{loc.shape[0]} 与"
+                f"先验框数 {priors.shape[0]} 不一致(输入尺寸不匹配?)")
+
+        cx = priors[:, 0] + loc[:, 0] * priors[:, 2]
+        cy = priors[:, 1] + loc[:, 1] * priors[:, 3]
+        bw = priors[:, 2] * np.exp(loc[:, 2])
+        bh = priors[:, 3] * np.exp(loc[:, 3])
+        x0 = cx - (bw - 1.0) / 2.0
+        y0 = cy - (bh - 1.0) / 2.0
+        x1 = x0 + bw - 1.0
+        y1 = y0 + bh - 1.0
+
+        inds = np.where(conf > threshold)[0]
+        if inds.size == 0:
+            return []
+        dets = np.stack(
+            [x0[inds], y0[inds], x1[inds], y1[inds], conf[inds]], axis=1)
+        # NMS 前 top-K (官方 top_k=5000)
+        order = np.argsort(dets[:, 4])[::-1][:5000]
+        dets = dets[order]
+        keep = self._nms(dets, 0.4)
+        dets = dets[keep][:750]                            # 官方 keep_top_k=750
+
+        # input_size 空间 -> 原图空间
+        sx, sy = w / float(self.input_size), h / float(self.input_size)
+        out = []
+        img_area = w * h
+        for row in dets:
+            bx1, by1 = row[0] * sx, row[1] * sy
+            bx2, by2 = row[2] * sx, row[3] * sy
+            score = float(row[4])
+            bx1, by1 = max(0, int(bx1)), max(0, int(by1))
+            bx2, by2 = min(w, int(bx2)), min(h, int(by2))
+            fw, fh = bx2 - bx1, by2 - by1
+            if fw <= 0 or fh <= 0:
+                continue
+            # 与 YOLO/SCRFD 相同的几何过滤
+            if fw < FACE_MIN_SIZE or fh < FACE_MIN_SIZE:
+                continue
+            if fw * fh > img_area * FACE_MAX_AREA_RATIO:
+                continue
+            ratio = fw / fh
+            if ratio < FACE_ASPECT_MIN or ratio > FACE_ASPECT_MAX:
+                continue
+            out.append(((bx1, by1, bx2, by2), score))
+        return out
+
+    @staticmethod
+    def _nms(dets, thresh):
+        """dets: (N,5) [x0,y0,x1,y1,score] -> keep 索引 (与 py_cpu_nms 等价)。"""
+        x1, y1, x2, y2 = dets[:, 0], dets[:, 1], dets[:, 2], dets[:, 3]
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = np.argsort(dets[:, 4])[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            inter = np.maximum(0.0, xx2 - xx1 + 1) * np.maximum(0.0, yy2 - yy1 + 1)
+            ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            order = order[np.where(ovr <= thresh)[0] + 1]
+        return keep
+
+    def detect(self, img, conf=None):
+        return [box for box, _ in self.detect_with_conf(img, conf)]
+
+    def detect_with_conf(self, img, conf=None):
+        """返回 [((x1,y1,x2,y2), score), ...]。"""
+        self.last_detection_details = []
+        if img is None or img.size == 0:
+            return []
+        started = time.perf_counter()
+        threshold = self.conf if conf is None else float(conf)
+        h, w = img.shape[:2]
+        blob = self._prepare_input(img)
+        outputs = self._sess.run(self._output_names, {self._input_name: blob})
+        result = self._decode_outputs(outputs, w, h, threshold)
+        self._record_timing(time.perf_counter() - started)
+        return result
+
+
 class SCRFDVerifier(SCRFDFaceDetector):
     """用 face-detect 同款 SCRFD 对 YOLO 的低置信度候选做二次验证。"""
 
@@ -2123,6 +2434,298 @@ class HardFaceRecall:
         return recalled
 
 
+# ================= v2: Evidence 评分 + 四态滞回决策 =================
+# v2 只把轨迹 confirmed 的"写入路径"替换为 Evidence→Decision, 其余 v1 管线
+# (检测/调度/跟踪/回补/渲染)全部保留。关键校准不变量:
+#   - D/V 建轨立即 CONFIRMED: current_evidence 的 +0.25/+0.30 建轨加成
+#     保证 D/V 双conf>=0.45 时 score>=0.70
+#   - X/R/S 建轨一律 PENDING(建轨处封顶 confirm-0.01): 高分X/R/S也不立即
+#     确认, 与 v1 X/R/S new_confirmed=False 一致(cons_bonus 提升后S建轨
+#     若不封顶会立即越线, 故S加入建轨封顶名单)
+#   - 第2次共识命中必升级(consensus_hits>=2 对齐): D/V/X 命中使
+#     consensus_count>=2 时, update() 把 score 兜底到 confirm 线——
+#     长间隔后 soft 经 EWMA 衰减可能不足, 仅靠 cons_bonus*cc 加成无法
+#     保证跨线(稀疏X命中场景), floor 保证任意间隔下第2次共识命中都升级
+#   - R/S 来源双重封顶(current 与轮最终分都封 confirm-0.01):
+#     consensus_count 结转不得把 pending 推过确认线(与 v1 "S/R 命中
+#     一律不构成升级证据"一致); 已确认轨迹不受影响(matched轮按命中保确认)
+#   - was_confirmed 恢复规则: 曾确认过的轨迹被 release 后, 任意匹配轮
+#     (含 S/R 弱来源)分数>=release 即恢复确认(对齐 v1 confirmed 粘性——
+#     匹配轮永不解确认; 修复"已确认轨迹被EWMA衰减提前解除后恢复过慢")
+#   - 确认后无证据 ~5 轮 EWMA 衰减跌破 release(≈grace 保活语义)
+
+
+class FaceEvidence:
+    """轨迹证据累积(v2): 分来源分数 + 共识累积计数 + EWMA总分。
+
+    soft: EWMA衰减的检测证据(不含共识加成)
+    score: 最终证据分 = clamp(soft + cons_bonus*min(consensus_count,5), 0, 1);
+        D/V/X 命中使 consensus_count 达到>=2 时 score 兜底到 confirm 线
+        (第2次共识命中必升级, v1 consensus_hits>=2 对齐)
+    consensus_count: 累积共识级(D/V/X)命中次数(v1 consensus_hits对齐:
+        创建=1(任意来源), D/V/X命中+1, S/R命中与丢失轮都不变——v1的ch
+        是终身累积计数, 从不因丢失清零; 这是"第2次共识命中升级"语义
+        的载体, 曾用连续streak在丢失轮清零导致稀疏X命中永远无法升级)
+    """
+
+    DEFAULT_WEIGHTS = {"yolo": 0.25, "scrfd": 0.25, "mogface": 0.25,
+                       "10g": 0.20, "stereo": 0.05, "roi": 0.05}
+    # 0.20: 使第2次共识命中(consensus_count=2)获得 +0.40 加成, 常规间隔
+    # (face-int级)下直接跨过 confirm 线; 更长间隔由 cc>=2 floor 兜底
+    DEFAULT_CONS_BONUS = 0.20
+
+    def __init__(self, weights=None, cons_bonus=None):
+        # 分来源当帧分数(模型名->分数, 由接线层填充)
+        self.source_scores = {}      # {"YOLOv8":0.7, "SCRFD-2.5g":0.6, ...}
+        self.landmark_ok = None      # None=无关键点/True/False
+        self.soft = 0.0
+        self.score = 0.0
+        self.consensus_count = 0
+        self.positive_hits = 0
+        self.negative_hits = 0
+        self.corroborated = False   # 是否经双模型共识/10g复核佐证(精度护栏)
+        self.weights = weights or dict(self.DEFAULT_WEIGHTS)
+        self.cons_bonus = (float(cons_bonus)
+                           if cons_bonus is not None
+                           else self.DEFAULT_CONS_BONUS)
+
+    def _weight_for(self, name):
+        """模型名 -> 权重桶: YOLO*->yolo; SCRFD-10g->10g; Stereo-*->stereo;
+        其余非10g的SCRFD->scrfd; MogFace*->mogface; HardROI->roi;
+        未知来源->None(不参与base)。"""
+        key = str(name).upper()
+        if key.startswith("YOLO"):
+            return self.weights.get("yolo")
+        if "10G" in key:
+            return self.weights.get("10g")
+        if key.startswith("STEREO"):
+            return self.weights.get("stereo")
+        if key.startswith("MOGFACE"):
+            return self.weights.get("mogface")
+        if key.startswith("SCRFD"):
+            return self.weights.get("scrfd")
+        if key.startswith("HARDROI"):
+            return self.weights.get("roi")
+        return None
+
+    def current_evidence(self, source, scores_map, lk_valid=None, jump=False,
+                         is_miss=False, confirm_thresh=0.65):
+        """计算当帧证据分 current(不修改累积状态)。
+
+        base: 可用来源动态权重归一化 base = Σ(w_i×s_i)/Σ(w_i),
+              缺失来源不按0计(只用本帧实际有分的来源);
+        正证据直接加(base之上): D +0.25 / V +0.30 / X +0.10 / landmark_ok +0.10;
+        负证据直接减: 模型分歧(YOLO与SCRFD-2.5g都有值且|差|>0.35) -0.15 /
+              landmark_ok=False -0.20 / bbox跳变 -0.10;
+        来源封顶: source为 S/R 时 current 封顶在 confirm_thresh-0.01
+              (单模型/ROI 永不单独把 pending 推过确认线);
+        miss轮: is_miss=True 时 current = 0.10(LK稳定) / 0.0(LK失败)。
+        """
+        if is_miss:
+            return 0.10 if lk_valid else 0.0
+        current = 0.0
+        w_sum, s_sum = 0.0, 0.0
+        for name, score in (scores_map or {}).items():
+            if score is None:
+                continue
+            w = self._weight_for(name)
+            if w is None:
+                continue
+            w_sum += w
+            s_sum += w * float(score)
+        if w_sum > 0:
+            current = s_sum / w_sum
+        # ---- 正证据(直接加) ----
+        if source == "D":            # 双模型共识
+            current += 0.25
+        elif source == "V":          # 10g复核强证据
+            current += 0.30
+        elif source == "X":          # 双目互证
+            current += 0.10
+        if self.landmark_ok is True:
+            current += 0.10
+        # ---- 负证据(直接减) ----
+        yolo_score = scrfd_score = None
+        for name, score in (scores_map or {}).items():
+            if score is None:
+                continue
+            key = str(name).upper()
+            if key.startswith("YOLO") and yolo_score is None:
+                yolo_score = float(score)
+            elif (key.startswith("SCRFD") and "10G" not in key
+                  and scrfd_score is None):
+                scrfd_score = float(score)
+        if (yolo_score is not None and scrfd_score is not None
+                and abs(yolo_score - scrfd_score) > 0.35):
+            current -= 0.15          # 模型分歧
+        if self.landmark_ok is False:
+            current -= 0.20
+        if jump:                     # bbox跳变
+            current -= 0.10
+        # ---- 来源封顶 ----
+        if source in ("S", "R") and current > confirm_thresh - 0.01:
+            current = confirm_thresh - 0.01
+        return float(min(1.0, max(0.0, current)))
+
+    def update(self, source, scores_map, decay, lk_valid=None, jump=False,
+               confirm_thresh=0.65):
+        """命中轮: soft EWMA 吸收当帧证据; D/V/X 命中推进
+        consensus_count(S/R命中与丢失轮都不变——终身累积计数);
+        score = clamp(soft + cons_bonus*min(consensus_count,5), 0, 1)
+        (共识加成直接加, 不经EWMA衰减); D/V/X 命中使 cc>=2 时
+        score 兜底到 confirm 线(第2次共识命中必升级, v1
+        consensus_hits>=2 对齐——长间隔衰减场景仅靠加成可能差零点几)。"""
+        self.source_scores = dict(scores_map or {})
+        current = self.current_evidence(
+            source, scores_map, lk_valid=lk_valid, jump=jump,
+            confirm_thresh=confirm_thresh)
+        self.soft = decay * self.soft + (1.0 - decay) * current
+        if source in ("D", "V", "X"):
+            self.consensus_count += 1
+        if current >= 0.5:
+            self.positive_hits += 1
+        else:
+            self.negative_hits += 1
+        self.score = float(min(1.0, max(
+            0.0, self.soft + self.cons_bonus * min(self.consensus_count, 5))))
+        if source in ("S", "R") and self.score > confirm_thresh - 0.01:
+            # S/R轮最终分封顶: current_evidence 只封当帧分, consensus_count
+            # 结转(X建轨/先前D/V/X命中)仍可把总分推过确认线; v1 红线是
+            # S/R 命中一律不构成pending升级证据, 故S/R轮总分不得越线
+            # (已确认轨迹不受影响: matched轮由 decide 按命中保确认)
+            self.score = float(confirm_thresh - 0.01)
+        if source in ("D", "V"):
+            self.corroborated = True
+        elif source == "S":
+            self.corroborated = (self.corroborated
+                                 or self._has_10g_corroboration(scores_map))
+        if source in ("D", "V", "X") and self.consensus_count >= 2:
+            # cc>=2 floor: 第2次共识命中必升级(v1 consensus_hits>=2
+            # 对齐)。长间隔后 soft 经 EWMA 衰减到稳态(~0.1), 仅靠
+            # cons_bonus*cc 加成可能差零点几(稀疏X命中场景); floor
+            # 到 confirm 线, soft 同步补齐使后续轮从 confirm 起衰减。
+            # 独立 if(非 elif): D/V 也需此兜底(EWMA 长间隔衰减后
+            # D/V 单次命中的 soft+cc 加成可能差零点几)
+            if self.score < confirm_thresh:
+                self.soft += confirm_thresh - self.score
+                self.score = float(confirm_thresh)
+        return self.score
+
+    def update_miss(self, decay, lk_valid):
+        """丢失轮: consensus_count 不变(v1 consensus_hits 终身累积,
+        从不因丢失清零——稀疏X命中跨丢失轮仍可累积到升级);
+        score = clamp(soft + cons_bonus*min(cc,5), 0, 1)——与 update
+        保持同一公式, consensus_count 的"终身累积"权重在 miss 轮
+        也生效, 避免 corroborated 且 cc 高的轨迹被过早 release。
+
+        丢失轮衰减: score = clamp(soft + cons_bonus*min(cc,5), 0, 1)——与
+        update 保持同一公式, consensus_count 的"终身累积"权重在 miss 轮
+        也生效, 避免 corroborated 且 cc 高的轨迹被过早 release。
+
+        精度护栏(仅针对不可靠轨迹): 仅当轨迹"未经双模型共识/10g复核
+        佐证"(corroborated=False, 即纯单模型 S, 鱼眼边缘最易误检)且 LK
+        也失败(真消失而非遮挡)时, 使用更陡的有效衰减(decay^2), 使误
+        检框更快跌破 release 线被清除; 可靠轨迹(双共识/10g佐证)保持常
+        规衰减以保召回。"""
+        self.source_scores = {}
+        miss_val = 0.10 if lk_valid else 0.0
+        eff_decay = ((decay * decay) if not lk_valid and not self.corroborated
+                     else decay)
+        self.soft = eff_decay * self.soft + (1.0 - eff_decay) * miss_val
+        # score 从 soft 派生(与 update 一致), consensus_count 权重保持
+        self.score = float(min(1.0, max(
+            0.0, self.soft + self.cons_bonus * min(self.consensus_count, 5))))
+        self.negative_hits += 1
+        return self.score
+
+    def _has_10g_corroboration(self, scores_map):
+        """单模型脸是否获得 SCRFD-10g 复核佐证(精度护栏)。
+
+        仅当分数表里带 SCRFD-10g 来源时返回 True——意味着该脸已被
+        异构的 10g 模型独立看到, 可信度高于纯单模型。"""
+        for name in (scores_map or {}):
+            if "10G" in str(name).upper():
+                return True
+        return False
+
+    def init_from(self, source, scores_map, lk_valid=None, jump=False,
+                  confirm_thresh=0.65):
+        """创建轮: soft 直接取当帧 current(不从0起EWMA);
+        consensus_count = 1(任意来源——v1 建轨即计1次共识命中);
+        score = clamp(soft + cons_bonus*1, 0, 1);
+        X/R/S 创建分封顶 confirm-0.01(建轨一律 pending, 高分也不立即确认)。"""
+        self.source_scores = dict(scores_map or {})
+        current = self.current_evidence(
+            source, scores_map, lk_valid=lk_valid, jump=jump,
+            confirm_thresh=confirm_thresh)
+        self.soft = current
+        self.consensus_count = 1
+        if current >= 0.5:
+            self.positive_hits += 1
+        else:
+            self.negative_hits += 1
+        self.score = float(min(1.0, max(0.0, self.soft + self.cons_bonus)))
+        if source in ("X", "R", "S") and self.score >= confirm_thresh:
+            # v1 红线: X(立体低分互证)/R(困难召回ROI)/S(单模型)建轨一律
+            # pending(new_confirmed=False), 高分也不立即确认(R的3x放大
+            # ROI分数不可信, S无独立第二证据); 二次 D/V/X 命中经
+            # consensus_count 加成/cc>=2 floor 升级。cons_bonus=0.20 后
+            # S建轨(0.64+0.20)必越线, S 必须在封顶名单内
+            self.soft -= self.score - (confirm_thresh - 0.01)
+            self.score = float(confirm_thresh - 0.01)
+        # corroborated: D/V/X 建轨即有共识/互证佐证; S 需 10g 复核;
+        # R(ROI)不可信, 不佐证
+        self.corroborated = (source in ("D", "V", "X")
+                             or self._has_10g_corroboration(scores_map))
+        return self.score
+
+
+class FaceDecisionEngine:
+    """四态滞回决策: REJECT(<reject) / PENDING / CONFIRMED(>=confirm) / GRACE"""
+
+    REJECT, PENDING, CONFIRMED, GRACE = "REJECT", "PENDING", "CONFIRMED", "GRACE"
+
+    def __init__(self, confirm=0.65, release=0.30, reject=0.35, decay=0.75,
+                 weights=None):
+        self.confirm = float(confirm)
+        self.release = float(release)
+        self.reject = float(reject)
+        self.decay = float(decay)
+        self.weights = dict(weights or FaceEvidence.DEFAULT_WEIGHTS)
+
+    def decide(self, ev, prev_confirmed, matched_this_round,
+               was_confirmed=False, source=None):
+        """返回 (state, mask, reason)。mask = state in {CONFIRMED, GRACE}。
+
+        - 新建时 score < reject -> REJECT(不建轨迹)
+        - was_confirmed(曾确认后被release) and matched and
+          score >= release and source not in (S,R) -> CONFIRMED("reconfirmed:matched")
+          (v1对齐恢复规则: v1 confirmed粘性, 匹配轮永不解确认; release后
+          检测恢复即重新打码, 不要求 EWMA 爬回 confirm 线;
+          但S/R单模型/ROI来源不构成恢复证据——同位置的误检不可恢复已释放轨迹)
+        - prev_confirmed and score < release -> PENDING("released:score<x")
+          (滞回解除: 已确认轨迹跌破解除线)
+        - (not prev_confirmed) and score >= confirm -> CONFIRMED("confirmed:score>=x")
+        - prev_confirmed and matched_this_round -> CONFIRMED, 否则 GRACE("grace:decaying")
+        - 其余 -> PENDING("pending:score=x")
+        """
+        if (was_confirmed and (not prev_confirmed) and matched_this_round
+                and ev.score >= self.release
+                and source not in ("S", "R")):
+            return self.CONFIRMED, True, f"reconfirmed:matched:score>={self.release}"
+        if (not prev_confirmed) and ev.score < self.reject:
+            return self.REJECT, False, f"reject:score<{self.reject}"
+        if prev_confirmed and ev.score < self.release:
+            return self.PENDING, False, f"released:score<{self.release}"
+        if (not prev_confirmed) and ev.score >= self.confirm:
+            return self.CONFIRMED, True, f"confirmed:score>={self.confirm}"
+        if prev_confirmed:
+            if matched_this_round:
+                return self.CONFIRMED, True, "confirmed:matched"
+            return self.GRACE, True, "grace:decaying"
+        return self.PENDING, False, f"pending:score={ev.score:.2f}"
+
+
 class FaceProcessor:
     """人脸检测+逐脸轨迹稳定：关键帧检测，中间帧 LK/模板跟踪。
 
@@ -2145,7 +2748,9 @@ class FaceProcessor:
                  backfill_frames=FACE_BACKFILL, burst_frames=FACE_BURST,
                  active_hold=FACE_ACTIVE_HOLD,
                  visible_hold=FACE_VISIBLE_HOLD, hard_face_recall=None,
-                 roi_detector=None):
+                 roi_detector=None,
+                 ev_confirm=0.65, ev_release=0.30, ev_reject=0.35,
+                 ev_decay=0.75, ev_weights=None):
         self.detector = detector
         self.detect_int = max(1, detect_int)
         self.empty_detect_int = max(1, empty_detect_int)
@@ -2200,6 +2805,37 @@ class FaceProcessor:
         # face-detect 同款模板桥接门槛；仅 LK 失败时运行，不增加正常帧开销。
         self._tmpl_thresh = 0.92
         self._psr_thresh = 2.0
+        # v2: Evidence→Decision 打码决策引擎(替换 v1 分散的 confirmed 布尔规则,
+        # 检测/调度/跟踪/回补/渲染管线全部保留)
+        self.decision = FaceDecisionEngine(
+            confirm=ev_confirm, release=ev_release, reject=ev_reject,
+            decay=ev_decay, weights=ev_weights)
+        # v2 统计计数器(main() 处理完成后汇总打印)
+        self.stats = {"det_rounds": 0, "verify_hits": 0, "roi_dets": 0,
+                      "confirms": 0, "releases": 0, "reconfirms": 0,
+                      "confirm_latencies": []}
+
+    @staticmethod
+    def _evidence_scores(debug_score):
+        """debug_scores 元组 ((模型名,分数),...) → {模型名: 分数} dict。
+
+        singles 的缺项(None)不计; None/空 → {}(单模型/verify 管线无分来源,
+        走 v1 布尔回退)。landmark 关键点信息不在 debug_scores 里,
+        landmark_ok 保持 None(该证据来源自动跳过)。
+        """
+        if not debug_score:
+            return {}
+        scores_map = {}
+        for item in debug_score:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                name, score = item[0], item[1]
+                if name is None or score is None:
+                    continue
+                try:
+                    scores_map[str(name)] = float(score)
+                except (TypeError, ValueError):
+                    continue
+        return scores_map
 
     def _init_pts(self, gray, box):
         """用均匀网格采样替代 goodFeaturesToTrack 的角点检测。
@@ -2257,7 +2893,7 @@ class FaceProcessor:
         # estimateAffinePartial2D 需要 ≥2 点对, 用 RANSAC 剔除异常值
         M, inliers = cv2.estimateAffinePartial2D(
             old_flat, good, method=cv2.RANSAC,
-            ransacReprojThreshold=3.0, maxIters=5000)
+            ransacReprojThreshold=3.0, maxIters=100)
         if M is not None and inliers is not None and inliers.sum() >= 3:
             # 将框四角做仿射变换, 得到新框
             corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
@@ -2422,6 +3058,8 @@ class FaceProcessor:
                     track["visible"] = True
                     track["visibility_misses"] = 0
                     track["debug_source"] = "T"
+                    # v2: LK光流稳定(证据miss轮+0.10正证据)
+                    track["lk_valid"] = True
                     if frame_idx is not None:
                         track["last_visible_frame"] = frame_idx
                         track["last_visible_box"] = track["box"]
@@ -2437,6 +3075,8 @@ class FaceProcessor:
                 track["visible"] = True
                 track["visibility_misses"] = 0
                 track["debug_source"] = "T"
+                # v2: LK失败但模板桥接成功(位移可靠, 视为跟踪有效)
+                track["lk_valid"] = True
                 if frame_idx is not None:
                     track["last_visible_frame"] = frame_idx
                     track["last_visible_box"] = track["box"]
@@ -2446,6 +3086,8 @@ class FaceProcessor:
             # 如果当帧检测也漏掉，_update_tracks() 会按 visible_hold
             # 给已确认轨迹短暂保活，避免只闪一帧。
             track["visible"] = False
+            # v2: LK与模板均失败(证据miss轮为0)
+            track["lk_valid"] = False
             active_tracks.append(track)
             # 跟踪失败强制复检只对已确认轨迹: pending本就不输出打码,
             # 老pending交由常规检测间隔兜底, 防止不可跟踪的误检pending
@@ -2530,6 +3172,7 @@ class FaceProcessor:
             track["visibility_misses"] = 0
             track["template"] = self._grab_template(gray, track["box"])
             if (frame_idx is not None and not was_visible
+                    and track.get("confirmed", True)
                     and previous_visible_frame is not None
                     and frame_idx > previous_visible_frame + 1
                     and self.backfill_frames > 0
@@ -2549,29 +3192,85 @@ class FaceProcessor:
             if debug_scores[di] is not None:
                 track["debug_scores"] = debug_scores[di]
                 track["debug_source"] = debug_sources[di]
-            # pending升级只认独立证据命中(D/V/X): S单模型续接旁路会让
-            # 纹理区域的YOLO持续误检把pending误检轨迹"转正";
-            # R命中与缩放相关(3x放大ROI的分数不可信), 一律不升级。
-            consensus_hit = debug_sources[di] not in ("S", "R")
-            if (not track.get("confirmed", True) and consensus_hit
-                    and (new_confirmed[di]
-                         or track.get("consensus_hits", 0) >= 2)):
-                # pending轨迹升级: 共识级检测命中(双模型/立体互证)或累计
-                # 第二次共识级命中(时间共识)。升级后从首见帧插值回补,
-                # pending期间不打码的帧在确认时统一补上。
-                track["confirmed"] = True
-                track["debug_source"] = "U"
-                first_frame = track.get("first_frame")
-                if (self.backfill_frames > 0 and frame_idx is not None
-                        and first_frame is not None
-                        and frame_idx > first_frame):
-                    self.last_backfill_events.append({
-                        "start_frame": first_frame,
-                        "start_box": track.get("first_box", track["box"]),
-                        "end_frame": frame_idx,
-                        "end_box": track["box"],
-                        "kind": "pending_confirm",
-                    })
+            # ---- v2: Evidence→Decision (替换 v1 的 pending 升级布尔规则) ----
+            # 语义对照: v1 的 `not confirmed and consensus_hit and
+            # (new_confirmed[di] or consensus_hits>=2)` 升级 ≈ v2 的
+            # D/V/X 命中推进证据分到 confirm 线; S/R 命中不构成升级证据
+            # (来源封顶, 永不单独把 pending 推过确认线)。
+            # 单模型/verify 管线无分来源(debug_scores=None): 保留 v1 布尔
+            # 语义(该管线轨迹恒 confirmed, 升级块在 v1 本就不触发)。
+            prev_conf = track.get("confirmed", True)
+            ev = track.get("evidence")
+            if ev is not None and debug_scores[di] is not None:
+                source = debug_sources[di]
+                scores_map = self._evidence_scores(debug_scores[di])
+                # bbox跳变检测: 本帧匹配框中心与轨迹框(平滑前)中心位移
+                # > 轨迹框宽高均值*0.5 → 负证据 -0.10
+                pcx, pcy = self._center(predicted)
+                dcx, dcy = self._center(detected)
+                bw_ = predicted[2] - predicted[0]
+                bh_ = predicted[3] - predicted[1]
+                jump = (((dcx - pcx) ** 2 + (dcy - pcy) ** 2) ** 0.5
+                        > 0.5 * ((bw_ + bh_) / 2.0))
+                # landmark证据: debug_scores 只含(模型,分数)不含关键点,
+                # landmark_ok 保持 None(该证据来源自动跳过)
+                ev.update(source, scores_map, self.decision.decay,
+                          lk_valid=track.get("lk_valid"), jump=jump,
+                          confirm_thresh=self.decision.confirm)
+                state, mask, reason = self.decision.decide(
+                    ev, prev_conf, matched_this_round=True,
+                    was_confirmed=track.get("confirm_frame") is not None,
+                    source=source)
+                track["ev_state"], track["ev_reason"] = state, reason
+                newly = (not prev_conf) and mask
+                released = prev_conf and (not mask)
+                track["confirmed"] = mask
+                if mask and track.get("release_frame") is not None:
+                    # 重确认(曾release过又回到确认线): 回补事件从
+                    # release_frame+1 起, 受 backfill_frames 窗口裁剪
+                    # (与 v1 track_gap 回补的窗口逻辑一致), 之后清标记
+                    rel = track["release_frame"]
+                    self.stats["reconfirms"] += 1
+                    if (self.backfill_frames > 0 and frame_idx is not None
+                            and frame_idx > rel
+                            and frame_idx - rel - 1 <= self.backfill_frames):
+                        self.last_backfill_events.append({
+                            "start_frame": rel + 1,
+                            "start_box": track.get(
+                                "last_visible_box", track["box"]),
+                            "end_frame": frame_idx,
+                            "end_box": track["box"],
+                            "kind": "reconfirm",
+                        })
+                    track["release_frame"] = None
+                    track["confirm_frame"] = frame_idx
+                elif newly:
+                    # pending轨迹升级(X2/D/V 命中把证据分推过确认线):
+                    # pending_confirm 回补事件结构与 v1 完全一致,
+                    # 从首见帧插值回补, pending期间不打码的帧统一补上
+                    track["confirm_frame"] = frame_idx
+                    track["debug_source"] = "U"
+                    self.stats["confirms"] += 1
+                    if (frame_idx is not None
+                            and track.get("first_frame") is not None):
+                        self.stats["confirm_latencies"].append(
+                            frame_idx - track["first_frame"])
+                    first_frame = track.get("first_frame")
+                    if (self.backfill_frames > 0 and frame_idx is not None
+                            and first_frame is not None
+                            and frame_idx > first_frame):
+                        self.last_backfill_events.append({
+                            "start_frame": first_frame,
+                            "start_box": track.get("first_box", track["box"]),
+                            "end_frame": frame_idx,
+                            "end_box": track["box"],
+                            "kind": "pending_confirm",
+                        })
+                elif released:
+                    # 滞回解除: 已确认轨迹证据分跌破 release 线
+                    track["release_frame"] = frame_idx
+                    track["visible"] = False   # 立即停止打码
+                    self.stats["releases"] += 1
 
         for ti, track in enumerate(self.tracks):
             if ti not in matched_tracks:
@@ -2579,15 +3278,48 @@ class FaceProcessor:
                 # 检测是加餐, 不烧存活预算(见docstring)
                 if count_misses:
                     track["misses"] += 1
+                    # ---- v2: 丢失轮证据衰减(与 misses 同 gate, 加餐帧不衰减) ----
+                    ev = track.get("evidence")
+                    if ev is not None:
+                        ev.update_miss(self.decision.decay,
+                                       track.get("lk_valid"))
+                        state, mask, reason = self.decision.decide(
+                            ev, track.get("confirmed", True),
+                            matched_this_round=False)
+                        track["ev_state"], track["ev_reason"] = state, reason
+                        if track.get("confirmed", True) and not mask:
+                            # 确认轨迹证据分跌破 release 线 → 滞回解除
+                            # (visible=False 立即停止打码; 随后
+                            # DualFaceDetector 的 visibility 保活可能改写
+                            # visible, 但 confirmed=False 已保证不打码)
+                            track["confirmed"] = False
+                            track["visible"] = False
+                            track["release_frame"] = frame_idx
+                            self.stats["releases"] += 1
+                        elif (not track.get("confirmed", True)) and mask:
+                            # 丢失轮EWMA不太可能直接确认, 但保底处理
+                            # 同上重确认路径
+                            track["confirmed"] = True
+                            track["confirm_frame"] = frame_idx
+                            self.stats["confirms"] += 1
                 if isinstance(self.detector, DualFaceDetector):
                     track["visibility_misses"] = (
                             track.get("visibility_misses", 0) + 1)
-                    # 只给已确认轨迹一帧保活，降低偶发检测抖动造成的闪屏；
-                    # 连续丢失超过门限后仍隐藏旧框并等待重新确认。
-                    track["visible"] = (
-                            track["visibility_misses"] <= self.visible_hold)
-                    if track["visible"]:
-                        track["debug_source"] = "H"
+                    # v2: visible由决策引擎ev_state控制, 不被visible_hold短路:
+                    # - GRACE(已确认但本帧无检测): visible=True, --face-grace生效
+                    # - 已release(confirmed=False): visible=False, 防debug残留
+                    # - PENDING/CONFIRMED: 保留原visible_hold保活逻辑
+                    #   (降低检测抖动闪屏; PENDING也保活, 避免长间隔未确认
+                    #   轨迹在二次命中前提前消失导致召回崩塌)
+                    if track.get("ev_state") == "GRACE":
+                        track["visible"] = True
+                    elif not track.get("confirmed", True) and track.get("ev_state") != "PENDING":
+                        track["visible"] = False
+                    else:
+                        track["visible"] = (
+                                track["visibility_misses"] <= self.visible_hold)
+                        if track["visible"]:
+                            track["debug_source"] = "H"
         # 光流已失败且当帧两个模型都无法续上的轨迹直接删除；
         # 不把没有位移证据的旧框输出为马赛克。
         self.tracks = [t for t in self.tracks if t["misses"] <= self.grace]
@@ -2601,12 +3333,72 @@ class FaceProcessor:
             if (debug_sources[di] == "R"
                     and self._find_matching_track(det) is not None):
                 continue
+            # ---- v2: Evidence→Decision 建轨判定 ----
+            # D/V 建轨加成(+0.25/+0.30)保证双conf>=0.45 时 score>=0.70
+            # 立即确认(与 v1 new_confirmed=True 建轨即确认一致, 无回补事件);
+            # X 建轨分在 init_from 内封顶 confirm-0.01, 一律 PENDING
+            # (与 v1 X 建 pending 一致); R/S 来源封顶永不单独确认。
+            # new_confirmed 仅保留给调度语义(detection_count/backfill
+            # 候选/S续接), 不再决定 confirmed。
+            source = debug_sources[di]
+            scores_map = self._evidence_scores(debug_scores[di])
+            ev = FaceEvidence(self.decision.weights)
+            if scores_map:
+                ev.init_from(source, scores_map,
+                             confirm_thresh=self.decision.confirm)
+                if source in ("R", "X") and ev.score < 0.40:
+                    # R/X 创建下限: 保底 PENDING, 保证 REJECT 默认阈值
+                    # 不误杀困难召回/立体互证轨迹; 下限不越过确认线
+                    # (ev_confirm 极端调低时保持 pending 语义)。
+                    floor = min(0.40, self.decision.confirm - 0.01)
+                    if ev.score < floor:
+                        boost = floor - ev.score
+                        ev.soft += boost
+                        ev.score = floor
+                # S(单模型脸)按尺寸分流:
+                #   小框(<=S_AUTO_CONFIRM_MAX): 直接确认 → 边缘小脸召回
+                #   大框(>S_AUTO_CONFIRM_MAX): 走 PENDING → 等二次确认, 防衣物/手部误检
+                #   YOLO 对深色衣物/手部纹理容易给 0.45~0.55 的中等置信度,
+                #   而 SCRFD 完全不匹配(IoU=0) 是强负证据; 大 S 框必须等第二帧佐证。
+                if source == "S":
+                    box_w = det[2] - det[0]
+                    box_h = det[3] - det[1]
+                    if max(box_w, box_h) <= S_AUTO_CONFIRM_MAX:
+                        # 小 S: 边缘远处小脸, 直接确认(对齐 v1 召回)
+                        confirmed = True
+                        state, reason = "CONFIRMED", "confirmed:single:small"
+                        if ev.score < self.decision.confirm:
+                            boost = self.decision.confirm - ev.score
+                            ev.soft += boost
+                            ev.score = self.decision.confirm
+                    else:
+                        # 大 S: 可能是衣物/手部误检, 不直接确认, 走 PENDING
+                        confirmed = False
+                        state, reason = "PENDING", "pending:single:large"
+                else:
+                    state, mask, reason = self.decision.decide(
+                        ev, prev_confirmed=False, matched_this_round=True)
+                    if state == "REJECT":
+                        # 证据分过低, 跳过该检测不建轨迹
+                        continue
+                    confirmed = mask
+            else:
+                # 单模型/verify 管线无分来源: 保留 v1 布尔语义
+                # (new_confirmed 默认 True, 建轨即确认), 证据对象
+                # 仅供 debug 展示与 miss 衰减使用
+                confirmed = bool(new_confirmed[di])
+                ev.soft = ev.score = 1.0 if confirmed else 0.45
+                ev.consensus_count = 1
+                state = ("CONFIRMED" if confirmed else "PENDING")
+                reason = ("confirmed:plain" if confirmed else "pending:plain")
+            if confirmed:
+                self.stats["confirms"] += 1
             box = tuple(int(round(v)) for v in det)
             self.tracks.append({
                 "id": self._next_track_id,
                 "box": box,
                 # 困难召唤低置信ROI命中建pending轨迹: 不打码, 等二次确认
-                "confirmed": bool(new_confirmed[di]),
+                "confirmed": confirmed,
                 "first_frame": frame_idx,
                 "first_box": box,
                 "misses": 0,
@@ -2624,6 +3416,12 @@ class FaceProcessor:
                 # 创建来源(X=立体互证/R=困难召回ROI): R复燃会持续
                 # 再生产pending, 不得参与强制检测窗口
                 "created_source": debug_sources[di],
+                # ---- v2 evidence 字段 ----
+                "evidence": ev,
+                "ev_state": state,
+                "ev_reason": reason,
+                "confirm_frame": frame_idx if confirmed else None,
+                "release_frame": None,
             })
             self._next_track_id += 1
 
@@ -2755,6 +3553,8 @@ class FaceProcessor:
                        or self._pending_force_detect
                        or self._single_force_detect)
         if need_detect:
+            # v2 统计: 实际执行检测的轮数
+            self.stats["det_rounds"] += 1
             if gray is None:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             # 本轮是否烧misses: 常规周期/冷启动/burst/跟踪失败复检都算;
@@ -2809,6 +3609,8 @@ class FaceProcessor:
                         self.detector, img, raw_cands, dets, self.dual_iou,
                         roi_detector=self.roi_detector)
                     self.detector.last_candidates = single_candidates
+                    # v2 统计: ROI困难召回命中数
+                    self.stats["roi_dets"] += len(hard_hits)
                     for box, roi_conf in hard_hits:
                         if any(self._iou(box, existing) >= 0.35 for existing in dets):
                             continue
@@ -3178,6 +3980,21 @@ def _create_face_detector(face_model, model_dir, face_size, face_conf, use_gpu,
         log(f"  [人脸] YOLO11+SCRFD-{scrfd_model} 严格双模型共识 "
             f"(输入{face_size}, SCRFD五点拓扑={scrfd_landmark_filter}, "
             f"SCRFD后端={scrfd.backend})")
+    elif face_model == "yolov8+mogface":
+        mogface = MogFaceDetector(
+            model_dir=model_dir, input_size=face_size, conf=face_conf,
+            device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
+        detector = DualFaceDetector(
+            YOLOFaceDetector(model_dir=model_dir, yolo_size=face_size, use_gpu=use_gpu),
+            mogface, name_a="YOLOv8", name_b="MogFace-large")
+        log(f"  [人脸] YOLOv8+MogFace-large 双模型共识 "
+            f"(输入{face_size}, MogFace后端={mogface.backend})")
+    elif face_model == "mogface":
+        detector = MogFaceDetector(
+            model_dir=model_dir, input_size=face_size, conf=face_conf,
+            device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
+        log(f"  [人脸] MogFace-large (输入{face_size}, "
+            f"conf={face_conf}, 后端={detector.backend})")
     elif face_model == "scrfd":
         detector = make_scrfd()
         log(f"  [人脸] SCRFD-{scrfd_model} (输入{face_size}, "
@@ -3242,8 +4059,12 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
                   hard_face_roi_size=HARD_FACE_ROI_SIZE,
-                  hard_face_full_scan=False,
-                  hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
+                  ev_confirm=0.65, ev_release=0.30, ev_reject=0.35,
+                  ev_decay=0.75, ev_weights=None,
+                  hand_protect=False, hand_backend="yolo",
+                  hand_model="models/hand_yolov8n.pt", hand_conf=0.25,
+                  hand_iou_reject=0.7, hand_downscale=1,
+                  hand_center_ratio=0.6, hand_expand=1.0):
     """流式管道: ffmpeg解码(rawvideo pipe) → Python处理 → ffmpeg编码, 全程0磁盘IO。
 
     三级流水线(读帧线程 → 主线程处理 → 写帧线程), 解码/编码与 Python 处理并行,
@@ -3285,6 +4106,21 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         face_model, model_dir, face_size, face_conf, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_landmark_filter, log)
+    # 手部保护: 实例化 HandDetector(每帧检测手部, 用于排斥遮罩 + 误检拒绝)
+    hand_detector = None
+    if hand_protect:
+        try:
+            hand_detector = HandDetector(hand_model, conf=hand_conf,
+                                         iou=0.45, device="auto",
+                                         downscale=hand_downscale)
+            log(f"  [手部保护] 已加载 HandDetector: {hand_model} "
+                f"(conf={hand_conf}, iou_reject={hand_iou_reject}, "
+                f"中心保护比={hand_center_ratio}, expand={hand_expand}"
+                + ("" if hand_center_ratio >= 1.0
+                   else ", 边缘手部框忽略)"))
+        except Exception as e:
+            log(f"  [警告] 手部保护初始化失败({e}), 已禁用")
+            hand_detector = None
     stereo_split = (_is_dual_fisheye(w, h, fisheye_dual)
                     and isinstance(fd, DualFaceDetector))
     if stereo_split:
@@ -3293,8 +4129,10 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         log(f"  [双鱼眼] 左右独立检测 + 低分互证 "
             f"(每目输入={face_size}, 低分候选>={fd._stereo_low_conf:.2f}, "
             f"高分增量={STEREO_HIGH_MARGIN:.2f}{batch_label})")
+    # DualFaceDetector 内部已自带 _verifier, 跳过 standalone scrfd_verifier
     scrfd_verifier = _create_scrfd_verifier(
-        scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
+        scrfd_verify and face_on and not isinstance(fd, DualFaceDetector),
+        face_model, model_dir, face_size, use_gpu,
         scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
         scrfd_conf, scrfd_iou, scrfd_keep_conf,
         scrfd_landmark_filter, log)
@@ -3328,7 +4166,10 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                                   max_rois=hard_face_max_rois,
                                   roi_size=hard_face_roi_size)
                                                 if hard_face_recall else None),
-                              roi_detector=roi_detector) if face_on else None
+                              roi_detector=roi_detector,
+                              ev_confirm=ev_confirm, ev_release=ev_release,
+                              ev_reject=ev_reject, ev_decay=ev_decay,
+                              ev_weights=ev_weights) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
             f"(有人检测间隔={face_proc.detect_int}, "
@@ -3511,6 +4352,9 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
     _PIPE_TIMEOUT = 5  # 秒, 队列超时阈值
     frame_buffer = []
     timing_snapshot = _model_timing_snapshot((fd, scrfd_verifier))
+    # 手部检测降频: 与人脸 detect_int 对齐, 中间帧复用上一帧 hand_boxes
+    last_hand_boxes = None
+    last_hand_frame = -999
 
     def _enqueue_image(image):
         nonlocal encoder_finished_early
@@ -3568,13 +4412,48 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                     # np.frombuffer(raw_bytes) 是只读视图；只在人脸帧需要打码时
                     # 才复制为可写数组，空场景仍保持零拷贝。
                     img = _ensure_writable_frame(img)
+                    # 手部保护: 与人脸 detect_int 对齐降频, 中间帧复用
+                    # 上一帧 hand_boxes(手在帧间位移小, 无需逐帧重检)
+                    if hand_detector and (frame_idx - last_hand_frame
+                                          >= face_proc.detect_int):
+                        hand_boxes = hand_detector.detect(img)
+                        # 中央区域保护: 边缘手部框(广角畸变区易误检)直接丢弃,
+                        # 不参与排斥遮罩与误检拒绝; 双鱼眼按左右目各自光心
+                        # 分别取中心区(整图单中心会误保拼缝边缘区、误丢目心区)
+                        hand_boxes = filter_center_boxes(
+                            hand_boxes, img.shape[1], img.shape[0],
+                            hand_center_ratio,
+                            dual=_is_dual_fisheye(img.shape[1],
+                                                  img.shape[0],
+                                                  fisheye_dual))
+                        last_hand_boxes = hand_boxes
+                        last_hand_frame = frame_idx
+                    else:
+                        hand_boxes = last_hand_boxes
+                else:
+                    hand_boxes = None
                 for (x1, y1, x2, y2) in faces:
                     bw, bh = x2 - x1, y2 - y1
-                    heavy_mosaic(img, int(x1 - FACE_EXPAND * bw),
-                                 int(y1 - FACE_EXPAND * bh),
-                                 int(x2 + FACE_EXPAND * bw),
-                                 int(y2 + FACE_EXPAND * bh),
-                                 FACE_CELLS, FACE_SIGMA)
+                    # 先钳位到图像内: dual-mirror 镜像框可越界(跨缝人脸 x1-mid<0
+                    # 或 x2+mid>w), 贴边脸扩展框为负; hand_exclude_mask 按传入
+                    # 坐标建 (bh,bw) 遮罩, 必须与 heavy_mosaic 钳位后的实际 ROI
+                    # 尺寸一致, 否则布尔索引形状不匹配崩溃
+                    ih, iw = img.shape[:2]
+                    ex1 = max(0, int(x1 - FACE_EXPAND * bw))
+                    ey1 = max(0, int(y1 - FACE_EXPAND * bh))
+                    ex2 = min(iw, int(x2 + FACE_EXPAND * bw))
+                    ey2 = min(ih, int(y2 + FACE_EXPAND * bh))
+                    # 误检拒绝: 原框基本整框是手 → 整框跳过不打码
+                    if (hand_boxes is not None and hand_iou_reject > 0
+                            and max_hand_iou((x1, y1, x2, y2), hand_boxes)
+                            >= hand_iou_reject):
+                        continue
+                    # 排斥遮罩: 手部像素保留原图, 绝对不被马赛克
+                    exclude = (hand_exclude_mask(ex1, ey1, ex2, ey2, hand_boxes,
+                                                  expand=hand_expand)
+                               if hand_boxes else None)
+                    heavy_mosaic(img, ex1, ey1, ex2, ey2,
+                                 FACE_CELLS, FACE_SIGMA, exclude=exclude)
                 if debug:
                     if raw_debug and face_proc.last_raw_debug_faces:
                         # 原始候选可能没有进入打码，此时 pipe 帧仍是只读视图。
@@ -3667,231 +4546,53 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
         "frames_with_face": frames_with_face,
         "total_face_detections": total_face,
         "duration_seconds": round(elapsed, 2),
+        "v2_stats": _v2_stats_snapshot(face_proc, fd),
     }
 
 
-def _process_files(src, dst, face_on, model_dir, face_size,
-                   face_int, face_empty_int, face_conf, face_model, keep_tmp, force_h264, use_gpu,
-                   frame_skip, fisheye, fisheye_strength, fisheye_device,
-                   fisheye_downscale, fisheye_dual, fisheye_crop, log,
-                   scrfd_verify=False, scrfd_conf=0.3, scrfd_iou=0.3, scrfd_keep_conf=0.35,
-                   dual_iou=0.2, scrfd_model="10g", scrfd_device="auto",
-                   scrfd_nms=0.4, scrfd_gpu_id=0, dual_mirror=False,
-                   stereo_batch=False,
-                   face_grace=FACE_GRACE, face_smooth=FACE_BOX_SMOOTH,
-                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
-                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
-                   hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
-                   hard_face_min_size=HARD_FACE_MIN_SIZE,
-                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
-                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
-                   hard_face_roi_size=HARD_FACE_ROI_SIZE,
-                   hard_face_full_scan=False,
-                   hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
-    """文件模式: ffmpeg抽帧JPEG → 打码 → 重新编码。
+def _v2_stats_snapshot(face_proc, detector):
+    """v2 统计快照: FaceProcessor 计数器 + 检测器 10g 复核调用次数。
 
-    frame_skip 控制"每隔多少帧抽一帧"(1=逐帧, 2=隔1抽1提速2x)。
-    跳帧时输出帧率同步降低(fps/frame_skip), 保持视频时长不变。
+    confirm_latency_avg/p95 从 confirm_latencies(pending→确认的
+    frame_idx−first_frame)汇总; 检测器无 verify_calls 属性时省略该键
+    (main 打印时只打 verify_hits)。
     """
-    tmp = tempfile.mkdtemp(prefix="vmb_")
-    fin, fout = os.path.join(tmp, "in"), os.path.join(tmp, "out")
-    os.makedirs(fin)
-    os.makedirs(fout)
-    t0 = time.time()
-    fps = get_fps(src)
-    w, h, _, _ = get_video_info(src)
-
-    # 鱼眼裁剪: 计算输出尺寸
-    if fisheye and 0 < fisheye_crop < 1.0:
-        # 用 dummy 帧探测 fisheye_undistort 的实际输出尺寸
-        _probe = fisheye_undistort(np.zeros((h, w, 3), dtype=np.uint8),
-                                   fisheye_strength, fisheye_device,
-                                   downscale=fisheye_downscale,
-                                   dual=fisheye_dual,
-                                   crop=fisheye_crop)
-        out_h, out_w = _probe.shape[:2]
-        out_w = out_w // 2 * 2
-        out_h = out_h // 2 * 2
-        log(f"  [鱼眼] 裁剪边缘: crop={fisheye_crop}, 输出 {out_w}x{out_h} (原 {w}x{h})")
-    elif fisheye_crop != 1.0 and not fisheye:
-        log(f"  [警告] --fisheye-crop 需要 --fisheye 同时启用, 已忽略")
-        out_w, out_h = w, h
+    if face_proc is None:
+        return None
+    stats = dict(face_proc.stats)
+    latencies = sorted(float(x) for x in stats.pop("confirm_latencies", []) or [])
+    if latencies:
+        avg = sum(latencies) / len(latencies)
+        p95 = latencies[min(len(latencies) - 1, int(0.95 * len(latencies)))]
     else:
-        out_w, out_h = w, h
+        avg = p95 = 0.0
+    stats["confirm_latency_avg"] = round(avg, 2)
+    stats["confirm_latency_p95"] = round(p95, 2)
+    verify_calls = getattr(detector, "verify_calls", None)
+    if verify_calls is not None:
+        stats["verify_calls"] = verify_calls
+    return stats
 
-    log(f"  [文件模式] 抽帧: {src}" + (f" (每{frame_skip}帧抽1帧,提速约{frame_skip}x)" if frame_skip > 1 else ""))
-    extract_cmd = ["ffmpeg", "-y", "-i", src, "-q:v", "2"]
-    if frame_skip > 1:
-        extract_cmd += ["-vf", f"select=not(mod(n\\,{frame_skip})),setpts=N/FRAME_RATE/TB"]
-    extract_cmd += [os.path.join(fin, "frame_%05d.jpg")]
-    r = _run(extract_cmd)
-    if r.returncode != 0:
-        log("  [错误] ffmpeg 抽帧失败: " + r.stderr[-300:])
-        shutil.rmtree(tmp, ignore_errors=True)
-        return False
-    frames = sorted(f for f in os.listdir(fin) if f.endswith(".jpg"))
-    log(f"  共 {len(frames)} 帧")
 
-    fd = _create_face_detector(
-        face_model, model_dir, face_size, face_conf, use_gpu,
-        scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
-        scrfd_landmark_filter, log)
-    stereo_split = (_is_dual_fisheye(w, h, fisheye_dual)
-                    and isinstance(fd, DualFaceDetector))
-    if stereo_split:
-        fd.enable_stereo_split(True, batch=stereo_batch)
-        batch_label = ", 左右目批量推理" if fd._stereo_batch else ""
-        log(f"  [双鱼眼] 左右独立检测 + 低分互证 "
-            f"(每目输入={face_size}, 低分候选>={fd._stereo_low_conf:.2f}, "
-            f"高分增量={STEREO_HIGH_MARGIN:.2f}{batch_label})")
-    scrfd_verifier = _create_scrfd_verifier(
-        scrfd_verify and face_on, face_model, model_dir, face_size, use_gpu,
-        scrfd_model, scrfd_device, scrfd_nms, scrfd_gpu_id,
-        scrfd_conf, scrfd_iou, scrfd_keep_conf,
-        scrfd_landmark_filter, log)
-    # 困难召唤: 创建专用轻量 ROI 检测器(SCRFD-2.5g@320, 与主检测YOLOv8异构,
-    # YOLO的系统性盲区SCRFD未必盲, 提供真正独立的第二意见)
-    roi_detector = None
-    if hard_face_recall and face_on:
-        try:
-            roi_detector = SCRFDFaceDetector(
-                model_dir=model_dir, model="2.5g",
-                input_size=hard_face_roi_size, conf=hard_face_conf,
-                device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
-            # 固定batch=3变体: 每帧全部ROI合并一次推理(缺失时自动逐张)
-            roi_detector.prepare_batch(3)
-            log(f"  [困难召唤] ROI二检: SCRFD-2.5g@{roi_detector.input_size}px "
-                f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf}, "
-                f"命中一律建pending轨迹, D/V/X二次证据升级)")
-        except Exception as exc:
-            log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
-            roi_detector = None
-    face_proc = FaceProcessor(fd, detect_int=face_int,
-                              empty_detect_int=face_empty_int, conf=face_conf,
-                              scrfd_verifier=scrfd_verifier, dual_iou=dual_iou,
-                              grace=face_grace, box_smooth=face_smooth,
-                              backfill_frames=face_backfill,
-                              burst_frames=face_burst,
-                              hard_face_recall=(HardFaceRecall(
-                                  conf=hard_face_conf,
-                                  min_size=hard_face_min_size,
-                                  roi_scale=hard_face_roi_scale,
-                                  max_rois=hard_face_max_rois,
-                                  roi_size=hard_face_roi_size)
-                                                if hard_face_recall else None),
-                              roi_detector=roi_detector) if face_on else None
-    if face_proc is not None:
-        log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
-            f"(有人检测间隔={face_proc.detect_int}, "
-            f"无人扫描间隔={face_proc.empty_detect_int}, "
-            f"向前补码={face_proc.backfill_frames}帧, "
-            f"变化突检={face_proc.burst_frames}帧, "
-            f"丢轨主动扫描保持={face_proc.active_hold}帧, "
-            f"单帧保活={face_proc.visible_hold}帧, "
-            f"grace={face_proc.grace}检测周期, smooth={face_proc.box_smooth})")
-    backfill_buffer_size = face_proc.backfill_frames if face_proc is not None else 0
-    total_face = 0
-    frames_with_face = 0
-    frame_buffer = []
-    timing_snapshot = _model_timing_snapshot((fd, scrfd_verifier))
-
-    for i, fn in enumerate(frames, 1):
-        img = cv2.imread(os.path.join(fin, fn))
-        if img is None:
-            continue
-        # 鱼眼去畸变
-        if fisheye:
-            img = fisheye_undistort(img, fisheye_strength, fisheye_device,
-                                    downscale=fisheye_downscale,
-                                    dual=fisheye_dual,
-                                    crop=fisheye_crop)
-        faces = []
-        if face_on:
-            faces = face_proc.process(img, i, raw_debug=raw_debug)
-            # 双鱼眼镜像打码: 一侧检出人脸 → 另一侧同步打码
-            if dual_mirror and fisheye and fisheye_dual != "false":
-                fh, fw = img.shape[:2]
-                mid = fw // 2
-                if mid >= 2 and fw >= 2 * fh:
-                    mirrored = list(faces)
-                    for (x1, y1, x2, y2) in faces:
-                        cx = (x1 + x2) / 2
-                        if cx < mid:
-                            mirrored.append((x1 + mid, y1, x2 + mid, y2))
-                        else:
-                            mirrored.append((x1 - mid, y1, x2 - mid, y2))
-                    faces = mirrored
-            for (x1, y1, x2, y2) in faces:
-                bw, bh = x2 - x1, y2 - y1
-                ex1, ey1 = int(x1 - FACE_EXPAND * bw), int(y1 - FACE_EXPAND * bh)
-                ex2, ey2 = int(x2 + FACE_EXPAND * bw), int(y2 + FACE_EXPAND * bh)
-                heavy_mosaic(img, ex1, ey1, ex2, ey2, FACE_CELLS, FACE_SIGMA)
-            if debug:
-                if raw_debug:
-                    draw_raw_face_debug(img, face_proc.last_raw_debug_faces)
-                draw_face_debug_scores(img, face_proc.last_debug_faces)
-            total_face += len(faces)
-            if faces:
-                frames_with_face += 1
-        frame_buffer.append({"frame_idx": i, "image": img, "filename": fn})
-        if face_on and face_proc.last_backfill_events:
-            total_face += apply_face_backfill(
-                frame_buffer, face_proc.last_backfill_events)
-        if len(frame_buffer) > backfill_buffer_size:
-            oldest = frame_buffer.pop(0)
-            cv2.imwrite(
-                os.path.join(fout, oldest["filename"]), oldest["image"],
-                [cv2.IMWRITE_JPEG_QUALITY, 100])
-        if i % 50 == 0 or i == len(frames):
-            model_timing, timing_snapshot = _format_model_timing(
-                (fd, scrfd_verifier), timing_snapshot)
-            log(f"    [{i}/{len(frames)}] 人脸帧={len(faces)} "
-                f"elapsed={time.time()-t0:.0f}s | {model_timing}")
-
-    for item in frame_buffer:
-        cv2.imwrite(
-            os.path.join(fout, item["filename"]), item["image"],
-            [cv2.IMWRITE_JPEG_QUALITY, 100])
-
-    log("  合成视频...")
-    hw = find_hw_encoder(family="h264" if force_h264 else "hevc")
-    out_fps = fps / frame_skip  # 跳帧时帧率同步降低
-    vcmd = ["ffmpeg", "-y", "-framerate", str(out_fps), "-i", os.path.join(fout, "frame_%05d.jpg")]
-    if has_audio(src):
-        vcmd += ["-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
-    if hw:
-        vcmd += ["-c:v", hw, "-b:v", str(hw_bitrate(out_w, out_h, fps, hw, get_bitrate(src)))]
-        if hw.startswith(("hevc", "h265")):
-            vcmd += ["-tag:v", "hvc1"]
-        log(f"  [编码] 硬件: {hw}")
-    else:
-        # CPU x264: preset veryfast(原slow太慢) + threads 0(全核) + crf 20(原18偏慢)
-        vcmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                 "-threads", "0"]
-        log("  [编码] libx264 veryfast(CPU多核)")
-    vcmd += ["-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart", dst]
-    r = _run(vcmd)
-    if r.returncode != 0:
-        log("  [错误] ffmpeg 合成失败: " + r.stderr[-300:])
-        shutil.rmtree(tmp, ignore_errors=True)
-        return {"success": False, "total_frames": len(frames),
-                "frames_with_face": frames_with_face,
-                "total_face_detections": total_face,
-                "duration_seconds": round(time.time() - t0, 2)}
-    if not keep_tmp:
-        shutil.rmtree(tmp, ignore_errors=True)
-    final_model_timing, _ = _format_model_timing((fd, scrfd_verifier))
-    log(f"  [模型性能汇总] {final_model_timing}")
-    _log_scrfd_timing((fd, scrfd_verifier), log)
-    elapsed = time.time() - t0
-    log(f"  [完成] {dst}  耗时 {elapsed:.0f}s  人脸帧次={total_face}  有人脸帧={frames_with_face}")
-    return {
-        "success": True,
-        "total_frames": len(frames),
-        "frames_with_face": frames_with_face,
-        "total_face_detections": total_face,
-        "duration_seconds": round(elapsed, 2),
-    }
+def _print_v2_evidence_stats(result):
+    """main() 处理完成后打印 v2 Evidence 决策统计汇总(单视频)。"""
+    stats = result.get("v2_stats")
+    if not stats:
+        return
+    total = result.get("total_frames", 0)
+    elapsed = result.get("duration_seconds", 0.0) or 0.0
+    fps = (total / elapsed) if elapsed > 0 else 0.0
+    verify_part = (f" verify_calls={stats['verify_calls']}"
+                   if "verify_calls" in stats else "")
+    print(f"[v2-evidence-stats] det_rounds={stats.get('det_rounds', 0)} "
+          f"verify_hits={stats.get('verify_hits', 0)} "
+          f"roi_dets={stats.get('roi_dets', 0)}{verify_part}")
+    print(f"  confirms={stats.get('confirms', 0)} "
+          f"releases={stats.get('releases', 0)} "
+          f"reconfirms={stats.get('reconfirms', 0)} "
+          f"confirm_latency_avg={stats.get('confirm_latency_avg', 0.0)} "
+          f"p95={stats.get('confirm_latency_p95', 0.0)}")
+    print(f"  masked_frames={total} fps={fps:.2f}")
 
 
 def process_video(src, dst, face_on=True, model_dir=None,
@@ -3914,50 +4615,45 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
                   hard_face_roi_size=HARD_FACE_ROI_SIZE,
-                  hard_face_full_scan=False,
-                  hard_face_full_scan_conf=HARD_FACE_FULL_SCAN_CONF):
+                  ev_confirm=0.65, ev_release=0.30, ev_reject=0.35,
+                  ev_decay=0.75, ev_weights=None,
+                  hand_protect=False, hand_backend="yolo",
+                  hand_model="models/hand_yolov8n.pt", hand_conf=0.25,
+                  hand_iou_reject=0.7, hand_downscale=1,
+                  hand_center_ratio=0.6, hand_expand=1.0):
     """处理单个视频: 人脸打码, 保留音轨。返回处理结果 dict。"""
     w, h, fps, _ = get_video_info(src)
     result = None
-    if use_pipe:
-        try:
-            result = _process_pipe(src, dst, face_on, model_dir, face_size,
-                                   face_int, face_empty_int, face_conf, face_model,
-                                   keep_tmp, force_h264, use_gpu,
-                                   frame_skip, fisheye, fisheye_strength,
-                                   fisheye_device, fisheye_downscale,
-                                   fisheye_dual, fisheye_crop, log,
-                                   scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                                   dual_iou, scrfd_model, scrfd_device,
-                                   scrfd_nms, scrfd_gpu_id, dual_mirror,
-                                   stereo_batch,
-                                   face_grace, face_smooth,
-                                   scrfd_landmark_filter, debug, raw_debug,
-                                   face_backfill, face_burst,
-                                   hard_face_recall, hard_face_conf,
-                                   hard_face_min_size, hard_face_roi_scale,
-                                   hard_face_max_rois, hard_face_roi_size,
-                                   hard_face_full_scan, hard_face_full_scan_conf)
-        except Exception as e:
-            log(f"  [警告] 管道模式失败({e}), 回退文件模式")
-    if result is None:
-        result = _process_files(src, dst, face_on, model_dir, face_size,
-                                face_int, face_empty_int, face_conf, face_model,
-                                keep_tmp, force_h264, use_gpu,
-                                frame_skip, fisheye, fisheye_strength,
-                                fisheye_device, fisheye_downscale,
-                                fisheye_dual, fisheye_crop, log,
-                                scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
-                                dual_iou, scrfd_model, scrfd_device,
-                                scrfd_nms, scrfd_gpu_id, dual_mirror,
-                                stereo_batch,
-                                face_grace, face_smooth,
-                                scrfd_landmark_filter, debug, raw_debug,
-                                face_backfill, face_burst,
-                                hard_face_recall, hard_face_conf,
-                                hard_face_min_size, hard_face_roi_scale,
-                                hard_face_max_rois, hard_face_roi_size,
-                                hard_face_full_scan, hard_face_full_scan_conf)
+    try:
+        result = _process_pipe(src, dst, face_on, model_dir, face_size,
+                               face_int, face_empty_int, face_conf, face_model,
+                               keep_tmp, force_h264, use_gpu,
+                               frame_skip, fisheye, fisheye_strength,
+                               fisheye_device, fisheye_downscale,
+                               fisheye_dual, fisheye_crop, log,
+                               scrfd_verify, scrfd_conf, scrfd_iou, scrfd_keep_conf,
+                               dual_iou, scrfd_model, scrfd_device,
+                               scrfd_nms, scrfd_gpu_id, dual_mirror,
+                               stereo_batch,
+                               face_grace, face_smooth,
+                               scrfd_landmark_filter, debug, raw_debug,
+                               face_backfill, face_burst,
+                               hard_face_recall, hard_face_conf,
+                               hard_face_min_size, hard_face_roi_scale,
+                               hard_face_max_rois, hard_face_roi_size,
+                               ev_confirm=ev_confirm, ev_release=ev_release,
+                               ev_reject=ev_reject, ev_decay=ev_decay,
+                               ev_weights=ev_weights,
+                               hand_protect=hand_protect,
+                               hand_backend=hand_backend,
+                               hand_model=hand_model, hand_conf=hand_conf,
+                               hand_iou_reject=hand_iou_reject,
+                               hand_downscale=hand_downscale,
+                               hand_center_ratio=hand_center_ratio,
+                               hand_expand=hand_expand)
+    except Exception as e:
+        log(f"  [警告] 管道模式失败({e})")
+        raise
     result["input_file"] = src
     result["output_file"] = dst
     result["fps"] = round(fps, 2)
@@ -3979,18 +4675,30 @@ def expand_inputs(inputs):
 
 
 def main():
+    # FACE_MIN_SIZE 需在 add_argument 的 default=FACE_MIN_SIZE 之前声明,
+    # 否则触发 "used prior to global declaration"
+    global FACE_MIN_SIZE, S_AUTO_CONFIRM_MAX
     ap = argparse.ArgumentParser(description="视频批量打码(仅人脸, YuNet/YOLO/SCRFD)")
     ap.add_argument("inputs", nargs="+", help="视频文件/目录/通配符")
     ap.add_argument("--out-dir", default="masked_out", help="输出目录(默认 masked_out)")
     ap.add_argument("--face-size", type=int, default=FACE_YUNET_SIZE,
                     help="人脸检测输入尺寸(默认640; YuNet/YOLO/SCRFD 均调整为32的倍数)")
+    ap.add_argument("--face-min-size", type=int, default=FACE_MIN_SIZE,
+                    help=f"人脸框最小边长(像素, 默认{FACE_MIN_SIZE})。低于该值的框直接丢弃。"
+                         f"双鱼眼远处小脸常只有10~16px, 检测置信度并不低却会被该门槛杀掉; "
+                         f"降到8~10可显著召回鱼眼边缘小脸(误检由证据引擎corroborated=False快速衰减清除)")
+    ap.add_argument("--s-confirm-max", type=int, default=S_AUTO_CONFIRM_MAX,
+                    help=f"S(单模型)候选直接确认的最大边长(像素, 默认{S_AUTO_CONFIRM_MAX})。"
+                         f"超过此值的 S 候选走 PENDING 等二次确认, 防止衣物/手部误检立即打码。"
+                         f"边缘小脸通常<=20px不受影响; 衣物/手部通常>80px会被拦截")
     ap.add_argument("--face-model", default="yunet",
                     choices=["yunet", "yolov8", "yolov8m", "yolo11", "scrfd",
-                             "yolo11+yunet", "yolov8+yolo11",
-                             "yolov8+scrfd", "yolo11+scrfd"],
+                             "mogface", "yolo11+yunet", "yolov8+yolo11",
+                             "yolov8+scrfd", "yolo11+scrfd", "yolov8+mogface"],
                     help="人脸检测模型: yunet(默认,轻量,仅opencv) / yolov8(极速) / yolov8m(高精度) / "
-                         "yolo11(最新) / scrfd(face-detect同款) / yolo11+yunet / yolov8+yolo11 / "
-                         "yolov8+scrfd / yolo11+scrfd(含+号的为严格双模型共识)")
+                         "yolo11(最新) / scrfd(face-detect同款) / mogface(WiderFace SOTA, 需mogface_large.onnx) / "
+                         "yolo11+yunet / yolov8+yolo11 / yolov8+scrfd / yolo11+scrfd / "
+                         "yolov8+mogface(含+号的为严格双模型共识)")
     ap.add_argument("--dual-iou", type=float, default=0.2, metavar="IOU",
                     help="双模型共识 IoU 阈值(默认0.2; 仅--face-model 含+号时生效; "
                          "越高越严格,越低越宽容)")
@@ -4071,14 +4779,34 @@ def main():
                     help=f"每帧最多二检的困难框数(默认{HARD_FACE_MAX_ROIS}; 防止推理爆炸)")
     ap.add_argument("--hard-face-roi-size", type=int, default=HARD_FACE_ROI_SIZE,
                     help=f"ROI二检推理尺寸(默认{HARD_FACE_ROI_SIZE}px; 比主检测小一倍提速~75%%)")
-    ap.add_argument("--hard-face-full-scan", action="store_true",
-                    help="全帧低阈值扫描: ROI检测器独立扫描全帧, 主动发现主检测遗漏的人脸(需要--hard-face-recall同时开启)")
-    ap.add_argument("--hard-face-full-scan-conf", type=float, default=HARD_FACE_FULL_SCAN_CONF,
-                    help=f"全帧扫描阈值(默认{HARD_FACE_FULL_SCAN_CONF}; 低于主检测阈值, 独立捕获漏检人脸)")
+    # ===== 手部保护(保证人手不被打码) =====
+    ap.add_argument("--hand-protect", action="store_true",
+                    help="启用手部保护: 每帧检测手部, 马赛克不覆盖手部像素, "
+                         "并拒绝整框是手的误检人脸框")
+    ap.add_argument("--hand-backend", choices=["yolo"], default="yolo",
+                    help="手部检测后端(默认 yolo; 使用 models/hand_yolov8n.pt)")
+    ap.add_argument("--hand-model", default="models/hand_yolov8n.pt",
+                    help="手部检测模型路径(默认 models/hand_yolov8n.pt)")
+    ap.add_argument("--hand-conf", type=float, default=0.25,
+                    help="手部检测置信阈值(默认0.25, 偏低以保证高召回)")
+    ap.add_argument("--hand-iou-reject", type=float, default=0.7,
+                    help="人脸框与手部框 IoU 超此值则整框跳过(误检拒绝, 默认0.7)")
+    ap.add_argument("--hand-downscale", type=int, default=1,
+                    help="手部检测降采样倍数(默认1=全分辨率; 2提速但召回略降)")
+    ap.add_argument("--hand-center-ratio", type=float, default=0.6,
+                    help="手部只保护图像中央区域(宽高各占此比例, 默认0.6; "
+                         "边缘手部框忽略不打码不受保护, 1.0=全图保护)。"
+                         "广角/鱼眼边缘畸变区手部模型易误检, 会挖空人脸马赛克或"
+                         "通过IoU拒绝整脸造成漏打")
+    ap.add_argument("--hand-expand", type=float, default=1.0,
+                    help="手部排斥遮罩外扩倍数(默认1.0=只保护手部本身; "
+                         "1.3~1.5 可覆盖手上拿的手机/杯子/遥控器等物品, 使其也不被打码; "
+                         "过大可能误保护手后方的人脸)")
     ap.add_argument("--frame-skip", type=int, default=FRAME_SKIP,
                     help="【抽帧频率】跳过间隔(默认1=逐帧; 2=隔1抽1提速2x; 3=每3帧抽1提速3x; 配合--face-int效果叠加)")
+    # 文件模式已移除(--no-pipe 保留但被忽略, 始终使用流式管道)
     ap.add_argument("--no-pipe", action="store_true",
-                    help="禁用管道模式, 强制文件模式(调试或特殊场景; 默认已启用流式管道)")
+                    help="[已弃用] 文件模式已移除, 此参数保留但被忽略(始终使用流式管道)")
     ap.add_argument("--debug", action="store_true",
                     help="显示双模型分值及来源: D=双模型确认, "
                          "S=单模型续轨, T=光流/模板跟踪")
@@ -4093,7 +4821,41 @@ def main():
     ap.add_argument("--keep-tmp", action="store_true", help="保留中间帧")
     ap.add_argument("--report", type=str, default=None,
                     help="JSON处理报告输出路径(不指定则输出到stdout)")
+    # ---- v2专有: Evidence评分 + 四态滞回决策参数 ----
+    ev = ap.add_argument_group("v2-evidence", "v2专有: Evidence评分+四态滞回决策")
+    ev.add_argument("--ev-confirm", type=float, default=0.65,
+                    help="证据分确认阈值(默认0.65; score>=此值轨迹CONFIRMED开始打码)")
+    ev.add_argument("--ev-release", type=float, default=0.30,
+                    help="证据分滞回解除阈值(默认0.30; 已确认轨迹score跌破此值解除打码)")
+    ev.add_argument("--ev-reject", type=float, default=0.35,
+                    help="建轨拒绝阈值(默认0.35; 新建轨迹score低于此值不建轨迹; R/X有0.40下限保底)")
+    ev.add_argument("--ev-decay", type=float, default=0.75,
+                    help="证据分EWMA衰减系数(默认0.75; 确认后无证据约5轮跌破release)")
+    ev.add_argument("--ev-w-yolo", type=float, default=0.25,
+                    help="YOLO系列来源权重(默认0.25)")
+    ev.add_argument("--ev-w-scrfd", type=float, default=0.25,
+                    help="SCRFD非10g来源权重(默认0.25)")
+    ev.add_argument("--ev-w-mogface", type=float, default=0.25,
+                    help="MogFace-large来源权重(默认0.25)")
+    ev.add_argument("--ev-w-10g", type=float, default=0.20,
+                    help="SCRFD-10g复核来源权重(默认0.20)")
+    ev.add_argument("--ev-w-stereo", type=float, default=0.05,
+                    help="Stereo左右互证来源权重(默认0.05)")
+    ev.add_argument("--ev-w-roi", type=float, default=0.05,
+                    help="HardROI困难召回来源权重(默认0.05)")
     args = ap.parse_args()
+
+    if args.face_min_size < 1:
+        ap.error("--face-min-size 必须 >= 1")
+    # 覆盖模块级几何过滤门槛: FACE_MIN_SIZE 被 YOLO 单张/批量检测、
+    # SCRFD 向量化过滤、以及候选尺寸过滤共 4 处引用, 运行时改全局即可全生效
+    if args.face_min_size != FACE_MIN_SIZE:
+        print(f"  [人脸] 最小框边长 FACE_MIN_SIZE: {FACE_MIN_SIZE} -> {args.face_min_size}")
+        FACE_MIN_SIZE = args.face_min_size
+    if args.s_confirm_max != S_AUTO_CONFIRM_MAX:
+        print(f"  [人脸] S直接确认最大边长 S_AUTO_CONFIRM_MAX: "
+              f"{S_AUTO_CONFIRM_MAX} -> {args.s_confirm_max}")
+        S_AUTO_CONFIRM_MAX = args.s_confirm_max
 
     if args.face_int < 1 or args.face_empty_int < 1:
         ap.error("--face-int 和 --face-empty-int 必须 >= 1")
@@ -4111,10 +4873,18 @@ def main():
         ap.error("--hard-face-max-rois 必须 >= 1")
     if not 160 <= args.hard_face_roi_size <= 640:
         ap.error("--hard-face-roi-size 必须在 160~640 之间")
-    if not 0 <= args.hard_face_full_scan_conf <= 1:
-        ap.error("--hard-face-full-scan-conf 必须在 0~1 之间")
-    if args.hard_face_full_scan and not args.hard_face_recall:
-        print("  [警告] --hard-face-full-scan 需要 --hard-face-recall 同时开启, 已忽略")
+    # v2: Evidence 决策参数校验
+    if not 0 < args.ev_confirm <= 1:
+        ap.error("--ev-confirm 必须在 (0,1] 之间")
+    if not 0 <= args.ev_release < args.ev_confirm:
+        ap.error("--ev-release 必须在 [0, --ev-confirm) 之间")
+    if not 0 <= args.ev_reject <= 1:
+        ap.error("--ev-reject 必须在 0~1 之间")
+    if not 0.5 <= args.ev_decay < 1:
+        ap.error("--ev-decay 必须在 [0.5,1) 之间")
+    ev_weights = {"yolo": args.ev_w_yolo, "scrfd": args.ev_w_scrfd,
+                  "mogface": args.ev_w_mogface, "10g": args.ev_w_10g,
+                  "stereo": args.ev_w_stereo, "roi": args.ev_w_roi}
 
     files = expand_inputs(args.inputs)
     if not files:
@@ -4140,8 +4910,6 @@ def main():
                                hard_face_roi_scale=args.hard_face_roi_scale,
                                hard_face_max_rois=args.hard_face_max_rois,
                                hard_face_roi_size=args.hard_face_roi_size,
-                               hard_face_full_scan=args.hard_face_full_scan,
-                               hard_face_full_scan_conf=args.hard_face_full_scan_conf,
                                face_conf=args.face_conf, face_model=args.face_model,
                                use_pipe=not args.no_pipe, keep_tmp=args.keep_tmp,
                                force_h264=args.force_h264, use_gpu=not args.no_gpu,
@@ -4166,8 +4934,23 @@ def main():
                                face_smooth=args.face_smooth,
                                scrfd_landmark_filter=not args.no_scrfd_landmark_filter,
                                debug=args.debug or args.debug_raw,
-                               raw_debug=args.debug_raw)
+                               raw_debug=args.debug_raw,
+                               ev_confirm=args.ev_confirm,
+                               ev_release=args.ev_release,
+                               ev_reject=args.ev_reject,
+                               ev_decay=args.ev_decay,
+                               ev_weights=ev_weights,
+                               hand_protect=args.hand_protect,
+                               hand_backend=args.hand_backend,
+                               hand_model=args.hand_model,
+                               hand_conf=args.hand_conf,
+                               hand_iou_reject=args.hand_iou_reject,
+                               hand_downscale=args.hand_downscale,
+                               hand_center_ratio=args.hand_center_ratio,
+                               hand_expand=args.hand_expand)
         reports.append(result)
+        # v2: Evidence 决策统计汇总(含 masked_frames 总帧数与 FPS)
+        _print_v2_evidence_stats(result)
         if result["success"]:
             ok += 1
     print(f"\n全部完成: {ok}/{len(files)} 成功, 输出目录: {args.out_dir}")

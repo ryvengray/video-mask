@@ -74,6 +74,7 @@ HARD_FACE_ROI_SCALE = 3.0
 HARD_FACE_MAX_ROIS = 3             # 每帧最多二检的困难框数量(防止推理爆炸)
 HARD_FACE_ROI_SIZE = 320           # ROI 二检推理尺寸(比主检测 640 小一倍, 提速~75%)
 HARD_FACE_FULL_SCAN_CONF = 0.15    # 全帧低阈值扫描置信度(低于主检测, 独立捕获遗漏人脸)
+HARD_FACE_IMMEDIATE_CONF = 0.45    # ROI二检达到该分数立即确认; 低于则建pending轨迹等二次命中
 SCRFD_ADAPTIVE_VERIFY_MARGIN = 0.15  # 新候选进入10g复核区间的分数增量
 SCRFD_ADAPTIVE_VERIFY_IOU = 0.25     # 10g复核框与候选框的最低IoU
 SCRFD_VERIFIER_MAX_SCORE_DROP = 0.02  # 复核时10g相对候选模型允许的最大分差
@@ -814,13 +815,6 @@ class DualFaceDetector:
         self._stereo_split_enabled = bool(enabled)
         self._stereo_low_conf = max(0.0, float(low_conf))
         self._stereo_batch = bool(batch)
-        if self._stereo_batch:
-            # 预加载固定batch变体(SCRFD 等固定batch模型, 左右目恒为2);
-            # YOLO 原生支持任意 batch, 无需准备
-            for det in (self._det_a, self._det_b):
-                prep = getattr(det, "prepare_batch", None)
-                if prep is not None:
-                    prep(2)
 
     @staticmethod
     def _iou(a, b):
@@ -875,7 +869,7 @@ class DualFaceDetector:
             return [self._detect_with_details(detector, img, conf)
                     for img in images]
         details_per_image = getattr(detector, "last_detection_details_batch",
-                                    None)
+                                     None)
         if not details_per_image or len(details_per_image) != len(images):
             details_per_image = [()] * len(images)
         out = []
@@ -921,7 +915,7 @@ class DualFaceDetector:
         yolo_score = float(scores[0][1])
         scrfd_score = float(scores[1][1])
         return scrfd_score + 1e-6 >= (
-                yolo_score - SCRFD_VERIFIER_MAX_SCORE_DROP)
+            yolo_score - SCRFD_VERIFIER_MAX_SCORE_DROP)
 
     def _verifier_score_consistent(self, item, verifier_score):
         """检查新人脸候选与SCRFD-10g复核分数是否一致。"""
@@ -944,7 +938,7 @@ class DualFaceDetector:
         if reference_score is None:
             return True
         return float(verifier_score) + 1e-6 >= (
-                float(reference_score) - SCRFD_VERIFIER_MAX_SCORE_DROP)
+            float(reference_score) - SCRFD_VERIFIER_MAX_SCORE_DROP)
 
     def _has_required_primary_scores(self, item):
         """2.5g组合的新轨迹必须同时得到YOLOv8和2.5g有效分数。"""
@@ -1187,16 +1181,16 @@ class DualFaceDetector:
         dets_b = [item for item in dets_b_all
                   if item["score"] is None or item["score"] >= conf]
         self.last_raw_candidates = [
-                                       {"box": item["box"], "model": self._name_a,
-                                        "score": item["score"],
-                                        "formal": item["score"] is None or item["score"] >= conf}
-                                       for item in dets_a_all
-                                   ] + [
-                                       {"box": item["box"], "model": self._name_b,
-                                        "score": item["score"],
-                                        "formal": item["score"] is None or item["score"] >= conf}
-                                       for item in dets_b_all
-                                   ]
+            {"box": item["box"], "model": self._name_a,
+             "score": item["score"],
+             "formal": item["score"] is None or item["score"] >= conf}
+            for item in dets_a_all
+        ] + [
+            {"box": item["box"], "model": self._name_b,
+             "score": item["score"],
+             "formal": item["score"] is None or item["score"] >= conf}
+            for item in dets_b_all
+        ]
 
         # 贪心匹配: 对每个 A 框找最佳 IoU 匹配的 B 框
         consensus = []
@@ -1387,7 +1381,6 @@ class SCRFDFaceDetector:
                 raise
             print(f"[人脸] [警告] SCRFD {provider_name} 初始化失败({exc})，回退 CPU")
             provider_name = "CPUExecutionProvider"
-            providers = ["CPUExecutionProvider"]
             self._sess = ort.InferenceSession(
                 model_path, options, providers=["CPUExecutionProvider"])
 
@@ -1407,13 +1400,10 @@ class SCRFDFaceDetector:
             if provider_name == "CPUExecutionProvider":
                 raise
             print(f"[人脸] [警告] SCRFD {provider_name} 预热失败({exc})，回退 CPU")
-            providers = ["CPUExecutionProvider"]
             self._sess = ort.InferenceSession(
                 model_path, options, providers=["CPUExecutionProvider"])
             self._sess.run(self._output_names, {self._input_name: dummy})
         self.backend = self._sess.get_providers()[0]
-        # 批量变体模型复用同一后端配置(见 prepare_batch)
-        self._providers = providers
         self.timing_label = f"SCRFD-{self.model}"
         # 仅统计正式视频帧；模型加载和上面的预热不计入运行时性能数据。
         self._timing = {
@@ -1423,13 +1413,6 @@ class SCRFDFaceDetector:
             "postprocess": 0.0,
         }
         self._allocate_preprocess_buffers()
-        # 固定 batch 变体会话(左右目=2 / 困难召回ROI=3): prepare_batch 惰性
-        # 加载 <stem>_bN.onnx; 无变体时批量推理自动回退逐张, 语义不变。
-        self._batch_sess = None
-        self._batch_fixed = 0
-        self._batch_input_name = None
-        self._batch_output_names = None
-        self._batch_missing = set()
 
     def _allocate_preprocess_buffers(self):
         """为固定 SCRFD 输入尺寸分配一次可复用的预处理内存。"""
@@ -1532,7 +1515,7 @@ class SCRFDFaceDetector:
             points[:, 1] - distance[:, 1],
             points[:, 0] + distance[:, 2],
             points[:, 1] + distance[:, 3],
-            ], axis=-1)
+        ], axis=-1)
 
     @staticmethod
     def _distance2kps(points, distance):
@@ -1679,114 +1662,61 @@ class SCRFDFaceDetector:
             postprocess_finished - inference_finished)
         return result
 
-    def prepare_batch(self, batch):
-        """加载固定 batch 变体模型(<stem>_bN.onnx)供 detect_batch_with_conf。
-
-        变体由 make_scrfd_batch_variants.py 生成: 输入 (N,3,?,?), 输出
-        (N, anchors, C)。一次 session.run 处理 N 张图, 省去 N-1 次推理
-        调用开销(CoreML 每次调用固定开销约 17-26ms, 与输入尺寸无关)。
-        未找到或初始化失败返回 False, 批量推理自动回退逐张, 语义不变。
-        """
-        batch = int(batch)
-        if batch <= 1:
-            return False
-        if self._batch_sess is not None:
-            return True
-        if batch in self._batch_missing:
-            return False
-        stem, _ = os.path.splitext(self.model_path)
-        variant_path = f"{stem}_b{batch}.onnx"
-        if not os.path.isfile(variant_path):
-            self._batch_missing.add(batch)
-            return False
-        try:
-            import onnxruntime as ort
-            options = ort.SessionOptions()
-            options.log_severity_level = 3
-            sess = ort.InferenceSession(variant_path, options,
-                                        providers=self._providers)
-            # 预热: 尽早暴露 CoreML/CUDA 与变体形状的兼容性问题
-            dummy = np.zeros((batch, 3, self.input_size, self.input_size),
-                             np.float32)
-            sess.run([out.name for out in sess.get_outputs()],
-                     {sess.get_inputs()[0].name: dummy})
-        except Exception as exc:
-            self._batch_missing.add(batch)
-            print(f"[人脸] [警告] SCRFD-{self.model} 批量变体加载失败"
-                  f"({os.path.basename(variant_path)}): {exc}, 批量推理回退逐张")
-            return False
-        self._batch_sess = sess
-        self._batch_fixed = batch
-        self._batch_input_name = sess.get_inputs()[0].name
-        self._batch_output_names = [out.name for out in sess.get_outputs()]
-        print(f"[人脸] SCRFD-{self.model} 批量推理变体已加载: "
-              f"{os.path.basename(variant_path)} "
-              f"(batch={batch}, 后端={sess.get_providers()[0]})")
-        return True
-
     def detect_batch_with_conf(self, images, conf=None):
         """批量检测多张同尺寸图像, 返回与 images 对齐的 [[(bbox, conf), ...], ...]。
 
-        优先使用固定 batch 变体模型(prepare_batch 加载): 一次推理跑 N 张图。
-        数量不足变体 batch 时用末图填充, 超出时分块; 无变体时回退逐张,
-        结果语义与单张路径完全一致。landmark 风险按图写入
-        last_detection_details_batch。
+        需要模型导出支持动态 batch: 每个输出首维必须等于 batch 数,
+        否则抛 ValueError 并由上层回退逐张推理(结果语义完全一致)。
+        landmark 风险按图写入 last_detection_details_batch。
         """
+        if getattr(self, "_batch_ok", True) is False:
+            raise ValueError("SCRFD 模型不支持批量推理(已缓存)")
         if not images:
             return []
         if any(img is None or img.size == 0 for img in images):
             raise ValueError("批量输入包含空图像")
-        if len(images) == 1:
-            result = self.detect_with_conf(images[0], conf)
-            self.last_detection_details_batch = [self.last_detection_details]
-            return [result]
-        if self._batch_sess is None and not self.prepare_batch(len(images)):
-            # 官方导出固定 batch=1, 直接喂 N 张必然报错; 逐张推理结果一致
-            return self._detect_batch_sequential(images, conf)
+        batch = len(images)
+        preprocess_started = time.perf_counter()
         threshold = self.conf if conf is None else float(conf)
+        blobs = np.empty((batch, 3, self.input_size, self.input_size),
+                         np.float32)
+        scales, shapes = [], []
+        for i, img in enumerate(images):
+            blob, scale = self._prepare_input(img)  # 复用单张预处理缓冲
+            blobs[i] = blob[0]
+            scales.append(scale)
+            shapes.append(img.shape[:2])
+        preprocess_finished = time.perf_counter()
+        try:
+            outputs = self._sess.run(self._output_names,
+                                     {self._input_name: blobs})
+        except Exception as exc:
+            self._batch_ok = False
+            raise ValueError(f"SCRFD 批量推理失败: {exc}") from exc
+        inference_finished = time.perf_counter()
+        # 校验输出按 batch 维组织(官方导出为 (B, N, ...)); 首维不符则
+        # 说明模型为固定 batch=1, 标记后永久回退逐张, 避免逐帧重试。
+        for out in outputs:
+            if not out.shape or out.shape[0] != batch:
+                self._batch_ok = False
+                raise ValueError(
+                    f"SCRFD 模型不支持批量推理(输出shape={out.shape}, "
+                    f"batch={batch})")
         results, details_batch = [], []
-        t_pre = t_inf = t_post = 0.0
-        for start in range(0, len(images), self._batch_fixed):
-            chunk = images[start:start + self._batch_fixed]
-            # 不足变体 batch 用末图填充到固定值(填充位结果丢弃)
-            run_images = chunk + [chunk[-1]] * (self._batch_fixed - len(chunk))
-            preprocess_started = time.perf_counter()
-            blobs = np.empty((len(run_images), 3, self.input_size,
-                              self.input_size), np.float32)
-            scales, shapes = [], []
-            for i, img in enumerate(run_images):
-                blob, scale = self._prepare_input(img)  # 复用单张预处理缓冲
-                blobs[i] = blob[0]
-                scales.append(scale)
-                shapes.append(img.shape[:2])
-            preprocess_finished = time.perf_counter()
-            outputs = self._batch_sess.run(
-                self._batch_output_names,
-                {self._batch_input_name: blobs})
-            inference_finished = time.perf_counter()
-            for i in range(len(chunk)):  # 只解码真实图, 填充位丢弃
-                h, w = shapes[i]
-                result, details = self._decode_outputs(
-                    [out[i] for out in outputs], scales[i], w, h, threshold)
-                results.append(result)
-                details_batch.append(details)
-            postprocess_finished = time.perf_counter()
-            t_pre += preprocess_finished - preprocess_started
-            t_inf += inference_finished - preprocess_finished
-            t_post += postprocess_finished - inference_finished
+        for i in range(batch):
+            h, w = shapes[i]
+            result, details = self._decode_outputs(
+                [out[i] for out in outputs], scales[i], w, h, threshold)
+            results.append(result)
+            details_batch.append(details)
         self.last_detection_details_batch = details_batch
         # 兼容单张接口的消费方: 暴露最后一张图的 details
         self.last_detection_details = details_batch[-1] if details_batch else []
-        self._record_timing(t_pre, t_inf, t_post)
-        return results
-
-    def _detect_batch_sequential(self, images, conf):
-        """无批量变体时的回退: 逐张推理(耗时由各单张调用自行统计)。"""
-        results, details_batch = [], []
-        for img in images:
-            results.append(self.detect_with_conf(img, conf))
-            details_batch.append(self.last_detection_details)
-        self.last_detection_details_batch = details_batch
+        postprocess_finished = time.perf_counter()
+        self._record_timing(
+            preprocess_finished - preprocess_started,
+            inference_finished - preprocess_finished,
+            postprocess_finished - inference_finished)
         return results
 
     def _decode_outputs(self, outputs, scale, w, h, threshold):
@@ -1974,11 +1904,9 @@ def _log_scrfd_timing(detectors, log):
         calls = stats["calls"]
         if not calls:
             continue
-        batch_info = (f" | 固定batch变体={detector._batch_fixed}"
-                      if getattr(detector, "_batch_sess", None) is not None else "")
         log(
             f"  [SCRFD性能] model={detector.model} backend={detector.backend} "
-            f"调用={calls} 平均={stats['average_ms']:.2f}ms{batch_info} | "
+            f"调用={calls} 平均={stats['average_ms']:.2f}ms | "
             f"预处理={stats['preprocess_average_ms']:.2f}ms"
             f"({stats['preprocess_ratio']:.1%}) | "
             f"ONNX推理={stats['inference_average_ms']:.2f}ms"
@@ -1996,14 +1924,16 @@ class HardFaceRecall:
     formal候选(2.5g组合下没有共识出口的)中取种子, 再对种子框 3x 放大
     的 ROI 区域用 SCRFD-2.5g 轻量模型二检: 与主检测 YOLOv8 异构,
     提供真正独立的第二意见。
-    二检命中一律建 pending 轨迹等二次命中(时间共识): 3x 放大 ROI 会
-    把小纹理放大成"脸型", 缩放催生的误检 ROI 分数可高于真脸, ROI 分数
-    本身不构成确认证据; 升级只认 D/V/X 等与缩放无关的独立证据。
+    二检结果按置信度分级: 高置信直接确认, 低置信建 pending 轨迹
+    等二次命中(时间共识), 杜绝单模型一次低分命中即永久打码。
     """
     def __init__(self, conf=HARD_FACE_CONF, min_size=HARD_FACE_MIN_SIZE,
                  edge_ratio=HARD_FACE_EDGE_RATIO, roi_scale=HARD_FACE_ROI_SCALE,
-                 max_rois=HARD_FACE_MAX_ROIS, roi_size=HARD_FACE_ROI_SIZE):
+                 max_rois=HARD_FACE_MAX_ROIS, roi_size=HARD_FACE_ROI_SIZE,
+                 immediate_conf=HARD_FACE_IMMEDIATE_CONF):
         self.conf = max(0.0, float(conf))
+        # 立即确认阈值不低于ROI二检阈值, 防止配置倒挂导致全部直接确认
+        self.immediate_conf = max(self.conf, float(immediate_conf))
         self.min_size = max(1, int(min_size))
         self.edge_ratio = min(0.49, max(0.0, float(edge_ratio)))
         self.roi_scale = max(1.0, float(roi_scale))
@@ -2060,9 +1990,9 @@ class HardFaceRecall:
         existing_dets:  已有的共识检测结果, 用于去重。
         roi_detector:   专用轻量检测器(SCRFD-2.5g@320)。
                         为 None 时回退到主检测器。
-        roi_conf:       ROI二检置信度(仅供参考/调试)。上层一律建立
-                        pending 轨迹等二次命中, 不按分数直接确认。
-                        主检测器无分数接口时为 None。
+        roi_conf:       ROI二检置信度。达到 immediate_conf 视为强证据;
+                        低于则由上层建立 pending 轨迹等二次命中。
+                        主检测器无分数接口时为 None, 按低置信处理。
         """
         height, width = img.shape[:2]
         recalled = []
@@ -2083,35 +2013,16 @@ class HardFaceRecall:
             difficult.append((score, box))
         difficult.sort(key=lambda x: x[0])
         # 只处理最困难的前 max_rois 个, 防止推理爆炸
-        rois, offsets = [], []
         for _, box in difficult[:self.max_rois]:
             x1, y1, x2, y2 = self._roi(box, width, height)
             if x2 <= x1 or y2 <= y1:
                 continue
-            rois.append(img[y1:y2, x1:x2])
-            offsets.append((x1, y1))
-        if not rois:
-            return recalled
-        target = roi_detector if roi_detector is not None else detector
-        # 全部ROI一次批量推理(固定batch变体, 不足自动填充); 不支持批量时
-        # 自动回退逐张, 每帧模型调用从 N 次降到 1 次
-        pairs_per_roi = None
-        batch_fn = getattr(target, "detect_batch_with_conf", None)
-        if batch_fn is not None and len(rois) >= 2:
-            try:
-                pairs_per_roi = batch_fn(rois, conf=self.conf)
-            except Exception:
-                pairs_per_roi = None
-        if pairs_per_roi is None or len(pairs_per_roi) != len(rois):
-            pairs_per_roi = []
-            for roi in rois:
-                if hasattr(target, "detect_with_conf"):
-                    pairs_per_roi.append(
-                        target.detect_with_conf(roi, conf=self.conf))
-                else:
-                    pairs_per_roi.append(
-                        [(b, None) for b in target.detect(roi, conf=self.conf)])
-        for (x1, y1), pairs in zip(offsets, pairs_per_roi):
+            roi = img[y1:y2, x1:x2]
+            target = roi_detector if roi_detector is not None else detector
+            if hasattr(target, "detect_with_conf"):
+                pairs = target.detect_with_conf(roi, conf=self.conf)
+            else:
+                pairs = [(b, None) for b in target.detect(roi, conf=self.conf)]
             for roi_box, roi_conf in pairs:
                 mapped = (roi_box[0] + x1, roi_box[1] + y1,
                           roi_box[2] + x1, roi_box[3] + y1)
@@ -2171,15 +2082,6 @@ class FaceProcessor:
         self._burst_remaining = 0
         self.prev_gray = None
         self._force_detect = False
-        # pending确认窗口专用强制检测标志: 与 _force_detect 分离,
-        # 窗口帧是"加餐"检测, 不烧未命中轨迹的 misses(grace语义=
-        # 漏掉的检测周期数, 不应被额外检测加速耗尽)
-        self._pending_force_detect = False
-        # 单模型候选复检专用强制检测标志(候选入回补池后下一帧立即
-        # 复检): 同为"加餐"检测, 不烧misses——否则复检链以逐帧速率
-        # 烧掉别处已确认轨迹的grace, 轨迹提前死亡(实测f2086-2097
-        # 基线整段12帧丢失)
-        self._single_force_detect = False
         self.scrfd_verifier = scrfd_verifier  # SCRFD 二次验证器(可选, --scrfd-verify 开启)
         self.dual_iou = dual_iou    # 双模型共识 IoU 阈值(仅 DualFaceDetector 使用)
         self.hard_face_recall = hard_face_recall
@@ -2447,28 +2349,18 @@ class FaceProcessor:
             # 给已确认轨迹短暂保活，避免只闪一帧。
             track["visible"] = False
             active_tracks.append(track)
-            # 跟踪失败强制复检只对已确认轨迹: pending本就不输出打码,
-            # 老pending交由常规检测间隔兜底, 防止不可跟踪的误检pending
-            # 借道这里无限期触发逐帧检测(年轻pending由创建后2帧的
-            # 强制检测窗口覆盖)。
-            if track.get("confirmed", True):
-                self._force_detect = True
+            self._force_detect = True
         self.tracks = active_tracks
 
     def _update_tracks(self, dets, gray, debug_scores=None,
                        allow_new=None, debug_sources=None, frame_idx=None,
-                       new_confirmed=None, count_misses=True):
+                       new_confirmed=None):
         """按 IoU/中心距离匹配；未匹配轨迹分别保活，不再整帧清空。
 
         new_confirmed: 与 dets 对齐的布尔列表。False 表示该检测只建立
                        pending 轨迹(困难召唤低置信ROI命中), 不打码;
                        须共识级检测命中或累计第二次命中后才确认,
                        确认时从首见帧回补打码(时间共识替代模型共识)。
-        count_misses:  本轮检测是否累计未命中轨迹的 misses。pending
-                       确认窗口等"加餐"检测帧传 False: grace 语义是
-                       漏掉的检测周期数, 额外检测不应加速轨迹死亡,
-                       否则窗口帧会把确认轨迹的存活时间从 grace*间隔
-                       压缩到 grace 帧(实测致整段人脸丢失)。
         """
         if debug_scores is None:
             debug_scores = [None] * len(dets)
@@ -2485,20 +2377,15 @@ class FaceProcessor:
             gate = self.track_dist * max(current[2] - current[0],
                                          current[3] - current[1], 1)
             for di, det in enumerate(dets):
-                # 正式检测(D/V/X)优先于R(困难召回ROI)抢占轨迹匹配:
-                # R框与X/V框常在同一位置(种子即来自该区域), 若R先抢占
-                # pending匹配, X/V命中被迫另建pending, 共识计数分裂,
-                # 二次命中升级被阻断。S(allow_new=False)仍为最低档。
-                src = debug_sources[di]
-                priority = (8.0 if allow_new[di] and src != "R"
-                            else 4.0 if allow_new[di] else 0.0)
                 overlap = self._iou(current, det)
                 if overlap >= self.track_iou:
+                    priority = 4.0 if allow_new[di] else 0.0
                     pairs.append((priority + 2.0 + overlap, ti, di))
                     continue
                 dcx, dcy = self._center(det)
                 dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
                 if dist <= gate:
+                    priority = 4.0 if allow_new[di] else 0.0
                     pairs.append((priority + 2.0 - dist / gate, ti, di))
         pairs.sort(reverse=True)
 
@@ -2517,14 +2404,11 @@ class FaceProcessor:
             alpha = self.box_smooth
             track["box"] = tuple(int(round(
                 alpha * detected[j] + (1.0 - alpha) * predicted[j]))
-                                 for j in range(4))
+                for j in range(4))
             track["misses"] = 0
             track["hits"] += 1
-            # 共识级命中计数: S(单模型续接)与R(ROI二检)命中只续框, 不构成
-            # pending升级证据。ROI二检对3x放大的同一纹理逐帧复燃是相关
-            # 证据(缩放催生的误检ROI分数可高于真脸), 无论分数高低;
-            # 升级仍需 D/V/X 命中等与缩放无关的独立证据。
-            if debug_sources[di] not in ("S", "R"):
+            # 共识级命中计数: S(单模型续接)只续框, 不构成pending升级证据
+            if debug_sources[di] != "S":
                 track["consensus_hits"] = track.get("consensus_hits", 0) + 1
             track["visible"] = True
             track["visibility_misses"] = 0
@@ -2549,14 +2433,13 @@ class FaceProcessor:
             if debug_scores[di] is not None:
                 track["debug_scores"] = debug_scores[di]
                 track["debug_source"] = debug_sources[di]
-            # pending升级只认独立证据命中(D/V/X): S单模型续接旁路会让
-            # 纹理区域的YOLO持续误检把pending误检轨迹"转正";
-            # R命中与缩放相关(3x放大ROI的分数不可信), 一律不升级。
-            consensus_hit = debug_sources[di] not in ("S", "R")
+            # pending升级只认共识级命中(D/V/X/ROI): S单模型续接旁路会
+            # 让纹理区域的YOLO持续误检把pending误检轨迹"转正"。
+            consensus_hit = debug_sources[di] != "S"
             if (not track.get("confirmed", True) and consensus_hit
                     and (new_confirmed[di]
                          or track.get("consensus_hits", 0) >= 2)):
-                # pending轨迹升级: 共识级检测命中(双模型/立体互证)或累计
+                # pending轨迹升级: 共识级检测命中(双模型/高分ROI)或累计
                 # 第二次共识级命中(时间共识)。升级后从首见帧插值回补,
                 # pending期间不打码的帧在确认时统一补上。
                 track["confirmed"] = True
@@ -2575,17 +2458,14 @@ class FaceProcessor:
 
         for ti, track in enumerate(self.tracks):
             if ti not in matched_tracks:
-                # misses只在常规检测帧累计: pending确认窗口的额外
-                # 检测是加餐, 不烧存活预算(见docstring)
-                if count_misses:
-                    track["misses"] += 1
+                track["misses"] += 1
                 if isinstance(self.detector, DualFaceDetector):
                     track["visibility_misses"] = (
-                            track.get("visibility_misses", 0) + 1)
+                        track.get("visibility_misses", 0) + 1)
                     # 只给已确认轨迹一帧保活，降低偶发检测抖动造成的闪屏；
                     # 连续丢失超过门限后仍隐藏旧框并等待重新确认。
                     track["visible"] = (
-                            track["visibility_misses"] <= self.visible_hold)
+                        track["visibility_misses"] <= self.visible_hold)
                     if track["visible"]:
                         track["debug_source"] = "H"
         # 光流已失败且当帧两个模型都无法续上的轨迹直接删除；
@@ -2594,12 +2474,6 @@ class FaceProcessor:
 
         for di, det in enumerate(dets):
             if di in matched_dets or not allow_new[di]:
-                continue
-            # R命中不与既有轨迹并存新建pending: 落在任一轨迹匹配门限
-            # 内的R框(该轨迹本帧已被正式检测占用)只会分裂该区域的共识
-            # 计数; R的价值是空白区域召回与匹配续活, 不是复制轨迹。
-            if (debug_sources[di] == "R"
-                    and self._find_matching_track(det) is not None):
                 continue
             box = tuple(int(round(v)) for v in det)
             self.tracks.append({
@@ -2621,9 +2495,6 @@ class FaceProcessor:
                 "template": self._grab_template(gray, box),
                 "debug_scores": debug_scores[di],
                 "debug_source": debug_sources[di],
-                # 创建来源(X=立体互证/R=困难召回ROI): R复燃会持续
-                # 再生产pending, 不得参与强制检测窗口
-                "created_source": debug_sources[di],
             })
             self._next_track_id += 1
 
@@ -2646,16 +2517,8 @@ class FaceProcessor:
         return None
 
     def _candidate_matches_existing_track(self, box):
-        """单模型框只允许续接附近的已确认轨迹，禁止创建新轨迹。
-
-        仅已确认轨迹算"已覆盖": pending轨迹(困难召回R/立体互证X)尚未
-        打码, 单模型候选挂着S续轨永远无法升格确认; 若把pending也当
-        已覆盖, 候选不入回补池、不触发下一帧强制复检, 检测退回常规
-        间隔, 基线本可在随后几帧拿到的V/D共识确认永远不会到来
-        (实测f1371-1386整段16帧人脸丢失)。
-        """
-        track = self._find_matching_track(box)
-        return track is not None and track.get("confirmed", True)
+        """单模型框只允许续接附近的已确认轨迹，禁止创建新轨迹。"""
+        return self._find_matching_track(box) is not None
 
     @staticmethod
     def _backfill_match_score(old_box, new_box):
@@ -2723,10 +2586,8 @@ class FaceProcessor:
             })
             added = True
         # 单模型已经看到疑似人脸时，下一帧立即复检，而不是继续等待空场景间隔。
-        # 用独立的加餐标志(不烧misses): 复检链逐帧运行时, 别处未命中的
-        # 已确认轨迹不应以逐帧速率耗尽grace。
         if added:
-            self._single_force_detect = True
+            self._force_detect = True
 
     def process(self, img, frame_idx, raw_debug=False):
         gray = None
@@ -2751,21 +2612,11 @@ class FaceProcessor:
         interval = self.detect_int if active_scene else self.empty_detect_int
         need_detect = (((frame_idx - 1) % interval == 0)
                        or cold_start or self._force_detect
-                       or self._burst_remaining > 0
-                       or self._pending_force_detect
-                       or self._single_force_detect)
+                       or self._burst_remaining > 0)
         if need_detect:
             if gray is None:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            # 本轮是否烧misses: 常规周期/冷启动/burst/跟踪失败复检都算;
-            # pending确认窗口与单模型候选复检的加餐帧不算
-            # (grace=漏检周期数, 不是帧数)
-            count_misses = (((frame_idx - 1) % interval == 0)
-                            or cold_start or self._force_detect
-                            or self._burst_remaining > 0)
             self._force_detect = False
-            self._pending_force_detect = False
-            self._single_force_detect = False
             if self._burst_remaining > 0:
                 self._burst_remaining -= 1
             # 双模型共识: 两模型同时检测, IoU 匹配一致才保留
@@ -2791,6 +2642,7 @@ class FaceProcessor:
                 new_confirmed = [item.get("source", "D") != "X"
                                  for item in dual_dets]
                 debug_sources = [item.get("source", "D") for item in dual_dets]
+                immediate_hits = []
                 if self.hard_face_recall is not None:
                     raw_cands = list(self.detector.last_raw_candidates)
                     # 单模型formal候选并入种子池: 2.5g组合下它们没有共识
@@ -2815,20 +2667,25 @@ class FaceProcessor:
                         dets.append(box)
                         debug_scores.append((("HardROI", roi_conf),))
                         allow_new.append(True)
-                        # R命中一律建pending轨迹: 3x放大ROI会把小纹理放大成
-                        # "脸型", 实测缩放催生的误检ROI分数(0.53)反高于真脸
-                        # (0.38), 没有任何分数阈值能区分, ROI分数本身不构成
-                        # 确认证据。升级只认 D/V/X(双模型/立体互证/10g复核)
-                        # 等与缩放无关的独立证据。
-                        new_confirmed.append(False)
+                        # ROI二检分级: 3x放大后仍达立即确认阈值 → 证据等效
+                        # formal候选直接打码; 低置信 → pending轨迹等二次命中,
+                        # 杜绝单模型一次低分命中即永久打码的误检路径。
+                        immediate = (roi_conf is not None and
+                                     roi_conf >= self.hard_face_recall.immediate_conf)
+                        new_confirmed.append(immediate)
+                        if immediate:
+                            immediate_hits.append({
+                                "box": box,
+                                "scores": (("HardROI", roi_conf),)})
                         debug_sources.append("R")
-                # 回补只由已确认证据触发: X pending与ROI命中(R一律
-                # pending)都不具备回补资格。
+                # 回补只由已确认证据触发: X pending与低分ROI命中不具备
+                # 回补资格, immediate ROI命中视同确认结果。
                 confirmed_results = [
                     item for item, ok in zip(dual_dets, new_confirmed) if ok]
+                confirmed_results += immediate_hits
                 self._update_backfill_candidates(
                     frame_idx, confirmed_results, single_candidates)
-                # pending命中(X/ROI)不计入人数变化, 避免误检触发
+                # pending命中(X/低分ROI)不计入人数变化, 避免误检触发
                 # burst逐帧自持
                 detection_count = len(dets) - sum(
                     1 for ok in new_confirmed if not ok)
@@ -2868,8 +2725,7 @@ class FaceProcessor:
             self._update_tracks(
                 dets, gray, debug_scores,
                 allow_new=allow_new, debug_sources=debug_sources,
-                frame_idx=frame_idx, new_confirmed=new_confirmed,
-                count_misses=count_misses)
+                frame_idx=frame_idx, new_confirmed=new_confirmed)
             if (self._last_detection_count is not None
                     and detection_count != self._last_detection_count
                     and self._burst_remaining == 0):
@@ -2881,19 +2737,10 @@ class FaceProcessor:
                 self._active_hold_remaining -= 1
         elif not self.tracks and self._active_hold_remaining > 0:
             self._active_hold_remaining -= 1
-        # pending轨迹创建后前2帧强制检测: 把二次确认窗口压缩到1帧,
-        # 真脸几乎无感。仅X(独立证据创建)的pending参与: R pending由
-        # ROI复燃逐帧再生产, 其窗口会让检测频率自我膨胀——未命中的
-        # 已确认轨迹以逐帧速率烧grace提前死亡, S续轨救援随之消失,
-        # 人脸整段丢失(实测79帧)。超过窗口的pending回归常规检测间隔,
-        # 误检pending在grace内自然死亡。
-        if any(not track.get("confirmed", True)
-               and track.get("created_source") != "R"
-               and frame_idx is not None
-               and track.get("first_frame") is not None
-               and frame_idx - track["first_frame"] <= 2
-               for track in self.tracks):
-            self._pending_force_detect = True
+        # pending轨迹存在时强制下帧检测: 把二次确认窗口压缩到1帧,
+        # 真脸几乎无感; 误检pending则会在grace内快速死亡并停止消耗ROI推理
+        if any(not track.get("confirmed", True) for track in self.tracks):
+            self._force_detect = True
         self.last_faces = [
             track["box"] for track in self.tracks
             if track.get("confirmed", True) and track.get("visible", True)]
@@ -3039,9 +2886,9 @@ def nvenc_available():
 
     encoders = _run(["ffmpeg", "-hide_banner", "-encoders"])
     _NVENC_AVAILABLE = (
-            encoders.returncode == 0
-            and "h264_nvenc" in encoders.stdout
-            and _hw_encoder_is_usable("h264_nvenc")
+        encoders.returncode == 0
+        and "h264_nvenc" in encoders.stdout
+        and _hw_encoder_is_usable("h264_nvenc")
     )
     return _NVENC_AVAILABLE
 
@@ -3238,6 +3085,7 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                   scrfd_landmark_filter=True, debug=False, raw_debug=False,
                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
                   hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                  hard_face_immediate_conf=HARD_FACE_IMMEDIATE_CONF,
                   hard_face_min_size=HARD_FACE_MIN_SIZE,
                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
@@ -3307,11 +3155,10 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                 model_dir=model_dir, model="2.5g",
                 input_size=hard_face_roi_size, conf=hard_face_conf,
                 device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
-            # 固定batch=3变体: 每帧全部ROI合并一次推理(缺失时自动逐张)
-            roi_detector.prepare_batch(3)
             log(f"  [困难召唤] ROI二检: SCRFD-2.5g@{roi_detector.input_size}px "
                 f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf}, "
-                f"命中一律建pending轨迹, D/V/X二次证据升级)")
+                f"立即确认>={hard_face_immediate_conf}, "
+                f"低于建pending轨迹等二次命中)")
         except Exception as exc:
             log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
             roi_detector = None
@@ -3323,11 +3170,12 @@ def _process_pipe(src, dst, face_on, model_dir, face_size,
                               burst_frames=face_burst,
                               hard_face_recall=(HardFaceRecall(
                                   conf=hard_face_conf,
+                                  immediate_conf=hard_face_immediate_conf,
                                   min_size=hard_face_min_size,
                                   roi_scale=hard_face_roi_scale,
                                   max_rois=hard_face_max_rois,
                                   roi_size=hard_face_roi_size)
-                                                if hard_face_recall else None),
+                                  if hard_face_recall else None),
                               roi_detector=roi_detector) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
@@ -3682,6 +3530,7 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                    scrfd_landmark_filter=True, debug=False, raw_debug=False,
                    face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
                    hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                   hard_face_immediate_conf=HARD_FACE_IMMEDIATE_CONF,
                    hard_face_min_size=HARD_FACE_MIN_SIZE,
                    hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                    hard_face_max_rois=HARD_FACE_MAX_ROIS,
@@ -3758,11 +3607,10 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                 model_dir=model_dir, model="2.5g",
                 input_size=hard_face_roi_size, conf=hard_face_conf,
                 device=scrfd_device, gpu_id=scrfd_gpu_id, use_gpu=use_gpu)
-            # 固定batch=3变体: 每帧全部ROI合并一次推理(缺失时自动逐张)
-            roi_detector.prepare_batch(3)
             log(f"  [困难召唤] ROI二检: SCRFD-2.5g@{roi_detector.input_size}px "
                 f"(上限{hard_face_max_rois}框/帧, conf={hard_face_conf}, "
-                f"命中一律建pending轨迹, D/V/X二次证据升级)")
+                f"立即确认>={hard_face_immediate_conf}, "
+                f"低于建pending轨迹等二次命中)")
         except Exception as exc:
             log(f"  [警告] ROI二检检测器初始化失败: {exc}, 回退主检测器")
             roi_detector = None
@@ -3774,11 +3622,12 @@ def _process_files(src, dst, face_on, model_dir, face_size,
                               burst_frames=face_burst,
                               hard_face_recall=(HardFaceRecall(
                                   conf=hard_face_conf,
+                                  immediate_conf=hard_face_immediate_conf,
                                   min_size=hard_face_min_size,
                                   roi_scale=hard_face_roi_scale,
                                   max_rois=hard_face_max_rois,
                                   roi_size=hard_face_roi_size)
-                                                if hard_face_recall else None),
+                                  if hard_face_recall else None),
                               roi_detector=roi_detector) if face_on else None
     if face_proc is not None:
         log(f"  [稳定] 逐脸轨迹 + LK/模板桥接 "
@@ -3910,6 +3759,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                   face_empty_int=FACE_EMPTY_DETECT_INT,
                   face_backfill=FACE_BACKFILL, face_burst=FACE_BURST,
                   hard_face_recall=False, hard_face_conf=HARD_FACE_CONF,
+                  hard_face_immediate_conf=HARD_FACE_IMMEDIATE_CONF,
                   hard_face_min_size=HARD_FACE_MIN_SIZE,
                   hard_face_roi_scale=HARD_FACE_ROI_SCALE,
                   hard_face_max_rois=HARD_FACE_MAX_ROIS,
@@ -3935,6 +3785,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                    scrfd_landmark_filter, debug, raw_debug,
                                    face_backfill, face_burst,
                                    hard_face_recall, hard_face_conf,
+                                   hard_face_immediate_conf,
                                    hard_face_min_size, hard_face_roi_scale,
                                    hard_face_max_rois, hard_face_roi_size,
                                    hard_face_full_scan, hard_face_full_scan_conf)
@@ -3955,6 +3806,7 @@ def process_video(src, dst, face_on=True, model_dir=None,
                                 scrfd_landmark_filter, debug, raw_debug,
                                 face_backfill, face_burst,
                                 hard_face_recall, hard_face_conf,
+                                hard_face_immediate_conf,
                                 hard_face_min_size, hard_face_roi_scale,
                                 hard_face_max_rois, hard_face_roi_size,
                                 hard_face_full_scan, hard_face_full_scan_conf)
@@ -4063,6 +3915,10 @@ def main():
                     help="启用困难脸ROI二检：对小脸/边缘候选放大区域后低阈值复检")
     ap.add_argument("--hard-face-conf", type=float, default=HARD_FACE_CONF,
                     help=f"困难脸ROI二检阈值(默认{HARD_FACE_CONF})")
+    ap.add_argument("--hard-face-immediate-conf", type=float,
+                    default=HARD_FACE_IMMEDIATE_CONF,
+                    help=f"困难召唤立即确认阈值(默认{HARD_FACE_IMMEDIATE_CONF}; "
+                         f"ROI二检达到该分数直接打码, 低于则建pending轨迹等二次命中)")
     ap.add_argument("--hard-face-min-size", type=int, default=HARD_FACE_MIN_SIZE,
                     help=f"候选最小边小于该值时进入困难ROI二检(默认{HARD_FACE_MIN_SIZE}px)")
     ap.add_argument("--hard-face-roi-scale", type=float, default=HARD_FACE_ROI_SCALE,
@@ -4103,6 +3959,8 @@ def main():
         ap.error("--face-burst 必须 >= 0")
     if not 0 <= args.hard_face_conf <= 1:
         ap.error("--hard-face-conf 必须在 0~1 之间")
+    if not 0 <= args.hard_face_immediate_conf <= 1:
+        ap.error("--hard-face-immediate-conf 必须在 0~1 之间")
     if args.hard_face_min_size < 1:
         ap.error("--hard-face-min-size 必须 >= 1")
     if args.hard_face_roi_scale < 1:
@@ -4136,6 +3994,7 @@ def main():
                                face_burst=args.face_burst,
                                hard_face_recall=args.hard_face_recall,
                                hard_face_conf=args.hard_face_conf,
+                               hard_face_immediate_conf=args.hard_face_immediate_conf,
                                hard_face_min_size=args.hard_face_min_size,
                                hard_face_roi_scale=args.hard_face_roi_scale,
                                hard_face_max_rois=args.hard_face_max_rois,
